@@ -5,6 +5,7 @@ const axios = require('axios')
 const cron = require('node-cron')
 const { createClient } = require('@supabase/supabase-js')
 const webpush = require('web-push')
+const ws = require('ws')
 
 const app = express()
 app.use(cors())
@@ -12,7 +13,14 @@ app.use(express.json())
 
 const sb = createClient(
   process.env.SUPABASE_URL || 'https://foshqdjgbcigggrcjtap.supabase.co',
-  process.env.SUPABASE_SERVICE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZvc2hxZGpnYmNpZ2dncmNqdGFwIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTQwMDAyMSwiZXhwIjoyMDk0OTc2MDIxfQ.6h_Pouyxs73jug7JJtCtfj50JJPi1whWnAkdJuPNSoI'
+  process.env.SUPABASE_SERVICE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZvc2hxZGpnYmNpZ2dncmNqdGFwIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTQwMDAyMSwiZXhwIjoyMDk0OTc2MDIxfQ.6h_Pouyxs73jug7JJtCtfj50JJPi1whWnAkdJuPNSoI',
+  {
+    // Node.js não tem WebSocket nativo — o Supabase Realtime precisa do pacote "ws" pra funcionar.
+    // Este backend não usa Realtime (só REST via .from()), mas isso evita o erro/aviso na inicialização.
+    realtime: {
+      transport: ws
+    }
+  }
 )
 
 const ML_CLIENT_ID     = process.env.ML_CLIENT_ID     || '4022957335913783'
