@@ -29,8 +29,8 @@ const RAILWAY_URL      = 'https://tmp10-backend-v2-production.up.railway.app'
 const ERP_URL          = process.env.ERP_URL || 'https://roaring-pixie-c02520.netlify.app'
 
 // ── Shopee Open Platform (OAuth v2) ─────────────────────────────────
-const SHOPEE_PARTNER_ID  = process.env.SHOPEE_PARTNER_ID || ''
-const SHOPEE_PARTNER_KEY = process.env.SHOPEE_PARTNER_KEY || ''
+const SHOPEE_PARTNER_ID  = (process.env.SHOPEE_PARTNER_ID || '').trim()
+const SHOPEE_PARTNER_KEY = (process.env.SHOPEE_PARTNER_KEY || '').trim()
 // Ambiente de teste (sandbox) — quando o app virar produção, troca pra https://partner.shopeemobile.com
 const SHOPEE_HOST        = process.env.SHOPEE_HOST || 'https://partner.test-stable.shopeemobile.com'
 const crypto = require('crypto')
@@ -1288,6 +1288,11 @@ app.get('/api/ml/import-products/status', (req, res) => {
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
   console.log(`🚀 TMP10 v9.5 porta ${PORT}`)
+  // Diagnóstico seguro da Shopee — mostra só tamanho e se tinha espaço/quebra de linha sobrando, nunca o conteúdo
+  const rawId = process.env.SHOPEE_PARTNER_ID || ''
+  const rawKey = process.env.SHOPEE_PARTNER_KEY || ''
+  console.log(`🔍 [Shopee] Partner ID: ${SHOPEE_PARTNER_ID ? SHOPEE_PARTNER_ID.length + ' caracteres' : 'NÃO CONFIGURADO'}${rawId !== SHOPEE_PARTNER_ID ? ' ⚠️ tinha espaço/quebra de linha sobrando (já removido automaticamente)' : ''}`)
+  console.log(`🔍 [Shopee] Partner Key: ${SHOPEE_PARTNER_KEY ? SHOPEE_PARTNER_KEY.length + ' caracteres' : 'NÃO CONFIGURADO'}${rawKey !== SHOPEE_PARTNER_KEY ? ' ⚠️ tinha espaço/quebra de linha sobrando (já removido automaticamente)' : ''}`)
   setTimeout(syncAll, 3000)
   setTimeout(reclassifyOrders, 10000)
   setTimeout(checkDeliveries, 20000)
