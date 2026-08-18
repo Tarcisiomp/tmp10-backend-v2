@@ -211,6 +211,20 @@ app.get('/shopee/auth/:accountId', (req, res) => {
   const sign = shopeeSign(path, timestamp)
   const redirectBack = `${RAILWAY_URL}/shopee/callback?account_id=${req.params.accountId}&empresa_id=${empresaId}`
   const url = `${SHOPEE_HOST}${path}?partner_id=${SHOPEE_PARTNER_ID}&timestamp=${timestamp}&sign=${sign}&redirect=${encodeURIComponent(redirectBack)}`
+
+  // ── Diagnóstico temporário (seguro — nunca loga a Partner Key em si) ──
+  const baseStringDebug = `${SHOPEE_PARTNER_ID}${path}${timestamp}`
+  console.log('🔎 [Shopee DEBUG] ===== /shopee/auth chamado =====')
+  console.log('🔎 [Shopee DEBUG] SHOPEE_PARTNER_ID:', JSON.stringify(SHOPEE_PARTNER_ID))
+  console.log('🔎 [Shopee DEBUG] SHOPEE_HOST:', JSON.stringify(SHOPEE_HOST))
+  console.log('🔎 [Shopee DEBUG] path:', JSON.stringify(path))
+  console.log('🔎 [Shopee DEBUG] timestamp:', timestamp)
+  console.log('🔎 [Shopee DEBUG] SHOPEE_PARTNER_KEY length:', SHOPEE_PARTNER_KEY.length)
+  console.log('🔎 [Shopee DEBUG] baseString:', JSON.stringify(baseStringDebug))
+  console.log('🔎 [Shopee DEBUG] sign gerado:', sign)
+  console.log('🔎 [Shopee DEBUG] URL final:', url)
+  console.log('🔎 [Shopee DEBUG] ================================')
+
   res.redirect(url)
 })
 
