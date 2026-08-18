@@ -331,10 +331,25 @@ async function syncMLOrders(account) {
 
       while (hasMore) {
         try {
-          const { data } = await axios.get(
-            `https://api.mercadolibre.com/orders/search?seller=${account.ml_user_id}&order.status=${mlStatus}&order.date_created.from=${encodeURIComponent(dateFromStr)}&sort=date_desc&limit=50&offset=${offset}`,
-            { headers: { Authorization: `Bearer ${token}` } }
-          )
+          if (offset > 0) await new Promise(r => setTimeout(r, 400)); // evita bater no limite de requisições do ML
+          let data;
+          try {
+            ({ data } = await axios.get(
+              `https://api.mercadolibre.com/orders/search?seller=${account.ml_user_id}&order.status=${mlStatus}&order.date_created.from=${encodeURIComponent(dateFromStr)}&sort=date_desc&limit=50&offset=${offset}`,
+              { headers: { Authorization: `Bearer ${token}` } }
+            ))
+          } catch (e429) {
+            if (e429.response?.status === 429) {
+              // Limite de requisições do ML — espera um pouco e tenta mais uma vez antes de desistir
+              await new Promise(r => setTimeout(r, 2000));
+              ({ data } = await axios.get(
+                `https://api.mercadolibre.com/orders/search?seller=${account.ml_user_id}&order.status=${mlStatus}&order.date_created.from=${encodeURIComponent(dateFromStr)}&sort=date_desc&limit=50&offset=${offset}`,
+                { headers: { Authorization: `Bearer ${token}` } }
+              ))
+            } else {
+              throw e429;
+            }
+          }
 
           const results = data.results || []
           const total = data.paging?.total || 0
@@ -560,7 +575,7 @@ async function syncPerguntas() {
       if (!token) continue
       try {
         const { data: resp } = await axios.get(
-          `https://api.mercadolibre.com/my/questions/search?status=UNANSWERED&limit=20`,
+          `https://api.mercadolibre.com/questions/search?seller_id=${account.ml_user_id}&status=UNANSWERED&limit=20`,
           { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
         )
         const perguntas = resp?.questions || []
