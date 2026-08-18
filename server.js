@@ -25,8 +25,19 @@ const sb = createClient(
 
 const ML_CLIENT_ID     = process.env.ML_CLIENT_ID     || '4022957335913783'
 const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET || 'f9jB9yc6UvrAnz4kjT6u02xMxjbvn7z3'
-const RAILWAY_URL      = 'https://web-production-82c10.up.railway.app'
+const RAILWAY_URL      = 'https://tmp10-backend-v2-production.up.railway.app'
 const ERP_URL          = process.env.ERP_URL || 'https://roaring-pixie-c02520.netlify.app'
+
+// ── Shopee Open Platform (OAuth v2) ─────────────────────────────────
+const SHOPEE_PARTNER_ID  = process.env.SHOPEE_PARTNER_ID || ''
+const SHOPEE_PARTNER_KEY = process.env.SHOPEE_PARTNER_KEY || ''
+// Ambiente de teste (sandbox) — quando o app virar produção, troca pra https://partner.shopeemobile.com
+const SHOPEE_HOST        = process.env.SHOPEE_HOST || 'https://partner.test-stable.shopeemobile.com'
+const crypto = require('crypto')
+function shopeeSign(path, timestamp, accessToken = '', shopId = '') {
+  const baseString = `${SHOPEE_PARTNER_ID}${path}${timestamp}${accessToken}${shopId}`
+  return crypto.createHmac('sha256', SHOPEE_PARTNER_KEY).update(baseString).digest('hex')
+}
 
 // ── Notificações Push (Web Push) ────────────────────────────────────
 const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || 'BO4IgKTqXnhka_IuwlscQETrwMIJlUQcSOXUzU290rkvJJslgui5UZdCTWrB-J5QEAoE0ZfXlwqfP0h5gZq1hWw'
@@ -184,6 +195,94 @@ app.get('/ml/callback', async (req, res) => {
   } catch (e) {
     console.error('Auth error:', e.response?.data || e.message)
     res.redirect(`${ERP_URL}?ml_error=true`)
+  }
+})
+
+// ── Shopee OAuth v2 ──────────────────────────────────────────────────
+// accountId aqui é o próprio "id" (uuid) da linha em ml_accounts que foi criada manualmente
+// pra essa loja — o callback atualiza essa MESMA linha com os tokens de verdade.
+app.get('/shopee/auth/:accountId', (req, res) => {
+  if (!SHOPEE_PARTNER_ID || !SHOPEE_PARTNER_KEY) {
+    return res.status(500).send('SHOPEE_PARTNER_ID / SHOPEE_PARTNER_KEY não configurados no Railway')
+  }
+  const empresaId = req.query.empresa_id || ''
+  const path = '/api/v2/shop/auth_partner'
+  const timestamp = Math.floor(Date.now() / 1000)
+  const sign = shopeeSign(path, timestamp)
+  const redirectBack = `${RAILWAY_URL}/shopee/callback?account_id=${req.params.accountId}&empresa_id=${empresaId}`
+  const url = `${SHOPEE_HOST}${path}?partner_id=${SHOPEE_PARTNER_ID}&timestamp=${timestamp}&sign=${sign}&redirect=${encodeURIComponent(redirectBack)}`
+  res.redirect(url)
+})
+
+app.get('/shopee/callback', async (req, res) => {
+  const { code, shop_id, account_id, empresa_id } = req.query
+  try {
+    if (!code || !shop_id) throw new Error('Shopee não devolveu code/shop_id — autorização cancelada ou incompleta')
+    const path = '/api/v2/auth/token/get'
+    const timestamp = Math.floor(Date.now() / 1000)
+    const sign = shopeeSign(path, timestamp)
+    const { data: tok } = await axios.post(
+      `${SHOPEE_HOST}${path}?partner_id=${SHOPEE_PARTNER_ID}&timestamp=${timestamp}&sign=${sign}`,
+      { code, shop_id: Number(shop_id), partner_id: Number(SHOPEE_PARTNER_ID) }
+    )
+    if (tok.error) throw new Error(`${tok.error}: ${tok.message}`)
+
+    const updatePayload = {
+      platform: 'shopee',
+      ml_user_id: String(shop_id),
+      access_token: tok.access_token,
+      refresh_token: tok.refresh_token,
+      expires_at: new Date(Date.now() + tok.expire_in * 1000).toISOString(),
+      active: true
+    }
+    if (account_id) {
+      await sb.from('ml_accounts').update(updatePayload).eq('id', account_id)
+    } else {
+      await sb.from('ml_accounts').insert({ ...updatePayload, empresa_id: empresa_id || null, nickname: `Shopee ${shop_id}` })
+    }
+    res.redirect(`${ERP_URL}?shopee_connected=true&shop_id=${shop_id}`)
+  } catch (e) {
+    console.error('Shopee auth error:', e.response?.data || e.message)
+    res.redirect(`${ERP_URL}?shopee_error=${encodeURIComponent(e.message)}`)
+  }
+})
+
+async function refreshShopeeToken(account) {
+  try {
+    const path = '/api/v2/auth/access_token/get'
+    const timestamp = Math.floor(Date.now() / 1000)
+    const sign = shopeeSign(path, timestamp)
+    const { data } = await axios.post(
+      `${SHOPEE_HOST}${path}?partner_id=${SHOPEE_PARTNER_ID}&timestamp=${timestamp}&sign=${sign}`,
+      { refresh_token: account.refresh_token, shop_id: Number(account.ml_user_id), partner_id: Number(SHOPEE_PARTNER_ID) }
+    )
+    if (data.error) throw new Error(`${data.error}: ${data.message}`)
+    await sb.from('ml_accounts').update({
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      expires_at: new Date(Date.now() + data.expire_in * 1000).toISOString()
+    }).eq('ml_user_id', account.ml_user_id).eq('platform', 'shopee')
+    console.log(`🔑 [Shopee] Token renovado: loja ${account.ml_user_id}`)
+    return data.access_token
+  } catch (e) {
+    console.error(`❌ [Shopee] FALHA ao renovar token da loja ${account.ml_user_id}:`, e.response?.data || e.message)
+    return account.access_token
+  }
+}
+
+async function getShopeeToken(account) {
+  if (!account.expires_at) return account.access_token
+  if (new Date(account.expires_at) < new Date(Date.now() + 5 * 60 * 1000)) {
+    return await refreshShopeeToken(account)
+  }
+  return account.access_token
+}
+
+// Renova os tokens da Shopee automaticamente antes de vencerem (o access_token dura só algumas horas)
+cron.schedule('*/10 * * * *', async () => {
+  const { data: contas } = await sb.from('ml_accounts').select('*').eq('platform', 'shopee').eq('active', true)
+  for (const acc of (contas || [])) {
+    if (acc.access_token && acc.refresh_token) await getShopeeToken(acc)
   }
 })
 
