@@ -300,6 +300,162 @@ cron.schedule('*/10 * * * *', async () => {
   }
 })
 
+// ── Sincronização de pedidos da Shopee ──────────────────────────────
+// Busca pedidos dos últimos 15 dias por vez (limite da API da Shopee), pega os detalhes em lote
+// e classifica o tipo de envio: FBS (Fulfillment by Shopee) = equivalente ao FULL do ML, senão NORMAL.
+async function syncShopeeOrders(account) {
+  try {
+    if (!account.access_token || !account.refresh_token) return 0
+    const token = await getShopeeToken(account)
+    const shopId = Number(account.ml_user_id)
+    let totalNew = 0
+
+    // A Shopee só deixa buscar 15 dias por chamada — busca em 2 janelas pra cobrir os últimos 30 dias
+    const agora = Math.floor(Date.now() / 1000)
+    const janelas = [
+      { from: agora - 15 * 24 * 60 * 60, to: agora },
+      { from: agora - 30 * 24 * 60 * 60, to: agora - 15 * 24 * 60 * 60 }
+    ]
+
+    for (const janela of janelas) {
+      let cursor = ''
+      let hasMore = true
+
+      while (hasMore) {
+        const path = '/api/v2/order/get_order_list'
+        const timestamp = Math.floor(Date.now() / 1000)
+        const sign = shopeeSign(path, timestamp, token, shopId)
+        let data
+        try {
+          const resp = await axios.get(`${SHOPEE_HOST}${path}`, {
+            params: {
+              partner_id: Number(SHOPEE_PARTNER_ID),
+              timestamp,
+              sign,
+              shop_id: shopId,
+              access_token: token,
+              time_range_field: 'create_time',
+              time_from: janela.from,
+              time_to: janela.to,
+              page_size: 50,
+              cursor
+            }
+          })
+          data = resp.data
+        } catch (e) {
+          console.error(`[Shopee] Erro get_order_list (${account.nickname}):`, e.response?.data || e.message)
+          break
+        }
+        if (data.error) {
+          console.error(`[Shopee] get_order_list retornou erro (${account.nickname}):`, data.error, data.message)
+          break
+        }
+
+        const orderList = data.response?.order_list || []
+        if (orderList.length === 0) { hasMore = false; break }
+
+        // Busca os detalhes em lote (até 50 por chamada)
+        const orderSns = orderList.map(o => o.order_sn)
+        const pathDetail = '/api/v2/order/get_order_detail'
+        const timestampDetail = Math.floor(Date.now() / 1000)
+        const signDetail = shopeeSign(pathDetail, timestampDetail, token, shopId)
+        let detailData
+        try {
+          const respDetail = await axios.get(`${SHOPEE_HOST}${pathDetail}`, {
+            params: {
+              partner_id: Number(SHOPEE_PARTNER_ID),
+              timestamp: timestampDetail,
+              sign: signDetail,
+              shop_id: shopId,
+              access_token: token,
+              order_sn_list: orderSns.join(','),
+              response_optional_fields: 'buyer_username,item_list,total_amount,fulfillment_flag,shipping_carrier,order_status,create_time'
+            }
+          })
+          detailData = respDetail.data
+        } catch (e) {
+          console.error(`[Shopee] Erro get_order_detail (${account.nickname}):`, e.response?.data || e.message)
+          detailData = null
+        }
+
+        for (const order of (detailData?.response?.order_list || [])) {
+          try {
+            const { data: existing } = await sb.from('ml_orders')
+              .select('id').eq('ml_order_id', String(order.order_sn)).maybeSingle()
+            if (existing) continue
+
+            // fulfillment_flag: 'fulfilled_by_shopee' = FBS (equivalente ao FULL do ML), o resto é envio pelo próprio vendedor
+            const isFBS = order.fulfillment_flag === 'fulfilled_by_shopee'
+            const orderType = isFBS ? 'FULL' : 'NORMAL'
+            const status = isFBS ? 'full_ml' : 'aguardando'
+
+            const items = (order.item_list || []).map(item => ({
+              sku: item.model_sku || item.item_sku || String(item.item_id),
+              name: item.item_name,
+              qty: item.model_quantity_purchased || 1,
+              ml_item_id: item.item_id,
+              thumbnail: item.image_info?.image_url || null
+            }))
+
+            const totalAmount = order.total_amount || 0
+
+            await sb.from('ml_orders').insert({
+              ml_order_id: String(order.order_sn),
+              empresa_id: account.empresa_id || null,
+              account_nickname: account.nickname,
+              platform: 'shopee',
+              buyer_name: order.buyer_username || 'Cliente',
+              status,
+              order_type: orderType,
+              is_fulfillment: isFBS,
+              items,
+              ml_status: order.order_status || 'UNKNOWN',
+              shipment_id: null,
+              tracking_number: null,
+              created_at_ml: order.create_time ? new Date(order.create_time * 1000).toISOString() : new Date().toISOString(),
+              total_amount: totalAmount,
+              paid_amount: totalAmount, // a Shopee já desconta a comissão antes de repassar — ajuste fino fica pra próxima etapa
+              sale_fee: 0,
+              shipping_cost_ml: 0,
+              taxes_amount: 0
+            })
+
+            // Auto cadastra produto (só os que o vendedor mesmo envia, igual já fazemos no ML)
+            if (!isFBS) {
+              for (const item of items) {
+                if (item.sku) {
+                  await sb.from('products').upsert({
+                    sku: String(item.sku),
+                    empresa_id: account.empresa_id || null,
+                    name: item.name,
+                    description: `Shopee - ${account.nickname}`,
+                    photo: item.thumbnail || null,
+                    active: true,
+                    source: 'shopee'
+                  }, { onConflict: 'sku', ignoreDuplicates: true })
+                }
+              }
+            }
+            totalNew++
+          } catch (orderErr) {
+            console.error(`  ⚠️ [Shopee] Pedido ${order.order_sn} falhou (${account.nickname}): ${orderErr.message}`)
+          }
+        }
+
+        cursor = data.response?.next_cursor || ''
+        hasMore = data.response?.more === true && !!cursor
+        if (hasMore) await new Promise(r => setTimeout(r, 400)) // evita bater no limite de requisições da Shopee
+      }
+    }
+
+    if (totalNew > 0) console.log(`✅ [Shopee] ${account.nickname}: ${totalNew} novos pedidos`)
+    return totalNew
+  } catch (e) {
+    console.error(`[Shopee] Sync error (${account.nickname}):`, e.response?.data || e.message)
+    return 0
+  }
+}
+
 // ── Token ─────────────────────────────────────────────────────────
 async function refreshToken(account) {
   try {
@@ -579,7 +735,13 @@ async function syncMLOrders(account) {
 async function syncAll() {
   const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
   if (!accounts?.length) return
-  for (const acc of accounts) await syncMLOrders(acc)
+  for (const acc of accounts) {
+    if (acc.platform === 'shopee') {
+      await syncShopeeOrders(acc)
+    } else {
+      await syncMLOrders(acc)
+    }
+  }
 }
 
 // ── Reclassificar pedidos ─────────────────────────────────────────
