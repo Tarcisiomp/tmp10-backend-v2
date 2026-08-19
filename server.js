@@ -303,6 +303,45 @@ cron.schedule('*/10 * * * *', async () => {
 // ── Sincronização de pedidos da Shopee ──────────────────────────────
 // Busca pedidos dos últimos 15 dias por vez (limite da API da Shopee), pega os detalhes em lote
 // e classifica o tipo de envio: FBS (Fulfillment by Shopee) = equivalente ao FULL do ML, senão NORMAL.
+// Busca os valores financeiros REAIS do pedido (comissão, taxa de serviço, frete suportado pelo vendedor, valor líquido recebido)
+// Nunca inventa porcentagem fixa — usa exatamente o que a Shopee devolve pra esse pedido específico.
+async function getShopeeEscrowDetail(account, orderSn, token) {
+  try {
+    const shopId = Number(account.ml_user_id)
+    const path = '/api/v2/payment/get_escrow_detail'
+    const timestamp = Math.floor(Date.now() / 1000)
+    const sign = shopeeSign(path, timestamp, token, shopId)
+    const { data } = await axios.get(`${SHOPEE_HOST}${path}`, {
+      params: {
+        partner_id: Number(SHOPEE_PARTNER_ID),
+        timestamp,
+        sign,
+        shop_id: shopId,
+        access_token: token,
+        order_sn: orderSn
+      }
+    })
+    if (data.error) {
+      console.error(`[Shopee] get_escrow_detail erro (${orderSn}):`, data.error, data.message)
+      return null
+    }
+    const inc = data.response?.order_income
+    if (!inc) return null
+
+    // Soma tudo que a Shopee de fato descontou como taxa/comissão
+    const saleFee = (inc.commission_fee || 0) + (inc.service_fee || 0) + (inc.seller_transaction_fee || 0)
+    // Frete que sobrou pro vendedor pagar de verdade (frete real menos o que o comprador pagou menos o subsídio da Shopee)
+    const freteVendedor = Math.max(0, (inc.actual_shipping_fee || 0) - (inc.buyer_paid_shipping_fee || 0) - (inc.shopee_shipping_rebate || 0))
+    // Valor líquido que realmente cai na conta do vendedor
+    const valorLiquido = inc.escrow_amount != null ? inc.escrow_amount : null
+
+    return { saleFee, freteVendedor, valorLiquido }
+  } catch (e) {
+    console.error(`[Shopee] Erro get_escrow_detail (${orderSn}):`, e.response?.data || e.message)
+    return null
+  }
+}
+
 async function syncShopeeOrders(account) {
   try {
     if (!account.access_token || !account.refresh_token) return 0
@@ -399,6 +438,9 @@ async function syncShopeeOrders(account) {
 
             const totalAmount = order.total_amount || 0
 
+            // Busca os valores financeiros reais desse pedido específico (comissão, taxa, frete do vendedor, valor líquido)
+            const escrow = await getShopeeEscrowDetail(account, order.order_sn, token)
+
             await sb.from('ml_orders').insert({
               ml_order_id: String(order.order_sn),
               empresa_id: account.empresa_id || null,
@@ -414,10 +456,10 @@ async function syncShopeeOrders(account) {
               tracking_number: null,
               created_at_ml: order.create_time ? new Date(order.create_time * 1000).toISOString() : new Date().toISOString(),
               total_amount: totalAmount,
-              paid_amount: totalAmount, // a Shopee já desconta a comissão antes de repassar — ajuste fino fica pra próxima etapa
-              sale_fee: 0,
-              shipping_cost_ml: 0,
-              taxes_amount: 0
+              paid_amount: escrow?.valorLiquido != null ? escrow.valorLiquido : totalAmount,
+              sale_fee: escrow?.saleFee || 0,
+              shipping_cost_ml: escrow?.freteVendedor || 0,
+              taxes_amount: 0 // imposto continua sendo configuração interna do TMP10, não vem da Shopee
             })
 
             // Auto cadastra produto (só os que o vendedor mesmo envia, igual já fazemos no ML)
