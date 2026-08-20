@@ -425,7 +425,11 @@ async function syncShopeeOrders(account) {
 
             // fulfillment_flag: 'fulfilled_by_shopee' = FBS (equivalente ao FULL do ML), o resto é envio pelo próprio vendedor
             const isFBS = order.fulfillment_flag === 'fulfilled_by_shopee'
-            const orderType = isFBS ? 'FULL' : 'NORMAL'
+            // Shopee Direta = enviado pela transportadora própria da Shopee (Shopee Xpress);
+            // Shopee Normal = transportadora terceira (Correios, J&T, etc)
+            const carrier = order.shipping_carrier || ''
+            const isDiretaShopee = /shopee/i.test(carrier)
+            const orderType = isFBS ? 'FULL' : (isDiretaShopee ? 'FLEX' : 'NORMAL') // reaproveita FLEX pra representar "Direta" da Shopee na TV
             const status = isFBS ? 'full_ml' : 'aguardando'
 
             const items = (order.item_list || []).map(item => ({
@@ -449,6 +453,7 @@ async function syncShopeeOrders(account) {
               buyer_name: order.buyer_username || 'Cliente',
               status,
               order_type: orderType,
+              shipping_carrier: carrier || null,
               is_fulfillment: isFBS,
               items,
               ml_status: order.order_status || 'UNKNOWN',
