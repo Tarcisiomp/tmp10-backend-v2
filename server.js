@@ -342,6 +342,31 @@ async function getShopeeEscrowDetail(account, orderSn, token) {
   }
 }
 
+// Busca o código de rastreamento do pedido — só fica disponível depois que a Shopee (ou o vendedor)
+// processa o envio, então pode não vir nada ainda na primeira tentativa (normal, tentamos de novo depois)
+async function getShopeeTrackingNumber(account, orderSn, token) {
+  try {
+    const shopId = Number(account.ml_user_id)
+    const path = '/api/v2/logistics/get_tracking_number'
+    const timestamp = Math.floor(Date.now() / 1000)
+    const sign = shopeeSign(path, timestamp, token, shopId)
+    const { data } = await axios.get(`${SHOPEE_HOST}${path}`, {
+      params: {
+        partner_id: Number(SHOPEE_PARTNER_ID),
+        timestamp,
+        sign,
+        shop_id: shopId,
+        access_token: token,
+        order_sn: orderSn
+      }
+    })
+    if (data.error) return null // normal: ainda não tem rastreio (pedido não processado pra envio)
+    return data.response?.tracking_number || null
+  } catch (e) {
+    return null
+  }
+}
+
 async function syncShopeeOrders(account) {
   try {
     if (!account.access_token || !account.refresh_token) return 0
@@ -444,6 +469,8 @@ async function syncShopeeOrders(account) {
 
             // Busca os valores financeiros reais desse pedido específico (comissão, taxa, frete do vendedor, valor líquido)
             const escrow = await getShopeeEscrowDetail(account, order.order_sn, token)
+            // Busca o rastreamento — só vem se o pedido já foi processado pra envio, senão fica null (tentamos de novo depois)
+            const trackingNumber = await getShopeeTrackingNumber(account, order.order_sn, token)
 
             const { error: insertErr } = await sb.from('ml_orders').insert({
               ml_order_id: String(order.order_sn),
@@ -458,7 +485,7 @@ async function syncShopeeOrders(account) {
               items,
               ml_status: order.order_status || 'UNKNOWN',
               shipment_id: null,
-              tracking_number: null,
+              tracking_number: trackingNumber,
               created_at_ml: order.create_time ? new Date(order.create_time * 1000).toISOString() : new Date().toISOString(),
               total_amount: totalAmount,
               paid_amount: escrow?.valorLiquido != null ? escrow.valorLiquido : totalAmount,
@@ -941,6 +968,40 @@ async function reclassifyOrders() {
 }
 
 // ── Verificar entregas ────────────────────────────────────────────
+// Tenta de novo buscar o rastreamento dos pedidos Shopee que ainda não tinham na primeira sincronização
+// (é normal não vir na hora — o rastreio só existe depois que o pedido é processado pra envio)
+async function retentarRastreioShopee() {
+  try {
+    const { data: pendentes } = await sb.from('ml_orders')
+      .select('id, ml_order_id, empresa_id, account_nickname')
+      .eq('platform', 'shopee')
+      .is('tracking_number', null)
+      .in('status', ['aguardando', 'separando', 'conferindo', 'embalado'])
+      .limit(100)
+    if (!pendentes?.length) return
+
+    const { data: contas } = await sb.from('ml_accounts').select('*').eq('platform', 'shopee').eq('active', true)
+    const contaPorNickname = {}
+    for (const c of (contas || [])) contaPorNickname[c.nickname] = c
+
+    let achados = 0
+    for (const pedido of pendentes) {
+      const conta = contaPorNickname[pedido.account_nickname]
+      if (!conta) continue
+      const token = await getShopeeToken(conta)
+      const tracking = await getShopeeTrackingNumber(conta, pedido.ml_order_id, token)
+      if (tracking) {
+        await sb.from('ml_orders').update({ tracking_number: tracking, updated_at: new Date().toISOString() }).eq('id', pedido.id)
+        achados++
+      }
+      await new Promise(r => setTimeout(r, 300))
+    }
+    if (achados > 0) console.log(`📦 [Shopee] ${achados} rastreamento(s) novo(s) encontrado(s)`)
+  } catch (e) {
+    console.log('Erro retentarRastreioShopee:', e.message)
+  }
+}
+
 async function checkDeliveries() {
   const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
   if (!accounts?.length) return
@@ -1122,6 +1183,7 @@ async function syncEstoqueML() {
 cron.schedule('*/2 * * * *', syncAll)
 cron.schedule('*/30 * * * *', syncEstoqueML)
 cron.schedule('*/15 * * * *', checkDeliveries)
+cron.schedule('*/15 * * * *', retentarRastreioShopee)
 cron.schedule('*/5 * * * *', syncPerguntas)
 cron.schedule('*/10 * * * *', recalcularPedidosRecentesAutomatico)
 
