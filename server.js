@@ -1688,6 +1688,177 @@ app.get('/api/ml/import-products/status', (req, res) => {
   res.json(importStatus)
 })
 
+// ── Importar Produtos da Shopee ──────────────────────────────────────
+// Traz TODOS os anúncios da loja de uma vez (mesmo sem venda ainda), igual já fazemos com o ML.
+// Também popula o product_shopee_links (SKU ↔ item_id ↔ model_id), necessário pra empurrar estoque de volta pra Shopee.
+let importStatusShopee = { running: false, imported: 0, linked: 0, contaAtual: null, terminadoEm: null, erro: null }
+
+async function rodarImportProductsShopee(empresa_id) {
+  importStatusShopee = { running: true, imported: 0, linked: 0, contaAtual: null, terminadoEm: null, erro: null }
+  try {
+    const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true).eq('empresa_id', empresa_id).eq('platform', 'shopee')
+
+    for (const acc of accounts || []) {
+      importStatusShopee.contaAtual = acc.nickname
+      try {
+        const token = await getShopeeToken(acc)
+        const shopId = Number(acc.ml_user_id)
+        let offset = 0
+        let allItemIds = []
+        let hasMore = true
+
+        // Busca todos os item_id ativos da loja
+        while (hasMore) {
+          const path = '/api/v2/product/get_item_list'
+          const timestamp = Math.floor(Date.now() / 1000)
+          const sign = shopeeSign(path, timestamp, token, shopId)
+          const { data } = await axios.get(`${SHOPEE_HOST}${path}`, {
+            params: {
+              partner_id: Number(SHOPEE_PARTNER_ID),
+              timestamp,
+              sign,
+              shop_id: shopId,
+              access_token: token,
+              offset,
+              page_size: 50,
+              item_status: 'NORMAL'
+            }
+          })
+          const items = data.response?.item || []
+          allItemIds = allItemIds.concat(items.map(i => i.item_id))
+          hasMore = data.response?.has_next_page === true
+          offset += 50
+          if (allItemIds.length >= 3000) hasMore = false
+          await new Promise(r => setTimeout(r, 300))
+        }
+
+        // Busca detalhes em lotes de 20
+        for (let i = 0; i < allItemIds.length; i += 20) {
+          const batchIds = allItemIds.slice(i, i + 20)
+          try {
+            const pathDetail = '/api/v2/product/get_item_base_info'
+            const timestampDetail = Math.floor(Date.now() / 1000)
+            const signDetail = shopeeSign(pathDetail, timestampDetail, token, shopId)
+            const { data: detailData } = await axios.get(`${SHOPEE_HOST}${pathDetail}`, {
+              params: {
+                partner_id: Number(SHOPEE_PARTNER_ID),
+                timestamp: timestampDetail,
+                sign: signDetail,
+                shop_id: shopId,
+                access_token: token,
+                item_id_list: batchIds.join(',')
+              }
+            })
+
+            for (const item of (detailData.response?.item_list || [])) {
+              // Tenta buscar as variações (model) desse item — se não tiver nenhuma, usa o item direto
+              let modelos = []
+              try {
+                const pathModel = '/api/v2/product/get_model_list'
+                const timestampModel = Math.floor(Date.now() / 1000)
+                const signModel = shopeeSign(pathModel, timestampModel, token, shopId)
+                const { data: modelData } = await axios.get(`${SHOPEE_HOST}${pathModel}`, {
+                  params: {
+                    partner_id: Number(SHOPEE_PARTNER_ID),
+                    timestamp: timestampModel,
+                    sign: signModel,
+                    shop_id: shopId,
+                    access_token: token,
+                    item_id: item.item_id
+                  }
+                })
+                modelos = modelData.response?.model || []
+              } catch (e) { /* item sem variação, segue sem modelo */ }
+
+              const imagem = item.image?.image_url_list?.[0] || null
+
+              if (modelos.length > 0) {
+                // Produto com variações — um SKU por variação
+                for (const modelo of modelos) {
+                  const sku = String(modelo.model_sku || `${item.item_id}-${modelo.model_id}`)
+                  const estoque = modelo.stock_info_v2?.summary_info?.total_available_stock || 0
+                  await sb.from('products').upsert({
+                    sku,
+                    empresa_id,
+                    name: `${item.item_name} - ${modelo.model_name || ''}`.trim(),
+                    photo: imagem,
+                    active: true,
+                    source: 'shopee',
+                    estoque_atual: estoque
+                  }, { onConflict: 'empresa_id,sku', ignoreDuplicates: false })
+                  importStatusShopee.imported++
+
+                  await sb.from('product_shopee_links').upsert({
+                    empresa_id,
+                    sku,
+                    shop_id: String(shopId),
+                    item_id: item.item_id,
+                    model_id: modelo.model_id,
+                    quantity: estoque
+                  }, { onConflict: 'empresa_id,sku,shop_id' })
+                  importStatusShopee.linked++
+                }
+              } else {
+                // Produto simples, sem variação
+                const sku = String(item.item_sku || item.item_id)
+                const estoque = item.stock_info_v2?.summary_info?.total_available_stock || 0
+                await sb.from('products').upsert({
+                  sku,
+                  empresa_id,
+                  name: item.item_name,
+                  photo: imagem,
+                  active: true,
+                  source: 'shopee',
+                  estoque_atual: estoque
+                }, { onConflict: 'empresa_id,sku', ignoreDuplicates: false })
+                importStatusShopee.imported++
+
+                await sb.from('product_shopee_links').upsert({
+                  empresa_id,
+                  sku,
+                  shop_id: String(shopId),
+                  item_id: item.item_id,
+                  model_id: null,
+                  quantity: estoque
+                }, { onConflict: 'empresa_id,sku,shop_id' })
+                importStatusShopee.linked++
+              }
+            }
+          } catch (e) {
+            console.log(`Erro lote import Shopee (${acc.nickname}): ${e.response?.data ? JSON.stringify(e.response.data) : e.message}`)
+          }
+          await new Promise(r => setTimeout(r, 400))
+        }
+      } catch (e) {
+        console.log(`Erro import-products Shopee (${acc.nickname}): ${e.message}`)
+      }
+    }
+  } catch (e) {
+    importStatusShopee.erro = e.message
+    console.log('Erro import-products Shopee:', e.message)
+  } finally {
+    importStatusShopee.running = false
+    importStatusShopee.contaAtual = null
+    importStatusShopee.terminadoEm = new Date().toISOString()
+  }
+}
+
+app.post('/api/shopee/import-products', (req, res) => {
+  const { empresa_id } = req.body
+  if (!empresa_id) {
+    return res.status(400).json({ ok: false, error: 'empresa_id é obrigatório' })
+  }
+  if (importStatusShopee.running) {
+    return res.json({ ok: true, message: 'Já está rodando, confere o progresso em /api/shopee/import-products/status', status: importStatusShopee })
+  }
+  rodarImportProductsShopee(empresa_id)
+  res.json({ ok: true, message: 'Importação iniciada em segundo plano. Isso pode levar alguns minutos.' })
+})
+
+app.get('/api/shopee/import-products/status', (req, res) => {
+  res.json(importStatusShopee)
+})
+
 const PORT = process.env.PORT || 3001
 app.listen(PORT, () => {
   console.log(`🚀 TMP10 v9.5 porta ${PORT}`)
