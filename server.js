@@ -1182,6 +1182,55 @@ async function syncEstoqueML() {
 // ── Fatura de Cartão de Crédito ──────────────────────────────────────
 // No dia de fechamento, soma tudo que foi gasto no cartão desde o último fechamento
 // e gera a Conta a Pagar da fatura sozinha, com o vencimento certo.
+// ── Alerta de Conta Vencendo Hoje ────────────────────────────────────
+// Roda uma vez por dia, checa quem tem conta a pagar vencendo hoje (ou já vencida sem pagar)
+// e manda notificação push pra empresa — o mesmo sino de 3 batidas que já toca nas vendas.
+async function alertarContasVencendoHoje() {
+  try {
+    const hojeStr = new Date().toISOString().slice(0, 10)
+    const { data: contasVencendo } = await sb.from('fin_contas_pagar')
+      .select('empresa_id,fornecedor,valor,vencimento')
+      .in('status', ['pendente', 'vencido'])
+      .lte('vencimento', hojeStr) // vence hoje ou já venceu e ainda não foi paga
+
+    if (!contasVencendo?.length) return
+
+    // Agrupa por empresa, pra mandar um alerta só (não um por conta)
+    const porEmpresa = {}
+    for (const c of contasVencendo) {
+      if (!porEmpresa[c.empresa_id]) porEmpresa[c.empresa_id] = []
+      porEmpresa[c.empresa_id].push(c)
+    }
+
+    let empresasAvisadas = 0
+    for (const [empresaId, contas] of Object.entries(porEmpresa)) {
+      const { data: subs } = await sb.from('push_subscriptions').select('*').eq('empresa_id', empresaId)
+      if (!subs?.length) continue
+
+      const totalHoje = contas.reduce((s, c) => s + Number(c.valor), 0)
+      const titulo = contas.length === 1 ? '⚠️ Conta vencendo hoje!' : `⚠️ ${contas.length} contas vencendo hoje!`
+      const corpo = contas.length === 1
+        ? `${contas[0].fornecedor} — R$ ${Number(contas[0].valor).toFixed(2)}`
+        : `Total de R$ ${totalHoje.toFixed(2)} — ${contas.map(c => c.fornecedor).join(', ')}`
+
+      const payload = JSON.stringify({ title: titulo, body: corpo, tag: 'conta-vencendo' })
+      for (const s of subs) {
+        try {
+          await webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, payload)
+        } catch (err) {
+          if (err.statusCode === 404 || err.statusCode === 410) {
+            await sb.from('push_subscriptions').delete().eq('endpoint', s.endpoint)
+          }
+        }
+      }
+      empresasAvisadas++
+    }
+    if (empresasAvisadas > 0) console.log(`⚠️ Alerta de vencimento enviado pra ${empresasAvisadas} empresa(s)`)
+  } catch (e) {
+    console.log('Erro alertarContasVencendoHoje:', e.message)
+  }
+}
+
 async function gerarFaturasCartao() {
   try {
     const hoje = new Date(); hoje.setHours(0, 0, 0, 0)
@@ -1291,6 +1340,7 @@ cron.schedule('*/5 * * * *', syncPerguntas)
 cron.schedule('*/10 * * * *', recalcularPedidosRecentesAutomatico)
 cron.schedule('0 */6 * * *', gerarContasRecorrentes)
 cron.schedule('0 */6 * * *', gerarFaturasCartao)
+cron.schedule('0 8 * * *', alertarContasVencendoHoje)
 
 // ── Webhook ML ────────────────────────────────────────────────────
 app.post('/ml/notifications', async (req, res) => {
@@ -1381,6 +1431,11 @@ app.post('/api/fin/gerar-recorrencias', async (req, res) => {
 
 app.post('/api/fin/gerar-faturas', async (req, res) => {
   await gerarFaturasCartao()
+  res.json({ ok: true })
+})
+
+app.post('/api/fin/alertar-vencimento', async (req, res) => {
+  await alertarContasVencendoHoje()
   res.json({ ok: true })
 })
 
