@@ -1180,12 +1180,64 @@ async function syncEstoqueML() {
 }
 
 // ── Crons ─────────────────────────────────────────────────────────
+// ── Contas a Pagar Recorrentes ───────────────────────────────────────
+// Toda vez que a data de vencimento (menos a antecedência configurada) chegar,
+// gera automaticamente a conta a pagar do mês e já agenda a próxima geração.
+async function gerarContasRecorrentes() {
+  try {
+    const hoje = new Date(); hoje.setHours(0, 0, 0, 0)
+    const { data: recorrencias } = await sb.from('fin_recorrencias').select('*').eq('ativo', true)
+    if (!recorrencias?.length) return
+
+    let geradas = 0
+    for (const r of recorrencias) {
+      const proximaGeracao = new Date(r.proxima_geracao + 'T00:00:00')
+      const dataLimiteParaGerar = new Date(proximaGeracao)
+      dataLimiteParaGerar.setDate(dataLimiteParaGerar.getDate() - (r.antecedencia_dias || 5))
+
+      if (hoje >= dataLimiteParaGerar) {
+        // Evita gerar duplicado se já existe uma conta a pagar dessa recorrência com esse vencimento
+        const vencimentoStr = r.proxima_geracao
+        const { data: jaExiste } = await sb.from('fin_contas_pagar')
+          .select('id').eq('recorrencia_id', r.id).eq('vencimento', vencimentoStr).maybeSingle()
+
+        if (!jaExiste) {
+          await sb.from('fin_contas_pagar').insert({
+            empresa_id: r.empresa_id,
+            fornecedor: r.fornecedor,
+            descricao: r.descricao,
+            valor: r.valor,
+            vencimento: vencimentoStr,
+            categoria: r.categoria,
+            conta_id: r.conta_id,
+            status: 'pendente',
+            recorrente: true,
+            recorrencia_id: r.id
+          })
+          geradas++
+        }
+
+        // Agenda a próxima geração pro mesmo dia do mês seguinte
+        const proximoMes = new Date(proximaGeracao)
+        proximoMes.setMonth(proximoMes.getMonth() + 1)
+        await sb.from('fin_recorrencias').update({
+          proxima_geracao: proximoMes.toISOString().slice(0, 10)
+        }).eq('id', r.id)
+      }
+    }
+    if (geradas > 0) console.log(`🔁 ${geradas} conta(s) a pagar recorrente(s) gerada(s)`)
+  } catch (e) {
+    console.log('Erro gerarContasRecorrentes:', e.message)
+  }
+}
+
 cron.schedule('*/2 * * * *', syncAll)
 cron.schedule('*/30 * * * *', syncEstoqueML)
 cron.schedule('*/15 * * * *', checkDeliveries)
 cron.schedule('*/15 * * * *', retentarRastreioShopee)
 cron.schedule('*/5 * * * *', syncPerguntas)
 cron.schedule('*/10 * * * *', recalcularPedidosRecentesAutomatico)
+cron.schedule('0 */6 * * *', gerarContasRecorrentes)
 
 // ── Webhook ML ────────────────────────────────────────────────────
 app.post('/ml/notifications', async (req, res) => {
@@ -1266,6 +1318,11 @@ app.post('/api/check-deliveries', async (req, res) => {
 
 app.post('/api/shopee/check-tracking', async (req, res) => {
   await retentarRastreioShopee()
+  res.json({ ok: true })
+})
+
+app.post('/api/fin/gerar-recorrencias', async (req, res) => {
+  await gerarContasRecorrentes()
   res.json({ ok: true })
 })
 
