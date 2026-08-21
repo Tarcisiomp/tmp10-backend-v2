@@ -1179,6 +1179,58 @@ async function syncEstoqueML() {
   }
 }
 
+// ── Fatura de Cartão de Crédito ──────────────────────────────────────
+// No dia de fechamento, soma tudo que foi gasto no cartão desde o último fechamento
+// e gera a Conta a Pagar da fatura sozinha, com o vencimento certo.
+async function gerarFaturasCartao() {
+  try {
+    const hoje = new Date(); hoje.setHours(0, 0, 0, 0)
+    const { data: cartoes } = await sb.from('fin_contas')
+      .select('*').eq('tipo', 'cartao').eq('ativo', true).not('dia_fechamento', 'is', null)
+    if (!cartoes?.length) return
+
+    let geradas = 0
+    for (const cartao of cartoes) {
+      if (hoje.getDate() < cartao.dia_fechamento) continue // ainda não chegou o dia de fechar
+
+      const periodoAtual = `${hoje.getFullYear()}-${String(hoje.getMonth() + 1).padStart(2, '0')}`
+      const { data: jaExiste } = await sb.from('fin_contas_pagar')
+        .select('id').eq('cartao_conta_id', cartao.id).eq('periodo_referencia', periodoAtual).maybeSingle()
+      if (jaExiste) continue // já fechou esse mês
+
+      // Descobre desde quando somar: desde a última fatura gerada (ou desde sempre, se for a primeira)
+      const { data: ultimaFatura } = await sb.from('fin_contas_pagar')
+        .select('created_at').eq('cartao_conta_id', cartao.id).order('created_at', { ascending: false }).limit(1).maybeSingle()
+      const desde = ultimaFatura?.created_at || '2000-01-01'
+
+      const { data: gastos } = await sb.from('fin_lancamentos')
+        .select('valor').eq('conta_id', cartao.id).eq('tipo', 'saida').gte('created_at', desde)
+      const totalFatura = (gastos || []).reduce((s, g) => s + Number(g.valor), 0)
+
+      if (totalFatura <= 0) continue // não teve gasto nenhum, não gera fatura vazia
+
+      const vencimento = new Date(hoje.getFullYear(), hoje.getMonth(), cartao.dia_vencimento_fatura || cartao.dia_fechamento)
+      if (vencimento < hoje) vencimento.setMonth(vencimento.getMonth() + 1) // se o vencimento já passou nesse mês, é mês que vem
+
+      await sb.from('fin_contas_pagar').insert({
+        empresa_id: cartao.empresa_id,
+        fornecedor: `Fatura ${cartao.nome}`,
+        descricao: `Fatura referente a ${periodoAtual}`,
+        valor: totalFatura,
+        vencimento: vencimento.toISOString().slice(0, 10),
+        categoria: 'Fatura Cartão',
+        status: 'pendente',
+        cartao_conta_id: cartao.id,
+        periodo_referencia: periodoAtual
+      })
+      geradas++
+    }
+    if (geradas > 0) console.log(`💳 ${geradas} fatura(s) de cartão gerada(s)`)
+  } catch (e) {
+    console.log('Erro gerarFaturasCartao:', e.message)
+  }
+}
+
 // ── Crons ─────────────────────────────────────────────────────────
 // ── Contas a Pagar Recorrentes ───────────────────────────────────────
 // Toda vez que a data de vencimento (menos a antecedência configurada) chegar,
@@ -1238,6 +1290,7 @@ cron.schedule('*/15 * * * *', retentarRastreioShopee)
 cron.schedule('*/5 * * * *', syncPerguntas)
 cron.schedule('*/10 * * * *', recalcularPedidosRecentesAutomatico)
 cron.schedule('0 */6 * * *', gerarContasRecorrentes)
+cron.schedule('0 */6 * * *', gerarFaturasCartao)
 
 // ── Webhook ML ────────────────────────────────────────────────────
 app.post('/ml/notifications', async (req, res) => {
@@ -1323,6 +1376,11 @@ app.post('/api/shopee/check-tracking', async (req, res) => {
 
 app.post('/api/fin/gerar-recorrencias', async (req, res) => {
   await gerarContasRecorrentes()
+  res.json({ ok: true })
+})
+
+app.post('/api/fin/gerar-faturas', async (req, res) => {
+  await gerarFaturasCartao()
   res.json({ ok: true })
 })
 
