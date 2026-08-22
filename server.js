@@ -1335,7 +1335,7 @@ async function gerarContasRecorrentes() {
 cron.schedule('*/2 * * * *', syncAll)
 cron.schedule('*/30 * * * *', syncEstoqueML)
 cron.schedule('*/15 * * * *', checkDeliveries)
-cron.schedule('*/15 * * * *', retentarRastreioShopee)
+cron.schedule('*/5 * * * *', retentarRastreioShopee)
 cron.schedule('*/5 * * * *', syncPerguntas)
 cron.schedule('*/10 * * * *', recalcularPedidosRecentesAutomatico)
 cron.schedule('0 */6 * * *', gerarContasRecorrentes)
