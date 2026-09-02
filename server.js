@@ -861,7 +861,8 @@ async function syncMLOrders(account) {
                 paid_amount: paidAmount,
                 sale_fee: saleFeeLiquido,
                 shipping_cost_ml: freteVendedor,
-                taxes_amount: taxesAmount
+                taxes_amount: taxesAmount,
+                custos_confirmados: !!custosReais // só true se veio do billing_info de verdade, não do valor provisório
               })
 
               // Se realmente inseriu agora (não era duplicado), desconta o estoque central na hora.
@@ -1455,10 +1456,11 @@ app.post('/api/sync-estoque', async (req, res) => {
 // (comum: ML ainda não tinha fechado a comissão no momento da sincronização inicial)
 async function recalcularPedidosRecentesAutomatico() {
   try {
-    const desde = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString() // últimas 12h
+    const desde = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString() // últimas 48h — o ML às vezes demora mais que 12h pra fechar o billing_info
     const { data: orders } = await sb.from('ml_orders')
       .select('id, ml_order_id, shipment_id, sale_fee, total_amount, account_nickname, tracking_number')
-      .eq('sale_fee', 0)
+      .eq('custos_confirmados', false) // pega tanto quem ainda não tem comissão quanto quem só tem o frete provisório
+      .eq('platform', 'mercadolivre')
       .gt('created_at_ml', desde)
       .not('status', 'in', '(cancelado)')
       .limit(50)
@@ -1508,7 +1510,8 @@ async function recalcularPedidosRecentesAutomatico() {
           paid_amount: totalAmount - saleFeeReal - freteVendedor,
           taxes_amount: taxesAmount,
           total_amount: totalAmount,
-          tracking_number: trackingNumber
+          tracking_number: trackingNumber,
+          custos_confirmados: !!custosReais
         }).eq('id', order.id)
         corrigidos++
         await new Promise(r => setTimeout(r, 400))
@@ -1553,6 +1556,7 @@ async function recalcularUmPedido(mlOrderId) {
     paid_amount: paidAmount,
     taxes_amount: taxesAmount,
     total_amount: totalAmount,
+    custos_confirmados: true,
     updated_at: new Date().toISOString()
   }).eq('id', order.id)
 
