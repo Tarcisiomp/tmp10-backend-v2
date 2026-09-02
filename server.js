@@ -1522,6 +1522,61 @@ async function recalcularPedidosRecentesAutomatico() {
   }
 }
 
+async function recalcularUmPedido(mlOrderId) {
+  const { data: order } = await sb.from('ml_orders').select('*').eq('ml_order_id', mlOrderId).maybeSingle()
+  if (!order) return { ok: false, error: 'Pedido não encontrado no nosso banco' }
+
+  const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
+  const account = accounts?.find(a => a.nickname === order.account_nickname)
+  if (!account) return { ok: false, error: 'Conta ML não encontrada' }
+  const token = await getToken(account)
+
+  console.log(`🔎 [Recalcular 1 pedido] ${mlOrderId} — buscando billing_info...`)
+  const custosReais = await calcCustosReaisML(mlOrderId, token)
+  console.log(`🔎 [Recalcular 1 pedido] ${mlOrderId} — resultado billing_info:`, JSON.stringify(custosReais))
+
+  if (!custosReais) {
+    return { ok: false, error: 'billing_info não retornou dados (pode não ter fechado ainda do lado do ML)', order_atual: order }
+  }
+
+  const { data: mlOrder } = await axios.get(
+    `https://api.mercadolibre.com/orders/${mlOrderId}`,
+    { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
+  )
+  const totalAmount = mlOrder.total_amount || order.total_amount
+  const taxesAmount = mlOrder.taxes?.amount || 0
+  const paidAmount = totalAmount - custosReais.saleFeeLiquido - custosReais.freteVendedor
+
+  await sb.from('ml_orders').update({
+    sale_fee: custosReais.saleFeeLiquido,
+    shipping_cost_ml: custosReais.freteVendedor,
+    paid_amount: paidAmount,
+    taxes_amount: taxesAmount,
+    total_amount: totalAmount,
+    updated_at: new Date().toISOString()
+  }).eq('id', order.id)
+
+  return { ok: true, mlOrderId, antes: { sale_fee: order.sale_fee, shipping_cost_ml: order.shipping_cost_ml, paid_amount: order.paid_amount }, depois: { sale_fee: custosReais.saleFeeLiquido, shipping_cost_ml: custosReais.freteVendedor, paid_amount: paidAmount } }
+}
+
+app.get('/api/recalcular-um/:mlOrderId', async (req, res) => {
+  try {
+    const resultado = await recalcularUmPedido(req.params.mlOrderId)
+    res.json(resultado)
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
+app.post('/api/recalcular-um/:mlOrderId', async (req, res) => {
+  try {
+    const resultado = await recalcularUmPedido(req.params.mlOrderId)
+    res.json(resultado)
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
 app.post('/api/recalcular-custos', async (req, res) => {
   const offset = parseInt(req.query.offset || '0')
   const limit = 30
