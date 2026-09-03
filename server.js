@@ -1541,6 +1541,93 @@ async function recalcularPedidosRecentesAutomatico() {
   }
 }
 
+// ── Corrigir TODO o histórico de pedidos ML (não só os recentes) ─────────────
+// Roda em segundo plano, um por um, respeitando o limite de requisições do ML.
+let recalcularTodosStatus = { running: false, total: 0, processados: 0, corrigidos: 0, jaEstavamCertos: 0, erros: 0, iniciadoEm: null, terminadoEm: null }
+
+async function rodarRecalcularTodoHistorico() {
+  recalcularTodosStatus = { running: true, total: 0, processados: 0, corrigidos: 0, jaEstavamCertos: 0, erros: 0, iniciadoEm: new Date().toISOString(), terminadoEm: null }
+  try {
+    const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true).eq('platform', 'mercadolivre')
+    const tokenMap = {}
+    for (const acc of accounts || []) tokenMap[acc.nickname] = await getToken(acc)
+
+    // Pega todos os pedidos ML não cancelados, em lotes, pra não estourar memória
+    let offset = 0
+    const lote = 100
+    let todosOsPedidos = []
+    while (true) {
+      const { data: pedidos } = await sb.from('ml_orders')
+        .select('id, ml_order_id, shipment_id, sale_fee, shipping_cost_ml, total_amount, account_nickname, tracking_number, custos_confirmados')
+        .eq('platform', 'mercadolivre')
+        .not('status', 'in', '(cancelado)')
+        .not('shipment_id', 'is', null)
+        .range(offset, offset + lote - 1)
+      if (!pedidos?.length) break
+      todosOsPedidos = todosOsPedidos.concat(pedidos)
+      offset += lote
+      if (pedidos.length < lote) break
+    }
+
+    recalcularTodosStatus.total = todosOsPedidos.length
+    console.log(`🔄 [Recalcular TODOS] ${todosOsPedidos.length} pedidos ML pra conferir`)
+
+    for (const order of todosOsPedidos) {
+      try {
+        const token = tokenMap[order.account_nickname]
+        if (!token) { recalcularTodosStatus.erros++; recalcularTodosStatus.processados++; continue }
+
+        const freteReal = await getFreteRealML(order.shipment_id, token)
+        recalcularTodosStatus.processados++
+
+        if (freteReal == null) {
+          recalcularTodosStatus.erros++
+          await new Promise(r => setTimeout(r, 250))
+          continue
+        }
+
+        // Só grava se o valor realmente mudou (evita escrita desnecessária em pedido que já estava certo)
+        const diferenca = Math.abs((order.shipping_cost_ml || 0) - freteReal)
+        if (diferenca < 0.01 && order.custos_confirmados) {
+          recalcularTodosStatus.jaEstavamCertos++
+        } else {
+          const novoPaidAmount = (order.total_amount || 0) - (order.sale_fee || 0) - freteReal
+          await sb.from('ml_orders').update({
+            shipping_cost_ml: freteReal,
+            paid_amount: novoPaidAmount,
+            custos_confirmados: true,
+            updated_at: new Date().toISOString()
+          }).eq('id', order.id)
+          recalcularTodosStatus.corrigidos++
+        }
+
+        await new Promise(r => setTimeout(r, 250)) // não bater no limite de requisições do ML
+      } catch (e) {
+        recalcularTodosStatus.erros++
+        console.log(`  Erro no pedido ${order.ml_order_id}: ${e.message}`)
+      }
+    }
+  } catch (e) {
+    console.log('Erro rodarRecalcularTodoHistorico:', e.message)
+  } finally {
+    recalcularTodosStatus.running = false
+    recalcularTodosStatus.terminadoEm = new Date().toISOString()
+    console.log(`✅ [Recalcular TODOS] Terminou: ${recalcularTodosStatus.corrigidos} corrigidos, ${recalcularTodosStatus.jaEstavamCertos} já estavam certos, ${recalcularTodosStatus.erros} erros`)
+  }
+}
+
+app.all('/api/recalcular-todo-historico', (req, res) => {
+  if (recalcularTodosStatus.running) {
+    return res.json({ ok: true, message: 'Já está rodando, confere o progresso em /api/recalcular-todo-historico/status', status: recalcularTodosStatus })
+  }
+  rodarRecalcularTodoHistorico() // não aguarda — roda em segundo plano
+  res.json({ ok: true, message: 'Iniciado em segundo plano. Isso pode levar alguns minutos dependendo de quantos pedidos você tem. Confere o progresso em /api/recalcular-todo-historico/status' })
+})
+
+app.get('/api/recalcular-todo-historico/status', (req, res) => {
+  res.json(recalcularTodosStatus)
+})
+
 async function recalcularUmPedido(mlOrderId) {
   const { data: order } = await sb.from('ml_orders').select('*').eq('ml_order_id', mlOrderId).maybeSingle()
   if (!order) return { ok: false, error: 'Pedido não encontrado no nosso banco' }
