@@ -608,6 +608,25 @@ async function detectOrderType(order, token) {
 // ── CORREÇÃO v9.0: Buscar custos reais via /orders/{id}/billing_info ──────────
 // A API do ML tem um endpoint específico que retorna exatamente o que aparece
 // no extrato do vendedor: comissão real, frete real, descontos/bônus de campanha
+// ── Frete real via /shipments/{id}/costs — disponível NA HORA, sem esperar o billing_info fechar ──
+// senders[].cost é exatamente o que sobra pro vendedor pagar (já descontando o que o comprador cobriu),
+// confirmado na documentação oficial do Mercado Livre.
+async function getFreteRealML(shipmentId, token) {
+  if (!shipmentId || !token) return null
+  try {
+    const { data } = await axios.get(
+      `https://api.mercadolibre.com/shipments/${shipmentId}/costs`,
+      { headers: { Authorization: `Bearer ${token}` }, timeout: 5000 }
+    )
+    const senders = data.senders || []
+    const freteVendedor = senders.reduce((s, sender) => s + (sender.cost || 0), 0)
+    return freteVendedor
+  } catch (e) {
+    console.log(`  [Frete real] Erro ao buscar /shipments/${shipmentId}/costs: ${e.message}`)
+    return null
+  }
+}
+
 async function calcCustosReaisML(mlOrderId, token) {
   if (!mlOrderId || !token) return { saleFeeLiquido: 0, freteVendedor: 0, bonusCampanha: 0 }
   try {
@@ -817,10 +836,8 @@ async function syncMLOrders(account) {
               const taxesAmount = order.taxes?.amount || 0
               const shipmentId = order.shipping?.id ? String(order.shipping.id) : null
 
-              // Busca o rastreio pelo shipment, e os custos reais (comissão + frete que sobra pro vendedor)
-              // pelo billing_info — que reflete o extrato de verdade do ML, já descontando o que o
-              // comprador pagou de frete pelo Mercado Envios. Sem isso, o frete aparecia inteiro como
-              // se fosse tudo custo seu, o que gerava prejuízo falso.
+              // Busca o rastreio, e o frete real via /shipments/{id}/costs — esse valor já vem certo
+              // na hora, sem precisar esperar o billing_info fechar (pode levar horas do lado do ML).
               let trackingNumber = null
               let freteVendedorFallback = 0
               if (shipmentId && token) {
@@ -836,11 +853,10 @@ async function syncMLOrders(account) {
                 }
               }
 
-              const custosReais = await calcCustosReaisML(order.id, token)
-              const saleFeeLiquido = custosReais?.saleFeeLiquido ?? saleFeeTot
-              // Só usa o valor cheio do shipment (menos preciso) se o billing_info ainda não tiver fechado —
-              // o recálculo automático corrige isso depois, quando o ML já tiver processado
-              const freteVendedor = custosReais ? custosReais.freteVendedor : freteVendedorFallback
+              const freteReal = await getFreteRealML(shipmentId, token)
+              const saleFeeLiquido = saleFeeTot // a comissão por item já vem certa direto do pedido, sempre foi confiável
+              const freteVendedor = freteReal != null ? freteReal : freteVendedorFallback
+              const custosConfirmadosAgora = freteReal != null // true assim que o /costs responder — não precisa esperar o billing_info
 
               const paidAmount = totalAmount - saleFeeLiquido - freteVendedor
 
@@ -862,7 +878,7 @@ async function syncMLOrders(account) {
                 sale_fee: saleFeeLiquido,
                 shipping_cost_ml: freteVendedor,
                 taxes_amount: taxesAmount,
-                custos_confirmados: !!custosReais // só true se veio do billing_info de verdade, não do valor provisório
+                custos_confirmados: custosConfirmadosAgora // true assim que o /shipments/costs respondeu certo
               })
 
               // Se realmente inseriu agora (não era duplicado), desconta o estoque central na hora.
@@ -1500,9 +1516,9 @@ async function recalcularPedidosRecentesAutomatico() {
           } catch(e) {}
         }
 
-        const custosReais = await calcCustosReaisML(order.ml_order_id, orderToken)
-        const saleFeeReal = custosReais?.saleFeeLiquido ?? saleFeeTot
-        const freteVendedor = custosReais ? custosReais.freteVendedor : freteVendedorFallback
+        const freteReal = await getFreteRealML(order.shipment_id, orderToken)
+        const saleFeeReal = saleFeeTot
+        const freteVendedor = freteReal != null ? freteReal : freteVendedorFallback
 
         await sb.from('ml_orders').update({
           sale_fee: saleFeeReal,
@@ -1511,7 +1527,7 @@ async function recalcularPedidosRecentesAutomatico() {
           taxes_amount: taxesAmount,
           total_amount: totalAmount,
           tracking_number: trackingNumber,
-          custos_confirmados: !!custosReais
+          custos_confirmados: freteReal != null
         }).eq('id', order.id)
         corrigidos++
         await new Promise(r => setTimeout(r, 400))
@@ -1534,25 +1550,27 @@ async function recalcularUmPedido(mlOrderId) {
   if (!account) return { ok: false, error: 'Conta ML não encontrada' }
   const token = await getToken(account)
 
-  console.log(`🔎 [Recalcular 1 pedido] ${mlOrderId} — buscando billing_info...`)
-  const custosReais = await calcCustosReaisML(mlOrderId, token)
-  console.log(`🔎 [Recalcular 1 pedido] ${mlOrderId} — resultado billing_info:`, JSON.stringify(custosReais))
-
-  if (!custosReais) {
-    return { ok: false, error: 'billing_info não retornou dados (pode não ter fechado ainda do lado do ML)', order_atual: order }
-  }
-
   const { data: mlOrder } = await axios.get(
     `https://api.mercadolibre.com/orders/${mlOrderId}`,
     { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
   )
+  const saleFeeReal = mlOrder.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || 0
   const totalAmount = mlOrder.total_amount || order.total_amount
   const taxesAmount = mlOrder.taxes?.amount || 0
-  const paidAmount = totalAmount - custosReais.saleFeeLiquido - custosReais.freteVendedor
+
+  console.log(`🔎 [Recalcular 1 pedido] ${mlOrderId} — buscando /shipments/${order.shipment_id}/costs...`)
+  const freteReal = await getFreteRealML(order.shipment_id, token)
+  console.log(`🔎 [Recalcular 1 pedido] ${mlOrderId} — frete real:`, freteReal)
+
+  if (freteReal == null) {
+    return { ok: false, error: 'Não consegui buscar o frete real do shipment (pode não existir shipment_id ainda)', order_atual: order }
+  }
+
+  const paidAmount = totalAmount - saleFeeReal - freteReal
 
   await sb.from('ml_orders').update({
-    sale_fee: custosReais.saleFeeLiquido,
-    shipping_cost_ml: custosReais.freteVendedor,
+    sale_fee: saleFeeReal,
+    shipping_cost_ml: freteReal,
     paid_amount: paidAmount,
     taxes_amount: taxesAmount,
     total_amount: totalAmount,
@@ -1560,7 +1578,7 @@ async function recalcularUmPedido(mlOrderId) {
     updated_at: new Date().toISOString()
   }).eq('id', order.id)
 
-  return { ok: true, mlOrderId, antes: { sale_fee: order.sale_fee, shipping_cost_ml: order.shipping_cost_ml, paid_amount: order.paid_amount }, depois: { sale_fee: custosReais.saleFeeLiquido, shipping_cost_ml: custosReais.freteVendedor, paid_amount: paidAmount } }
+  return { ok: true, mlOrderId, antes: { sale_fee: order.sale_fee, shipping_cost_ml: order.shipping_cost_ml, paid_amount: order.paid_amount }, depois: { sale_fee: saleFeeReal, shipping_cost_ml: freteReal, paid_amount: paidAmount } }
 }
 
 app.get('/api/recalcular-um/:mlOrderId', async (req, res) => {
@@ -1624,8 +1642,7 @@ app.post('/api/recalcular-custos', async (req, res) => {
         const saleFeeTot = mlOrder.order_items?.reduce((s,i) => s + (i.sale_fee || 0), 0) || order.sale_fee || 0
         const taxesAmountNew = mlOrder.taxes?.amount || 0
 
-        // Busca o frete via billing_info (custo real, já descontando o que o comprador pagou) —
-        // só cai no valor cheio do shipment se o billing_info ainda não tiver fechado
+        // Busca o frete real via /shipments/{id}/costs — já vem certo na hora, sem esperar billing_info
         let freteVendedorFallback = 0
         const shipmentIdRecalc = order.shipment_id
         if (shipmentIdRecalc) {
@@ -1640,9 +1657,9 @@ app.post('/api/recalcular-custos', async (req, res) => {
           }
         }
 
-        const custosReais = await calcCustosReaisML(order.ml_order_id, orderToken)
-        const saleFeeLiquido = custosReais?.saleFeeLiquido ?? saleFeeTot
-        const freteVendedor = custosReais ? custosReais.freteVendedor : freteVendedorFallback
+        const freteReal = await getFreteRealML(shipmentIdRecalc, orderToken)
+        const saleFeeLiquido = saleFeeTot
+        const freteVendedor = freteReal != null ? freteReal : freteVendedorFallback
         const paidAmount = totalAmount - saleFeeLiquido - freteVendedor
         const taxesAmount = mlOrder.taxes?.amount || 0
 
@@ -1652,6 +1669,7 @@ app.post('/api/recalcular-custos', async (req, res) => {
           paid_amount: paidAmount,
           taxes_amount: taxesAmount,
           total_amount: totalAmount,
+          custos_confirmados: freteReal != null,
           updated_at: new Date().toISOString()
         }).eq('id', order.id)
         fixed++
