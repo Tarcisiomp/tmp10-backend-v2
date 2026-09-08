@@ -360,9 +360,16 @@ async function getShopeeTrackingNumber(account, orderSn, token) {
         order_sn: orderSn
       }
     })
-    if (data.error) return null // normal: ainda não tem rastreio (pedido não processado pra envio)
+    if (data.error) {
+      console.log(`⚠️ [Shopee Rastreio] ${orderSn}: ${data.error} — ${data.message}`)
+      return null
+    }
+    if (!data.response?.tracking_number) {
+      console.log(`ℹ️ [Shopee Rastreio] ${orderSn}: resposta ok, mas ainda sem tracking_number (pedido não processado pra envio ainda)`)
+    }
     return data.response?.tracking_number || null
   } catch (e) {
+    console.log(`❌ [Shopee Rastreio] Erro de conexão ${orderSn}: ${e.response?.data ? JSON.stringify(e.response.data) : e.message}`)
     return null
   }
 }
