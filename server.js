@@ -360,6 +360,9 @@ async function getShopeeTrackingNumber(account, orderSn, token) {
         order_sn: orderSn
       }
     })
+    // 🔎 DEBUG TEMPORÁRIO — mostra a resposta crua da Shopee, pra ver o formato real que ela usa
+    console.log(`🔎 [Shopee Rastreio DEBUG] ${orderSn} — resposta completa:`, JSON.stringify(data))
+
     if (data.error) {
       console.log(`⚠️ [Shopee Rastreio] ${orderSn}: ${data.error} — ${data.message}`)
       return null
