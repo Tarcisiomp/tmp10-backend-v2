@@ -455,8 +455,36 @@ async function syncShopeeOrders(account) {
         for (const order of (detailData?.response?.order_list || [])) {
           try {
             const { data: existing } = await sb.from('ml_orders')
-              .select('id').eq('ml_order_id', String(order.order_sn)).maybeSingle()
-            if (existing) continue
+              .select('id, tracking_number, platform, empresa_id')
+              .eq('ml_order_id', String(order.order_sn))
+              .eq('empresa_id', account.empresa_id)
+              .maybeSingle()
+
+            // IMPORTANTE: um pedido Shopee pode ser criado antes do rastreio existir.
+            // Não podemos simplesmente ignorar pedidos já existentes, porque isso deixaria
+            // tracking_number = NULL para sempre e a bipagem da etiqueta não encontraria o pedido.
+            // Só consultamos a Shopee novamente quando o pedido existente ainda não tem rastreio.
+            if (existing) {
+              if (existing.platform === 'shopee' && !existing.tracking_number) {
+                const trackingNumberAtualizado = await getShopeeTrackingNumber(account, order.order_sn, token)
+                if (trackingNumberAtualizado) {
+                  const { error: trackingUpdateError } = await sb.from('ml_orders')
+                    .update({
+                      tracking_number: trackingNumberAtualizado,
+                      shipping_carrier: order.shipping_carrier || null,
+                      updated_at: new Date().toISOString()
+                    })
+                    .eq('id', existing.id)
+                    .eq('empresa_id', account.empresa_id)
+                  if (trackingUpdateError) {
+                    console.error(`❌ [Shopee] Falha ao salvar rastreio do pedido ${order.order_sn}:`, trackingUpdateError.message)
+                  } else {
+                    console.log(`📦 [Shopee] Rastreio atualizado no pedido existente ${order.order_sn}: ${trackingNumberAtualizado}`)
+                  }
+                }
+              }
+              continue
+            }
 
             // fulfillment_flag: 'fulfilled_by_shopee' = FBS (equivalente ao FULL do ML), o resto é envio pelo próprio vendedor
             const isFBS = order.fulfillment_flag === 'fulfilled_by_shopee'
@@ -1006,10 +1034,11 @@ async function reclassifyOrders() {
 async function retentarRastreioShopee() {
   try {
     const { data: pendentes } = await sb.from('ml_orders')
-      .select('id, ml_order_id, empresa_id, account_nickname')
+      .select('id, ml_order_id, empresa_id, account_nickname, status')
       .eq('platform', 'shopee')
       .is('tracking_number', null)
-      .in('status', ['aguardando', 'separando', 'conferindo', 'embalado'])
+      .not('status', 'in', '(finalizado,cancelado)')
+      .order('created_at_ml', { ascending: true })
       .limit(100)
     if (!pendentes?.length) return
 
