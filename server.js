@@ -1354,6 +1354,66 @@ function calcularExcedenteArmazenamento(gbUtilizado, gbIncluido) {
   }
 }
 
+// Mede o armazenamento em arquivo (fotos, anexos, logo) de uma empresa específica,
+// somando o tamanho de tudo que está salvo nas pastas dela no Supabase Storage.
+async function medirArquivosEmpresa(empresaId) {
+  let bytesArquivos = 0
+  const pastas = [`fin-anexos/${empresaId}`, `produtos/${empresaId}`, empresaId]
+  for (const pasta of pastas) {
+    try {
+      const { data: arquivos } = await sb.storage.from('revendas-fotos').list(pasta, { limit: 1000 })
+      for (const arq of (arquivos || [])) {
+        bytesArquivos += arq.metadata?.size || 0
+      }
+    } catch (e) { /* pasta pode não existir ainda pra essa empresa, tudo bem */ }
+  }
+  // Logo é um arquivo único, direto na pasta "logo", nomeado com o próprio empresa_id
+  try {
+    const { data: logos } = await sb.storage.from('revendas-fotos').list('logo', { limit: 1000 })
+    const logoDoCliente = (logos || []).find(f => f.name.startsWith(`${empresaId}.`))
+    if (logoDoCliente) bytesArquivos += logoDoCliente.metadata?.size || 0
+  } catch (e) {}
+  return bytesArquivos / (1024 ** 3) // bytes pra GB
+}
+
+// Mede tudo (arquivos + estimativa de banco) de uma empresa e salva no histórico —
+// é essa medição que depois vira "o maior armazenamento do ciclo" na hora de fechar a fatura.
+async function medirArmazenamentoEmpresa(empresaId) {
+  try {
+    const gbArquivos = await medirArquivosEmpresa(empresaId)
+    const { data: gbBanco } = await sb.rpc('estimar_armazenamento_banco', { p_empresa_id: empresaId })
+    const gbBancoNum = gbBanco || 0
+    const gbTotal = gbArquivos + gbBancoNum
+
+    await sb.from('armazenamento_historico').insert({
+      empresa_id: empresaId,
+      data: new Date().toISOString().slice(0, 10),
+      gb_arquivos: Math.round(gbArquivos * 100) / 100,
+      gb_banco_estimado: Math.round(gbBancoNum * 100) / 100,
+      gb_total: Math.round(gbTotal * 100) / 100
+    })
+
+    return { gbArquivos, gbBanco: gbBancoNum, gbTotal }
+  } catch (e) {
+    console.log(`Erro medirArmazenamentoEmpresa ${empresaId}:`, e.message)
+    return null
+  }
+}
+
+// Roda pra todas as empresas — uma vez por dia, sozinho
+async function medirArmazenamentoTodasEmpresas() {
+  try {
+    const { data: empresas } = await sb.from('empresas').select('id').neq('status', 'inativo')
+    for (const emp of (empresas || [])) {
+      await medirArmazenamentoEmpresa(emp.id)
+      await new Promise(r => setTimeout(r, 300))
+    }
+    console.log(`📊 Armazenamento medido pra ${(empresas || []).length} empresa(s)`)
+  } catch (e) {
+    console.log('Erro medirArmazenamentoTodasEmpresas:', e.message)
+  }
+}
+
 // ── Contas a Pagar Recorrentes ───────────────────────────────────────
 // Toda vez que a data de vencimento (menos a antecedência configurada) chegar,
 // gera automaticamente a conta a pagar do mês e já agenda a próxima geração.
@@ -1414,6 +1474,7 @@ cron.schedule('*/10 * * * *', recalcularPedidosRecentesAutomatico)
 cron.schedule('0 */6 * * *', gerarContasRecorrentes)
 cron.schedule('0 */6 * * *', gerarFaturasCartao)
 cron.schedule('0 8 * * *', alertarContasVencendoHoje)
+cron.schedule('0 3 * * *', medirArmazenamentoTodasEmpresas)
 
 // ── Webhook ML ────────────────────────────────────────────────────
 app.post('/ml/notifications', async (req, res) => {
@@ -1510,6 +1571,17 @@ app.post('/api/fin/gerar-faturas', async (req, res) => {
 app.post('/api/fin/alertar-vencimento', async (req, res) => {
   await alertarContasVencendoHoje()
   res.json({ ok: true })
+})
+
+app.get('/api/faturamento/medir-armazenamento/:empresaId', async (req, res) => {
+  const resultado = await medirArmazenamentoEmpresa(req.params.empresaId)
+  if (!resultado) return res.status(500).json({ ok: false, error: 'Não consegui medir — confere se o empresa_id existe' })
+  res.json({ ok: true, ...resultado })
+})
+
+app.get('/api/faturamento/medir-todas', async (req, res) => {
+  medirArmazenamentoTodasEmpresas() // não aguarda — roda em segundo plano, pode demorar se tiver muita empresa
+  res.json({ ok: true, message: 'Medição iniciada em segundo plano pra todas as empresas.' })
 })
 
 app.post('/api/sync-estoque', async (req, res) => {
