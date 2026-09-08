@@ -1304,6 +1304,56 @@ async function gerarFaturasCartao() {
 }
 
 // ── Crons ─────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+// FATURAMENTO SAAS — cobrança automática dos clientes do TMP10 (por volume de pedidos + armazenamento)
+// ═══════════════════════════════════════════════════════════════════
+
+// Tabela de faixas — usar SEMPRE esses valores, nunca somar faixas, só a maior atingida no ciclo.
+const FAIXAS_FATURAMENTO = [
+  { max: 200,        label: 'Até 200 pedidos',        valor: 129.00, gb: 1 },
+  { max: 400,        label: '201 a 400 pedidos',      valor: 199.00, gb: 2 },
+  { max: 600,        label: '401 a 600 pedidos',      valor: 279.00, gb: 4 },
+  { max: 1000,       label: '601 a 1.000 pedidos',    valor: 399.00, gb: 8 },
+  { max: 2000,       label: '1.001 a 2.000 pedidos',  valor: 599.00, gb: 16 },
+  { max: 3000,       label: '2.001 a 3.000 pedidos',  valor: 849.00, gb: 24 },
+]
+const FAIXA_MAXIMA = { label: 'Acima de 3.000 pedidos', valor: 849.00, gb: 35, valorPorPedidoExcedente: 0.20 }
+const VALOR_POR_GB_EXCEDENTE = 10.00
+
+// Recebe a MAIOR quantidade de pedidos atingida no ciclo e devolve tudo já calculado —
+// faixa, valor do plano, armazenamento incluído, e o excedente de pedidos (só existe acima de 3.000).
+function calcularFaixaPedidos(maiorQtdPedidos) {
+  for (const faixa of FAIXAS_FATURAMENTO) {
+    if (maiorQtdPedidos <= faixa.max) {
+      return {
+        faixaLabel: faixa.label,
+        valorPlano: faixa.valor,
+        gbIncluido: faixa.gb,
+        pedidosExcedentes: 0,
+        valorExcedentePedidos: 0
+      }
+    }
+  }
+  // Acima de 3.000 — os primeiros 3.000 continuam incluídos no valor fixo, só o que passar disso é cobrado à parte
+  const pedidosExcedentes = maiorQtdPedidos - 3000
+  return {
+    faixaLabel: FAIXA_MAXIMA.label,
+    valorPlano: FAIXA_MAXIMA.valor,
+    gbIncluido: FAIXA_MAXIMA.gb,
+    pedidosExcedentes,
+    valorExcedentePedidos: Math.round(pedidosExcedentes * FAIXA_MAXIMA.valorPorPedidoExcedente * 100) / 100
+  }
+}
+
+// Calcula o excedente de armazenamento — proporcional, sem arredondar pra cima.
+function calcularExcedenteArmazenamento(gbUtilizado, gbIncluido) {
+  const excedente = Math.max(0, gbUtilizado - gbIncluido)
+  return {
+    armazenamentoExcedenteGb: Math.round(excedente * 100) / 100,
+    valorExcedenteArmazenamento: Math.round(excedente * VALOR_POR_GB_EXCEDENTE * 100) / 100
+  }
+}
+
 // ── Contas a Pagar Recorrentes ───────────────────────────────────────
 // Toda vez que a data de vencimento (menos a antecedência configurada) chegar,
 // gera automaticamente a conta a pagar do mês e já agenda a próxima geração.
