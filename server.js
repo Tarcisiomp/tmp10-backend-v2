@@ -1414,6 +1414,96 @@ async function medirArmazenamentoTodasEmpresas() {
   }
 }
 
+// Gera a fatura de uma empresa pra um período específico — conta os pedidos reais, pega o maior
+// armazenamento medido no período, calcula tudo pela tabela de faixas, e grava.
+async function gerarFatura(empresaId, periodoInicio, periodoFim) {
+  const { count: pedidosNoPeriodo } = await sb.from('ml_orders')
+    .select('*', { count: 'exact', head: true })
+    .eq('empresa_id', empresaId)
+    .gte('created_at_ml', periodoInicio)
+    .lte('created_at_ml', periodoFim + 'T23:59:59')
+    .neq('status', 'cancelado')
+
+  const { faixaLabel, valorPlano, gbIncluido, pedidosExcedentes, valorExcedentePedidos } = calcularFaixaPedidos(pedidosNoPeriodo || 0)
+
+  // Maior armazenamento medido durante o período (não o de hoje, o PICO do ciclo inteiro)
+  const { data: medicoes } = await sb.from('armazenamento_historico')
+    .select('gb_total')
+    .eq('empresa_id', empresaId)
+    .gte('data', periodoInicio)
+    .lte('data', periodoFim)
+    .order('gb_total', { ascending: false })
+    .limit(1)
+  const maiorArmazenamento = medicoes?.[0]?.gb_total || 0
+
+  const { armazenamentoExcedenteGb, valorExcedenteArmazenamento } = calcularExcedenteArmazenamento(maiorArmazenamento, gbIncluido)
+  const valorTotal = Math.round((valorPlano + valorExcedentePedidos + valorExcedenteArmazenamento) * 100) / 100
+
+  await sb.from('faturas').insert({
+    empresa_id: empresaId,
+    periodo_inicio: periodoInicio,
+    periodo_fim: periodoFim,
+    pedidos_no_periodo: pedidosNoPeriodo || 0,
+    faixa_pedidos: faixaLabel,
+    valor_plano: valorPlano,
+    pedidos_excedentes: pedidosExcedentes,
+    valor_excedente_pedidos: valorExcedentePedidos,
+    armazenamento_gb_maior: maiorArmazenamento,
+    armazenamento_incluido_gb: gbIncluido,
+    armazenamento_excedente_gb: armazenamentoExcedenteGb,
+    valor_excedente_armazenamento: valorExcedenteArmazenamento,
+    valor_total: valorTotal,
+    vencimento: periodoFim, // o vencimento é o próprio dia do fechamento, como combinado
+    status: 'em_aberto'
+  })
+
+  console.log(`💰 [Faturamento] Fatura gerada — empresa ${empresaId}: R$ ${valorTotal} (${pedidosNoPeriodo} pedidos, ${maiorArmazenamento}GB)`)
+}
+
+// Roda todo dia — decide, pra cada empresa, se é hora de fechar o ciclo dela.
+// 1ª vez: 30 dias depois do fim do trial (e essa data vira o "dia de vencimento" fixo dali pra frente).
+// Depois disso: todo mês, no mesmo dia.
+async function processarFechamentosDoDia() {
+  try {
+    const hoje = new Date(); hoje.setHours(0, 0, 0, 0)
+    const hojeStr = hoje.toISOString().slice(0, 10)
+    const diaHoje = hoje.getDate()
+
+    const { data: empresas } = await sb.from('empresas').select('*').neq('status', 'inativo')
+    for (const emp of (empresas || [])) {
+      try {
+        if (!emp.trial_fim) continue // empresa antiga, cadastrada antes de existir esse campo — não sabemos quando começar a contar
+
+        if (!emp.dia_vencimento_fatura) {
+          // Ainda não fechou o primeiro ciclo — checa se já passaram os 30 dias desde o fim do trial
+          const trialFimData = new Date(emp.trial_fim + 'T00:00:00')
+          const primeiroFechamento = new Date(trialFimData)
+          primeiroFechamento.setDate(primeiroFechamento.getDate() + 30)
+
+          if (hoje >= primeiroFechamento) {
+            const primeiroFechamentoStr = primeiroFechamento.toISOString().slice(0, 10)
+            await gerarFatura(emp.id, emp.trial_fim, primeiroFechamentoStr)
+            await sb.from('empresas').update({
+              dia_vencimento_fatura: primeiroFechamento.getDate(),
+              ultimo_fechamento: primeiroFechamentoStr
+            }).eq('id', emp.id)
+          }
+        } else if (diaHoje === emp.dia_vencimento_fatura && emp.ultimo_fechamento !== hojeStr) {
+          // Já tem o ciclo definido — fecha de novo, contando a partir do dia seguinte ao último fechamento
+          const periodoInicioData = new Date(emp.ultimo_fechamento + 'T00:00:00')
+          periodoInicioData.setDate(periodoInicioData.getDate() + 1)
+          await gerarFatura(emp.id, periodoInicioData.toISOString().slice(0, 10), hojeStr)
+          await sb.from('empresas').update({ ultimo_fechamento: hojeStr }).eq('id', emp.id)
+        }
+      } catch (e) {
+        console.log(`Erro fechamento empresa ${emp.id}:`, e.message)
+      }
+    }
+  } catch (e) {
+    console.log('Erro processarFechamentosDoDia:', e.message)
+  }
+}
+
 // ── Contas a Pagar Recorrentes ───────────────────────────────────────
 // Toda vez que a data de vencimento (menos a antecedência configurada) chegar,
 // gera automaticamente a conta a pagar do mês e já agenda a próxima geração.
@@ -1475,6 +1565,7 @@ cron.schedule('0 */6 * * *', gerarContasRecorrentes)
 cron.schedule('0 */6 * * *', gerarFaturasCartao)
 cron.schedule('0 8 * * *', alertarContasVencendoHoje)
 cron.schedule('0 3 * * *', medirArmazenamentoTodasEmpresas)
+cron.schedule('0 4 * * *', processarFechamentosDoDia)
 
 // ── Webhook ML ────────────────────────────────────────────────────
 app.post('/ml/notifications', async (req, res) => {
@@ -1582,6 +1673,25 @@ app.get('/api/faturamento/medir-armazenamento/:empresaId', async (req, res) => {
 app.get('/api/faturamento/medir-todas', async (req, res) => {
   medirArmazenamentoTodasEmpresas() // não aguarda — roda em segundo plano, pode demorar se tiver muita empresa
   res.json({ ok: true, message: 'Medição iniciada em segundo plano pra todas as empresas.' })
+})
+
+app.get('/api/faturamento/processar-fechamentos', async (req, res) => {
+  await processarFechamentosDoDia()
+  res.json({ ok: true, message: 'Fechamentos processados. Confere a tabela faturas.' })
+})
+
+// Gera uma fatura manual pra uma empresa/período específico — útil pra testar sem esperar a data certa
+app.get('/api/faturamento/gerar-fatura/:empresaId', async (req, res) => {
+  try {
+    const { periodoInicio, periodoFim } = req.query
+    if (!periodoInicio || !periodoFim) {
+      return res.status(400).json({ ok: false, error: 'Manda ?periodoInicio=YYYY-MM-DD&periodoFim=YYYY-MM-DD na URL' })
+    }
+    await gerarFatura(req.params.empresaId, periodoInicio, periodoFim)
+    res.json({ ok: true, message: 'Fatura gerada, confere a tabela faturas.' })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message })
+  }
 })
 
 app.post('/api/sync-estoque', async (req, res) => {
