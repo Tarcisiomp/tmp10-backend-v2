@@ -1403,7 +1403,7 @@ async function medirArmazenamentoEmpresa(empresaId) {
 // Roda pra todas as empresas — uma vez por dia, sozinho
 async function medirArmazenamentoTodasEmpresas() {
   try {
-    const { data: empresas } = await sb.from('empresas').select('id').neq('status', 'inativo')
+    const { data: empresas } = await sb.from('empresas').select('id').neq('status', 'inativo').neq('plano', 'interno')
     for (const emp of (empresas || [])) {
       await medirArmazenamentoEmpresa(emp.id)
       await new Promise(r => setTimeout(r, 300))
@@ -1469,7 +1469,7 @@ async function processarFechamentosDoDia() {
     const hojeStr = hoje.toISOString().slice(0, 10)
     const diaHoje = hoje.getDate()
 
-    const { data: empresas } = await sb.from('empresas').select('*').neq('status', 'inativo')
+    const { data: empresas } = await sb.from('empresas').select('*').neq('status', 'inativo').neq('plano', 'interno')
     for (const emp of (empresas || [])) {
       try {
         if (!emp.trial_fim) continue // empresa antiga, cadastrada antes de existir esse campo — não sabemos quando começar a contar
