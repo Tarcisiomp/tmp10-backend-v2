@@ -1651,6 +1651,11 @@ app.post('/api/check-deliveries', async (req, res) => {
   res.json({ ok: true })
 })
 
+app.get('/api/shopee/check-tracking', async (req, res) => {
+  await retentarRastreioShopee()
+  res.json({ ok: true })
+})
+
 app.post('/api/shopee/check-tracking', async (req, res) => {
   await retentarRastreioShopee()
   res.json({ ok: true })
