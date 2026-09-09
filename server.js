@@ -1738,6 +1738,109 @@ app.get('/api/faturamento/gerar-fatura/:empresaId', async (req, res) => {
   }
 })
 
+// Consulta o ciclo de faturamento ATUAL de uma empresa (pedidos já feitos, faixa, valor) SEM gerar fatura
+// e sem gravar nada em nenhuma tabela — é só leitura. Não chama gerarFatura() nem mexe nela; tem sua
+// própria query de contagem (mesmos filtros que gerarFatura usa) pra zero risco de afetar o faturamento real.
+app.get('/api/faturamento/status/:empresaId', async (req, res) => {
+  try {
+    const { empresaId } = req.params
+
+    const { data: empresa, error: empresaErr } = await sb.from('empresas')
+      .select('id, trial_fim, dia_vencimento_fatura, ultimo_fechamento')
+      .eq('id', empresaId)
+      .maybeSingle()
+
+    if (empresaErr) return res.status(500).json({ ok: false, error: empresaErr.message })
+    if (!empresa) return res.status(404).json({ ok: false, error: 'Empresa não encontrada' })
+
+    const hojeStr = new Date().toISOString().slice(0, 10)
+
+    // Sem trial_fim = empresa nunca entrou no fluxo de fechamento automático (processarFechamentosDoDia
+    // ignora essas empresas), então não dá pra determinar período nenhum.
+    if (!empresa.trial_fim) {
+      return res.json({
+        ok: true,
+        empresaId,
+        cicloDefinido: false,
+        mensagem: 'Ciclo de faturamento ainda não definido para essa empresa (sem trial_fim cadastrado).',
+        periodoInicio: null,
+        periodoFim: null,
+        pedidosNoPeriodo: null,
+        faixaAtual: null,
+        valorPlanoAtual: null,
+        pedidosParaProximaFaixa: null,
+        proximaFaixa: null
+      })
+    }
+
+    // Mesmas regras de período que processarFechamentosDoDia() usa pra decidir o ciclo — só que aqui
+    // é uma leitura do estado atual, sem fechar nada e sem gravar nada.
+    let periodoInicio
+    let cicloProvisorio = false
+    const periodoFim = hojeStr
+
+    if (empresa.dia_vencimento_fatura && empresa.ultimo_fechamento) {
+      // Já fechou pelo menos uma vez — ciclo atual começa no dia seguinte ao último fechamento
+      const inicioData = new Date(empresa.ultimo_fechamento + 'T00:00:00')
+      inicioData.setDate(inicioData.getDate() + 1)
+      periodoInicio = inicioData.toISOString().slice(0, 10)
+    } else {
+      // Ainda não fechou o primeiro ciclo — mostra o provisório desde o fim do trial
+      periodoInicio = empresa.trial_fim
+      cicloProvisorio = true
+    }
+
+    // Contagem própria, só leitura — mesmos filtros que gerarFatura() usa (empresa_id + created_at_ml
+    // no período + exclui cancelado), sem chamar nem alterar a função original. ML e Shopee já somam
+    // juntos automaticamente porque os dois ficam na mesma tabela ml_orders.
+    const { count: pedidosNoPeriodo, error: countErr } = await sb.from('ml_orders')
+      .select('*', { count: 'exact', head: true })
+      .eq('empresa_id', empresaId)
+      .gte('created_at_ml', periodoInicio)
+      .lte('created_at_ml', periodoFim + 'T23:59:59')
+      .neq('status', 'cancelado')
+
+    if (countErr) return res.status(500).json({ ok: false, error: countErr.message })
+
+    const qtd = pedidosNoPeriodo || 0
+
+    // Acha a faixa atual e a próxima — lê FAIXAS_FATURAMENTO/FAIXA_MAXIMA, não altera nenhuma das duas.
+    let faixaAtual, valorPlanoAtual, pedidosParaProximaFaixa, proximaFaixa
+    const idxFaixa = FAIXAS_FATURAMENTO.findIndex(f => qtd <= f.max)
+
+    if (idxFaixa !== -1) {
+      const faixa = FAIXAS_FATURAMENTO[idxFaixa]
+      faixaAtual = faixa.label
+      valorPlanoAtual = faixa.valor
+      pedidosParaProximaFaixa = faixa.max + 1 - qtd
+      const proxima = FAIXAS_FATURAMENTO[idxFaixa + 1] || FAIXA_MAXIMA
+      proximaFaixa = proxima.label
+    } else {
+      // Acima de 3.000 — já está na faixa máxima, não existe "próxima faixa"
+      faixaAtual = FAIXA_MAXIMA.label
+      valorPlanoAtual = FAIXA_MAXIMA.valor
+      pedidosParaProximaFaixa = 0
+      proximaFaixa = null
+    }
+
+    res.json({
+      ok: true,
+      empresaId,
+      cicloDefinido: true,
+      cicloProvisorio,
+      periodoInicio,
+      periodoFim,
+      pedidosNoPeriodo: qtd,
+      faixaAtual,
+      valorPlanoAtual,
+      pedidosParaProximaFaixa,
+      proximaFaixa
+    })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
 app.post('/api/sync-estoque', async (req, res) => {
   res.json({ ok: true })
   syncEstoqueML()
