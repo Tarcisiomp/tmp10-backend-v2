@@ -1455,48 +1455,91 @@ async function medirArmazenamentoTodasEmpresas() {
 
 // Gera a fatura de uma empresa pra um período específico — conta os pedidos reais, pega o maior
 // armazenamento medido no período, calcula tudo pela tabela de faixas, e grava.
+// Retorna sempre um objeto pro chamador saber exatamente o que aconteceu:
+//   { sucesso: true,  criada: true }                        -> fatura gerada agora
+//   { sucesso: true,  criada: false, motivo: 'ja_existia' }  -> já existia fatura pra esse período, não duplicou
+//   { sucesso: false, erro: '...' }                          -> algo falhou de verdade, NADA foi gravado
 async function gerarFatura(empresaId, periodoInicio, periodoFim) {
-  const { count: pedidosNoPeriodo } = await sb.from('ml_orders')
-    .select('*', { count: 'exact', head: true })
-    .eq('empresa_id', empresaId)
-    .gte('created_at_ml', periodoInicio)
-    .lte('created_at_ml', periodoFim + 'T23:59:59')
-    .neq('status', 'cancelado')
+  try {
+    // Proteção contra duplicidade — se já existe fatura pra esse empresa_id + período exato,
+    // não insere outra nem altera a existente.
+    const { data: faturaExistente, error: checagemErr } = await sb.from('faturas')
+      .select('id')
+      .eq('empresa_id', empresaId)
+      .eq('periodo_inicio', periodoInicio)
+      .eq('periodo_fim', periodoFim)
+      .maybeSingle()
 
-  const { faixaLabel, valorPlano, gbIncluido, pedidosExcedentes, valorExcedentePedidos } = calcularFaixaPedidos(pedidosNoPeriodo || 0)
+    if (checagemErr) {
+      console.log(`❌ [Faturamento] Erro ao checar fatura existente (empresa ${empresaId}, ${periodoInicio} a ${periodoFim}):`, checagemErr.message)
+      return { sucesso: false, erro: checagemErr.message }
+    }
+    if (faturaExistente) {
+      console.log(`⚠️ [Faturamento] Fatura já existe pra empresa ${empresaId} no período ${periodoInicio} a ${periodoFim} (id ${faturaExistente.id}) — não vou duplicar.`)
+      return { sucesso: true, criada: false, motivo: 'ja_existia' }
+    }
 
-  // Maior armazenamento medido durante o período (não o de hoje, o PICO do ciclo inteiro)
-  const { data: medicoes } = await sb.from('armazenamento_historico')
-    .select('gb_total')
-    .eq('empresa_id', empresaId)
-    .gte('data', periodoInicio)
-    .lte('data', periodoFim)
-    .order('gb_total', { ascending: false })
-    .limit(1)
-  const maiorArmazenamento = medicoes?.[0]?.gb_total || 0
+    const { count: pedidosNoPeriodo, error: countErr } = await sb.from('ml_orders')
+      .select('*', { count: 'exact', head: true })
+      .eq('empresa_id', empresaId)
+      .gte('created_at_ml', periodoInicio)
+      .lte('created_at_ml', periodoFim + 'T23:59:59')
+      .neq('status', 'cancelado')
 
-  const { armazenamentoExcedenteGb, valorExcedenteArmazenamento } = calcularExcedenteArmazenamento(maiorArmazenamento, gbIncluido)
-  const valorTotal = Math.round((valorPlano + valorExcedentePedidos + valorExcedenteArmazenamento) * 100) / 100
+    if (countErr) {
+      console.log(`❌ [Faturamento] Erro ao contar pedidos (empresa ${empresaId}, ${periodoInicio} a ${periodoFim}):`, countErr.message)
+      return { sucesso: false, erro: countErr.message }
+    }
 
-  await sb.from('faturas').insert({
-    empresa_id: empresaId,
-    periodo_inicio: periodoInicio,
-    periodo_fim: periodoFim,
-    pedidos_no_periodo: pedidosNoPeriodo || 0,
-    faixa_pedidos: faixaLabel,
-    valor_plano: valorPlano,
-    pedidos_excedentes: pedidosExcedentes,
-    valor_excedente_pedidos: valorExcedentePedidos,
-    armazenamento_gb_maior: maiorArmazenamento,
-    armazenamento_incluido_gb: gbIncluido,
-    armazenamento_excedente_gb: armazenamentoExcedenteGb,
-    valor_excedente_armazenamento: valorExcedenteArmazenamento,
-    valor_total: valorTotal,
-    vencimento: periodoFim, // o vencimento é o próprio dia do fechamento, como combinado
-    status: 'em_aberto'
-  })
+    const { faixaLabel, valorPlano, gbIncluido, pedidosExcedentes, valorExcedentePedidos } = calcularFaixaPedidos(pedidosNoPeriodo || 0)
 
-  console.log(`💰 [Faturamento] Fatura gerada — empresa ${empresaId}: R$ ${valorTotal} (${pedidosNoPeriodo} pedidos, ${maiorArmazenamento}GB)`)
+    // Maior armazenamento medido durante o período (não o de hoje, o PICO do ciclo inteiro)
+    const { data: medicoes, error: medicoesErr } = await sb.from('armazenamento_historico')
+      .select('gb_total')
+      .eq('empresa_id', empresaId)
+      .gte('data', periodoInicio)
+      .lte('data', periodoFim)
+      .order('gb_total', { ascending: false })
+      .limit(1)
+
+    if (medicoesErr) {
+      console.log(`❌ [Faturamento] Erro ao buscar armazenamento (empresa ${empresaId}, ${periodoInicio} a ${periodoFim}):`, medicoesErr.message)
+      return { sucesso: false, erro: medicoesErr.message }
+    }
+    const maiorArmazenamento = medicoes?.[0]?.gb_total || 0
+
+    const { armazenamentoExcedenteGb, valorExcedenteArmazenamento } = calcularExcedenteArmazenamento(maiorArmazenamento, gbIncluido)
+    const valorTotal = Math.round((valorPlano + valorExcedentePedidos + valorExcedenteArmazenamento) * 100) / 100
+
+    const { error: insertErr } = await sb.from('faturas').insert({
+      empresa_id: empresaId,
+      periodo_inicio: periodoInicio,
+      periodo_fim: periodoFim,
+      pedidos_no_periodo: pedidosNoPeriodo || 0,
+      faixa_pedidos: faixaLabel,
+      valor_plano: valorPlano,
+      pedidos_excedentes: pedidosExcedentes,
+      valor_excedente_pedidos: valorExcedentePedidos,
+      armazenamento_gb_maior: maiorArmazenamento,
+      armazenamento_incluido_gb: gbIncluido,
+      armazenamento_excedente_gb: armazenamentoExcedenteGb,
+      valor_excedente_armazenamento: valorExcedenteArmazenamento,
+      valor_total: valorTotal,
+      vencimento: periodoFim, // o vencimento é o próprio dia do fechamento, como combinado
+      status: 'em_aberto'
+    })
+
+    if (insertErr) {
+      console.log(`❌ [Faturamento] Erro ao gravar fatura (empresa ${empresaId}, ${periodoInicio} a ${periodoFim}):`, insertErr.message)
+      return { sucesso: false, erro: insertErr.message }
+    }
+
+    console.log(`💰 [Faturamento] Fatura gerada — empresa ${empresaId}: R$ ${valorTotal} (${pedidosNoPeriodo} pedidos, ${maiorArmazenamento}GB)`)
+    return { sucesso: true, criada: true }
+  } catch (e) {
+    console.log(`❌ [Faturamento] Erro inesperado em gerarFatura (empresa ${empresaId}, ${periodoInicio} a ${periodoFim}):`, e.message)
+    return { sucesso: false, erro: e.message }
+  }
 }
 
 // Roda todo dia — decide, pra cada empresa, se é hora de fechar o ciclo dela.
@@ -1521,18 +1564,27 @@ async function processarFechamentosDoDia() {
 
           if (hoje >= primeiroFechamento) {
             const primeiroFechamentoStr = primeiroFechamento.toISOString().slice(0, 10)
-            await gerarFatura(emp.id, emp.trial_fim, primeiroFechamentoStr)
-            await sb.from('empresas').update({
-              dia_vencimento_fatura: primeiroFechamento.getDate(),
-              ultimo_fechamento: primeiroFechamentoStr
-            }).eq('id', emp.id)
+            const resultado = await gerarFatura(emp.id, emp.trial_fim, primeiroFechamentoStr)
+            if (resultado.sucesso) {
+              await sb.from('empresas').update({
+                dia_vencimento_fatura: primeiroFechamento.getDate(),
+                ultimo_fechamento: primeiroFechamentoStr
+              }).eq('id', emp.id)
+            } else {
+              console.log(`❌ [Fechamento] Empresa ${emp.id}: gerarFatura falhou (${primeiroFechamentoStr}) — NÃO avancei o ciclo. Erro: ${resultado.erro}`)
+            }
           }
         } else if (diaHoje === emp.dia_vencimento_fatura && emp.ultimo_fechamento !== hojeStr) {
           // Já tem o ciclo definido — fecha de novo, contando a partir do dia seguinte ao último fechamento
           const periodoInicioData = new Date(emp.ultimo_fechamento + 'T00:00:00')
           periodoInicioData.setDate(periodoInicioData.getDate() + 1)
-          await gerarFatura(emp.id, periodoInicioData.toISOString().slice(0, 10), hojeStr)
-          await sb.from('empresas').update({ ultimo_fechamento: hojeStr }).eq('id', emp.id)
+          const periodoInicioStr = periodoInicioData.toISOString().slice(0, 10)
+          const resultado = await gerarFatura(emp.id, periodoInicioStr, hojeStr)
+          if (resultado.sucesso) {
+            await sb.from('empresas').update({ ultimo_fechamento: hojeStr }).eq('id', emp.id)
+          } else {
+            console.log(`❌ [Fechamento] Empresa ${emp.id}: gerarFatura falhou (${periodoInicioStr} a ${hojeStr}) — NÃO avancei o ciclo. Erro: ${resultado.erro}`)
+          }
         }
       } catch (e) {
         console.log(`Erro fechamento empresa ${emp.id}:`, e.message)
@@ -1835,6 +1887,41 @@ app.get('/api/faturamento/status/:empresaId', async (req, res) => {
       valorPlanoAtual,
       pedidosParaProximaFaixa,
       proximaFaixa
+    })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message })
+  }
+})
+
+// Rota de teste segura — SÓ verifica se já existe fatura pro período informado. Não cria, não altera,
+// não apaga nada. Serve pra conferir manualmente a proteção contra duplicidade de gerarFatura().
+app.get('/api/faturamento/verificar-fatura/:empresaId', async (req, res) => {
+  try {
+    const { empresaId } = req.params
+    const { periodoInicio, periodoFim } = req.query
+    if (!periodoInicio || !periodoFim) {
+      return res.status(400).json({ ok: false, error: 'Manda ?periodoInicio=YYYY-MM-DD&periodoFim=YYYY-MM-DD na URL' })
+    }
+
+    const { data: fatura, error } = await sb.from('faturas')
+      .select('id, status, valor_total, pedidos_no_periodo')
+      .eq('empresa_id', empresaId)
+      .eq('periodo_inicio', periodoInicio)
+      .eq('periodo_fim', periodoFim)
+      .maybeSingle()
+
+    if (error) return res.status(500).json({ ok: false, error: error.message })
+
+    res.json({
+      ok: true,
+      empresaId,
+      periodoInicio,
+      periodoFim,
+      existeFatura: !!fatura,
+      faturaId: fatura?.id || null,
+      status: fatura?.status || null,
+      valorTotal: fatura?.valor_total ?? null,
+      pedidosNoPeriodo: fatura?.pedidos_no_periodo ?? null
     })
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message })
