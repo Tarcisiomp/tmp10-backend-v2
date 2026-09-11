@@ -496,7 +496,7 @@ async function syncShopeeOrders(account) {
             const status = isFBS ? 'full_ml' : 'aguardando'
 
             const items = (order.item_list || []).map(item => ({
-              sku: item.model_sku || item.item_sku || String(item.item_id),
+              sku: String(item.model_sku || item.item_sku || item.item_id).trim(),
               name: item.item_name,
               qty: item.model_quantity_purchased || 1,
               ml_item_id: item.item_id,
@@ -861,7 +861,7 @@ async function syncMLOrders(account) {
               const status = isFull ? 'full_ml' : 'aguardando'
 
               const items = order.order_items.map(item => ({
-                sku: item.item.seller_sku || item.item.id,
+                sku: String(item.item.seller_sku || item.item.id).trim(),
                 name: item.item.title,
                 qty: item.quantity,
                 ml_item_id: item.item.id,
@@ -2431,7 +2431,7 @@ async function rodarImportProducts(empresa_id) {
               const item = entry.body
               const skuAttr = (item.attributes || []).find(a => a.id === 'SELLER_SKU')
               const skuReal = skuAttr?.value_name || item.seller_custom_field || null
-              const sku = String(skuReal || item.id)
+              const sku = String(skuReal || item.id).trim()
 
               await sb.from('products').upsert({
                 sku,
@@ -2592,7 +2592,7 @@ async function rodarImportProductsShopee(empresa_id) {
               if (modelos.length > 0) {
                 // Produto com variações — um SKU por variação
                 for (const modelo of modelos) {
-                  const sku = String(modelo.model_sku || `${item.item_id}-${modelo.model_id}`)
+                  const sku = String(modelo.model_sku || `${item.item_id}-${modelo.model_id}`).trim()
                   const estoque = modelo.stock_info_v2?.summary_info?.total_available_stock || 0
                   await sb.from('products').upsert({
                     sku,
@@ -2617,7 +2617,7 @@ async function rodarImportProductsShopee(empresa_id) {
                 }
               } else {
                 // Produto simples, sem variação
-                const sku = String(item.item_sku || item.item_id)
+                const sku = String(item.item_sku || item.item_id).trim()
                 const estoque = item.stock_info_v2?.summary_info?.total_available_stock || 0
                 await sb.from('products').upsert({
                   sku,
