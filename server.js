@@ -7,13 +7,28 @@ const { createClient } = require('@supabase/supabase-js')
 const webpush = require('web-push')
 const ws = require('ws')
 
+// ── Configuração (Etapa 0 de segurança) ─────────────────────────────
+// Todos os segredos vêm SOMENTE das variáveis de ambiente do Railway. Ver src/config.js e .env.example.
+const { lerConfig } = require('./src/config')
+const { criarExigirAdmin } = require('./src/adminAuth')
+let CONFIG
+try {
+  CONFIG = lerConfig()
+} catch (e) {
+  console.error(`❌ [Config] ${e.message}`)
+  console.error('❌ [Config] Configure as variáveis no Railway (Settings → Variables) e faça o deploy de novo. O servidor não vai iniciar sem elas.')
+  process.exit(1)
+}
+// Rotas de manutenção/faturamento/admin: só com o cabeçalho X-Admin-Token (ver src/adminAuth.js)
+const exigirAdmin = criarExigirAdmin({ token: CONFIG.ADMIN_API_TOKEN, modo: CONFIG.ADMIN_ROUTES_MODE })
+
 const app = express()
 app.use(cors())
 app.use(express.json())
 
 const sb = createClient(
-  process.env.SUPABASE_URL || 'https://foshqdjgbcigggrcjtap.supabase.co',
-  process.env.SUPABASE_SERVICE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZvc2hxZGpnYmNpZ2dncmNqdGFwIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3OTQwMDAyMSwiZXhwIjoyMDk0OTc2MDIxfQ.6h_Pouyxs73jug7JJtCtfj50JJPi1whWnAkdJuPNSoI',
+  CONFIG.SUPABASE_URL,
+  CONFIG.SUPABASE_SERVICE_KEY,
   {
     // Node.js não tem WebSocket nativo — o Supabase Realtime precisa do pacote "ws" pra funcionar.
     // Este backend não usa Realtime (só REST via .from()), mas isso evita o erro/aviso na inicialização.
@@ -23,8 +38,8 @@ const sb = createClient(
   }
 )
 
-const ML_CLIENT_ID     = process.env.ML_CLIENT_ID     || '4022957335913783'
-const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET || 'f9jB9yc6UvrAnz4kjT6u02xMxjbvn7z3'
+const ML_CLIENT_ID     = CONFIG.ML_CLIENT_ID
+const ML_CLIENT_SECRET = CONFIG.ML_CLIENT_SECRET
 const RAILWAY_URL      = 'https://tmp10-backend-v2-production.up.railway.app'
 const ERP_URL          = process.env.ERP_URL || 'https://roaring-pixie-c02520.netlify.app'
 
@@ -40,8 +55,8 @@ function shopeeSign(path, timestamp, accessToken = '', shopId = '') {
 }
 
 // ── Notificações Push (Web Push) ────────────────────────────────────
-const VAPID_PUBLIC_KEY  = process.env.VAPID_PUBLIC_KEY  || 'BO4IgKTqXnhka_IuwlscQETrwMIJlUQcSOXUzU290rkvJJslgui5UZdCTWrB-J5QEAoE0ZfXlwqfP0h5gZq1hWw'
-const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || 'aXwrRtzKNRJpFb4g-TDDmk_Kkhw0ToyA4POjhjy6y8Y'
+const VAPID_PUBLIC_KEY  = CONFIG.VAPID_PUBLIC_KEY
+const VAPID_PRIVATE_KEY = CONFIG.VAPID_PRIVATE_KEY
 webpush.setVapidDetails('mailto:contato@tmp10.com.br', VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY)
 
 // Salva a inscrição de notificação de um usuário (chamado pelo frontend)
@@ -1136,6 +1151,7 @@ async function syncPerguntas() {
           await sb.from('ml_perguntas').upsert({
             pergunta_id: String(p.id),
             account_nickname: account.nickname,
+            empresa_id: account.empresa_id || null, // Etapa 0: toda pergunta pertence à empresa da conta
             comprador: p.from?.nickname || 'Cliente',
             texto: p.text,
             item_id: p.item_id,
@@ -1745,39 +1761,39 @@ app.post('/api/shopee/check-tracking', async (req, res) => {
   res.json({ ok: true })
 })
 
-app.post('/api/fin/gerar-recorrencias', async (req, res) => {
+app.post('/api/fin/gerar-recorrencias', exigirAdmin, async (req, res) => {
   await gerarContasRecorrentes()
   res.json({ ok: true })
 })
 
-app.post('/api/fin/gerar-faturas', async (req, res) => {
+app.post('/api/fin/gerar-faturas', exigirAdmin, async (req, res) => {
   await gerarFaturasCartao()
   res.json({ ok: true })
 })
 
-app.post('/api/fin/alertar-vencimento', async (req, res) => {
+app.post('/api/fin/alertar-vencimento', exigirAdmin, async (req, res) => {
   await alertarContasVencendoHoje()
   res.json({ ok: true })
 })
 
-app.get('/api/faturamento/medir-armazenamento/:empresaId', async (req, res) => {
+app.get('/api/faturamento/medir-armazenamento/:empresaId', exigirAdmin, async (req, res) => {
   const resultado = await medirArmazenamentoEmpresa(req.params.empresaId)
   if (!resultado) return res.status(500).json({ ok: false, error: 'Não consegui medir — confere se o empresa_id existe' })
   res.json({ ok: true, ...resultado })
 })
 
-app.get('/api/faturamento/medir-todas', async (req, res) => {
+app.get('/api/faturamento/medir-todas', exigirAdmin, async (req, res) => {
   medirArmazenamentoTodasEmpresas() // não aguarda — roda em segundo plano, pode demorar se tiver muita empresa
   res.json({ ok: true, message: 'Medição iniciada em segundo plano pra todas as empresas.' })
 })
 
-app.get('/api/faturamento/processar-fechamentos', async (req, res) => {
+app.get('/api/faturamento/processar-fechamentos', exigirAdmin, async (req, res) => {
   await processarFechamentosDoDia()
   res.json({ ok: true, message: 'Fechamentos processados. Confere a tabela faturas.' })
 })
 
 // Gera uma fatura manual pra uma empresa/período específico — útil pra testar sem esperar a data certa
-app.get('/api/faturamento/gerar-fatura/:empresaId', async (req, res) => {
+app.get('/api/faturamento/gerar-fatura/:empresaId', exigirAdmin, async (req, res) => {
   try {
     const { periodoInicio, periodoFim } = req.query
     if (!periodoInicio || !periodoFim) {
@@ -1793,7 +1809,7 @@ app.get('/api/faturamento/gerar-fatura/:empresaId', async (req, res) => {
 // Consulta o ciclo de faturamento ATUAL de uma empresa (pedidos já feitos, faixa, valor) SEM gerar fatura
 // e sem gravar nada em nenhuma tabela — é só leitura. Não chama gerarFatura() nem mexe nela; tem sua
 // própria query de contagem (mesmos filtros que gerarFatura usa) pra zero risco de afetar o faturamento real.
-app.get('/api/faturamento/status/:empresaId', async (req, res) => {
+app.get('/api/faturamento/status/:empresaId', exigirAdmin, async (req, res) => {
   try {
     const { empresaId } = req.params
 
@@ -1895,7 +1911,7 @@ app.get('/api/faturamento/status/:empresaId', async (req, res) => {
 
 // Rota de teste segura — SÓ verifica se já existe fatura pro período informado. Não cria, não altera,
 // não apaga nada. Serve pra conferir manualmente a proteção contra duplicidade de gerarFatura().
-app.get('/api/faturamento/verificar-fatura/:empresaId', async (req, res) => {
+app.get('/api/faturamento/verificar-fatura/:empresaId', exigirAdmin, async (req, res) => {
   try {
     const { empresaId } = req.params
     const { periodoInicio, periodoFim } = req.query
@@ -2082,7 +2098,7 @@ async function rodarRecalcularTodoHistorico() {
   }
 }
 
-app.all('/api/recalcular-todo-historico', (req, res) => {
+app.all('/api/recalcular-todo-historico', exigirAdmin, (req, res) => {
   if (recalcularTodosStatus.running) {
     return res.json({ ok: true, message: 'Já está rodando, confere o progresso em /api/recalcular-todo-historico/status', status: recalcularTodosStatus })
   }
@@ -2090,7 +2106,7 @@ app.all('/api/recalcular-todo-historico', (req, res) => {
   res.json({ ok: true, message: 'Iniciado em segundo plano. Isso pode levar alguns minutos dependendo de quantos pedidos você tem. Confere o progresso em /api/recalcular-todo-historico/status' })
 })
 
-app.get('/api/recalcular-todo-historico/status', (req, res) => {
+app.get('/api/recalcular-todo-historico/status', exigirAdmin, (req, res) => {
   res.json(recalcularTodosStatus)
 })
 
@@ -2134,7 +2150,7 @@ async function recalcularUmPedido(mlOrderId) {
   return { ok: true, mlOrderId, antes: { sale_fee: order.sale_fee, shipping_cost_ml: order.shipping_cost_ml, paid_amount: order.paid_amount }, depois: { sale_fee: saleFeeReal, shipping_cost_ml: freteReal, paid_amount: paidAmount } }
 }
 
-app.get('/api/recalcular-um/:mlOrderId', async (req, res) => {
+app.get('/api/recalcular-um/:mlOrderId', exigirAdmin, async (req, res) => {
   try {
     const resultado = await recalcularUmPedido(req.params.mlOrderId)
     res.json(resultado)
@@ -2143,7 +2159,7 @@ app.get('/api/recalcular-um/:mlOrderId', async (req, res) => {
   }
 })
 
-app.post('/api/recalcular-um/:mlOrderId', async (req, res) => {
+app.post('/api/recalcular-um/:mlOrderId', exigirAdmin, async (req, res) => {
   try {
     const resultado = await recalcularUmPedido(req.params.mlOrderId)
     res.json(resultado)
@@ -2236,7 +2252,7 @@ app.post('/api/recalcular-custos', async (req, res) => {
   })()
 })
 
-app.post('/api/reclassify', async (req, res) => {
+app.post('/api/reclassify', exigirAdmin, async (req, res) => {
   await reclassifyOrders()
   res.json({ ok: true })
 })
@@ -2320,7 +2336,7 @@ async function rodarBackfillTracking() {
   }
 }
 
-app.all('/api/backfill-tracking', (req, res) => {
+app.all('/api/backfill-tracking', exigirAdmin, (req, res) => {
   if (backfillStatus.running) {
     return res.json({ ok: true, message: 'Já está rodando, confere o progresso em /api/backfill-tracking/status', status: backfillStatus })
   }
@@ -2328,7 +2344,7 @@ app.all('/api/backfill-tracking', (req, res) => {
   res.json({ ok: true, message: 'Iniciado em segundo plano. Confere o progresso em /api/backfill-tracking/status' })
 })
 
-app.get('/api/backfill-tracking/status', (req, res) => {
+app.get('/api/backfill-tracking/status', exigirAdmin, (req, res) => {
   res.json(backfillStatus)
 })
 
@@ -2339,7 +2355,7 @@ app.get('/', (req, res) => res.json({
   delivery_check: '15 minutos'
 }))
 
-app.get('/api/ml/accounts', async (req, res) => {
+app.get('/api/ml/accounts', exigirAdmin, async (req, res) => {
   const { empresa_id } = req.query
   if (!empresa_id) {
     return res.status(400).json({ error: 'empresa_id é obrigatório' })
@@ -2348,7 +2364,7 @@ app.get('/api/ml/accounts', async (req, res) => {
   res.json(data || [])
 })
 
-app.get('/api/orders', async (req, res) => {
+app.get('/api/orders', exigirAdmin, async (req, res) => {
   const { status, type, limit = 500 } = req.query
   let q = sb.from('ml_orders').select('*').order('created_at_ml', { ascending: false }).limit(Number(limit))
   if (status) q = q.eq('status', status)
@@ -2357,7 +2373,7 @@ app.get('/api/orders', async (req, res) => {
   res.json(data || [])
 })
 
-app.patch('/api/orders/:id', async (req, res) => {
+app.patch('/api/orders/:id', exigirAdmin, async (req, res) => {
   const { data } = await sb.from('ml_orders').update({
     ...req.body,
     updated_at: new Date().toISOString()
@@ -2377,7 +2393,7 @@ app.post('/api/sync', async (req, res) => {
   res.json({ ok: true, total: count })
 })
 
-app.get('/api/stats', async (req, res) => {
+app.get('/api/stats', exigirAdmin, async (req, res) => {
   const { data } = await sb.from('ml_orders').select('status,order_type')
   res.json({
     aguardando: data?.filter(o => o.status === 'aguardando').length || 0,
@@ -2688,3 +2704,6 @@ app.listen(PORT, () => {
   setTimeout(reclassifyOrders, 10000)
   setTimeout(checkDeliveries, 20000)
 })
+
+// Exportado só para os testes automáticos (test/). Não muda o funcionamento do servidor.
+module.exports = app
