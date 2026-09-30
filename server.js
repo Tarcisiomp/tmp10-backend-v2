@@ -23,7 +23,16 @@ try {
 const exigirAdmin = criarExigirAdmin({ token: CONFIG.ADMIN_API_TOKEN, modo: CONFIG.ADMIN_ROUTES_MODE })
 
 const app = express()
-app.use(cors())
+// CORS: só o painel Super Admin (/api/superadmin/*) tem lista própria de origens.
+// Todas as outras rotas continuam exatamente como antes (cors() aberto, igual ao main).
+const corsGeral = cors()
+const ORIGENS_SUPERADMIN = (process.env.CORS_ORIGENS_SUPERADMIN || 'https://admin.tmp10.com.br,https://bright-mooncake-1b7cd3.netlify.app')
+  .split(',').map((o) => o.trim()).filter(Boolean)
+const corsSuperAdmin = cors({ origin: (origem, cb) => cb(null, !origem || ORIGENS_SUPERADMIN.includes(origem)) })
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/superadmin/')) return corsSuperAdmin(req, res, next)
+  return corsGeral(req, res, next)
+})
 app.use(express.json())
 
 const sb = createClient(
@@ -37,6 +46,16 @@ const sb = createClient(
     }
   }
 )
+
+// ── Super Admin da plataforma (/api/superadmin/*) — ver src/superadmin/ ──
+// Login pelo Supabase Auth + id do usuário em SUPERADMIN_AUTH_IDS. O banco é acessado só aqui, com a chave de serviço.
+const { criarExigirSuperAdmin } = require('./src/superadmin/auth')
+const { criarRotasSuperAdmin } = require('./src/superadmin/rotas')
+app.use(criarRotasSuperAdmin({
+  sb,
+  exigirSuperAdmin: criarExigirSuperAdmin({ sb, ids: process.env.SUPERADMIN_AUTH_IDS }),
+  calcularStatusFaturamento: (empresaId) => calcularStatusFaturamento(empresaId)
+}))
 
 const ML_CLIENT_ID     = CONFIG.ML_CLIENT_ID
 const ML_CLIENT_SECRET = CONFIG.ML_CLIENT_SECRET
@@ -1809,24 +1828,26 @@ app.get('/api/faturamento/gerar-fatura/:empresaId', exigirAdmin, async (req, res
 // Consulta o ciclo de faturamento ATUAL de uma empresa (pedidos já feitos, faixa, valor) SEM gerar fatura
 // e sem gravar nada em nenhuma tabela — é só leitura. Não chama gerarFatura() nem mexe nela; tem sua
 // própria query de contagem (mesmos filtros que gerarFatura usa) pra zero risco de afetar o faturamento real.
-app.get('/api/faturamento/status/:empresaId', exigirAdmin, async (req, res) => {
+// Situação do ciclo de faturamento de uma empresa — SÓ LEITURA. Usada pela rota de manutenção (token de admin)
+// e pela rota do Super Admin (/api/superadmin/ciclo/:empresaId). Devolve { http, json }.
+async function calcularStatusFaturamento(empresaId) {
+  const resposta = (http, json) => ({ http, json })
   try {
-    const { empresaId } = req.params
 
     const { data: empresa, error: empresaErr } = await sb.from('empresas')
       .select('id, trial_fim, dia_vencimento_fatura, ultimo_fechamento')
       .eq('id', empresaId)
       .maybeSingle()
 
-    if (empresaErr) return res.status(500).json({ ok: false, error: empresaErr.message })
-    if (!empresa) return res.status(404).json({ ok: false, error: 'Empresa não encontrada' })
+    if (empresaErr) return resposta(500, { ok: false, error: empresaErr.message })
+    if (!empresa) return resposta(404, { ok: false, error: 'Empresa não encontrada' })
 
     const hojeStr = new Date().toISOString().slice(0, 10)
 
     // Sem trial_fim = empresa nunca entrou no fluxo de fechamento automático (processarFechamentosDoDia
     // ignora essas empresas), então não dá pra determinar período nenhum.
     if (!empresa.trial_fim) {
-      return res.json({
+      return resposta(200, {
         ok: true,
         empresaId,
         cicloDefinido: false,
@@ -1868,7 +1889,7 @@ app.get('/api/faturamento/status/:empresaId', exigirAdmin, async (req, res) => {
       .lte('created_at_ml', periodoFim + 'T23:59:59')
       .neq('status', 'cancelado')
 
-    if (countErr) return res.status(500).json({ ok: false, error: countErr.message })
+    if (countErr) return resposta(500, { ok: false, error: countErr.message })
 
     const qtd = pedidosNoPeriodo || 0
 
@@ -1891,7 +1912,7 @@ app.get('/api/faturamento/status/:empresaId', exigirAdmin, async (req, res) => {
       proximaFaixa = null
     }
 
-    res.json({
+    return resposta(200, {
       ok: true,
       empresaId,
       cicloDefinido: true,
@@ -1905,8 +1926,13 @@ app.get('/api/faturamento/status/:empresaId', exigirAdmin, async (req, res) => {
       proximaFaixa
     })
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message })
+    return resposta(500, { ok: false, error: e.message })
   }
+}
+
+app.get('/api/faturamento/status/:empresaId', exigirAdmin, async (req, res) => {
+  const r = await calcularStatusFaturamento(req.params.empresaId)
+  res.status(r.http).json(r.json)
 })
 
 // Rota de teste segura — SÓ verifica se já existe fatura pro período informado. Não cria, não altera,

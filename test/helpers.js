@@ -10,32 +10,88 @@ for (const nivel of ['log', 'info', 'warn', 'error']) {
   console[nivel] = (...args) => { logs.push(util.format(...args)) }
 }
 
-const registro = { ops: [], crons: 0, dados: {}, axiosGet: null, logs }
+const registro = { ops: [], crons: 0, dados: {}, db: {}, falhas: {}, seq: 0, auth: { tokens: {}, chamadas: [], erro: null }, axiosGet: null, axiosPost: null, logs }
+
+function aplicarFiltros(linhas, filtros) {
+  return linhas.filter((r) => filtros.every(([m, col, val]) => {
+    if (m === 'eq') return r[col] === val
+    if (m === 'neq') return r[col] !== val
+    if (m === 'in') return Array.isArray(val) && val.includes(r[col])
+    if (m === 'lt') return r[col] < val
+    if (m === 'lte') return r[col] <= val
+    if (m === 'gt') return r[col] > val
+    if (m === 'gte') return r[col] >= val
+    return true
+  }))
+}
 
 function criarQuery(tabela) {
-  const q = { tabela, filtros: [], acao: 'select', payload: null }
+  const q = { tabela, filtros: [], acao: 'select', payload: null, erroForcado: null }
   const cadeia = ['select', 'eq', 'neq', 'in', 'order', 'limit', 'gte', 'lte', 'not', 'gt', 'lt', 'is', 'range', 'ilike', 'or', 'filter', 'match']
-  for (const m of cadeia) q[m] = (...args) => { q.filtros.push([m, ...args]); return q }
+  for (const m of cadeia) q[m] = (...args) => { if (m !== 'select' || q.acao === 'select') q.filtros.push([m, ...args]); return q }
   for (const m of ['insert', 'update', 'upsert', 'delete']) {
-    q[m] = (payload) => { q.acao = m; q.payload = payload; registro.ops.push({ tabela, acao: m, payload }); return q }
+    q[m] = (payload, opcoes) => { q.acao = m; q.payload = payload; q.opcoes = opcoes || {}; registro.ops.push({ tabela, acao: m, payload, filtros: q.filtros, opcoes: q.opcoes }); return q }
   }
   const resultado = () => {
+    // Banco em memória (registro.db) — usado pelos testes da conta central
+    if (registro.db[tabela]) {
+      const linhas = registro.db[tabela]
+      if (registro.falhas[`${tabela}.${q.acao}`]) return { data: null, error: registro.falhas[`${tabela}.${q.acao}`] }
+      if (q.acao === 'insert') {
+        const novos = (Array.isArray(q.payload) ? q.payload : [q.payload]).map((r) => ({ id: 'id-' + (++registro.seq), ...r }))
+        for (const n of novos) {
+          if (n.email && linhas.some((x) => (x.email || '').toLowerCase() === n.email.toLowerCase())) return { data: null, error: { code: '23505', message: 'duplicate key' } }
+        }
+        linhas.push(...novos)
+        return { data: novos, error: null }
+      }
+      if (q.acao === 'upsert') {
+        const chave = (q.opcoes && q.opcoes.onConflict) || 'id'
+        for (const n of (Array.isArray(q.payload) ? q.payload : [q.payload])) {
+          const existente = linhas.find((r) => r[chave] !== undefined && r[chave] === n[chave])
+          if (existente) Object.assign(existente, n); else linhas.push({ id: 'id-' + (++registro.seq), ...n })
+        }
+        return { data: q.payload, error: null }
+      }
+      const alvo = aplicarFiltros(linhas, q.filtros)
+      if (q.acao === 'update') { for (const r of alvo) Object.assign(r, q.payload); return { data: alvo, error: null } }
+      if (q.acao === 'delete') { registro.db[tabela] = linhas.filter((r) => !alvo.includes(r)); return { data: alvo, error: null } }
+      return { data: alvo.map((r) => ({ ...r })), error: null, count: alvo.length }
+    }
     const linhas = typeof registro.dados[tabela] === 'function' ? registro.dados[tabela](q) : (registro.dados[tabela] || [])
     return { data: linhas, error: null, count: Array.isArray(linhas) ? linhas.length : 0 }
   }
-  q.maybeSingle = () => Promise.resolve({ ...resultado(), data: (resultado().data || [])[0] || null })
+  q.maybeSingle = () => Promise.resolve(resultado()).then((r) => ({ ...r, data: Array.isArray(r.data) ? (r.data[0] || null) : r.data }))
   q.single = q.maybeSingle
   q.then = (ok, falha) => Promise.resolve(resultado()).then(ok, falha)
   return q
 }
 
+// Supabase Auth simulado: tokens válidos em registro.auth.tokens { token: authUserId }
+const authFake = {
+  getUser: async (token) => {
+    const id = registro.auth.tokens[token]
+    return id ? { data: { user: { id } }, error: null } : { data: { user: null }, error: { message: 'invalid JWT' } }
+  },
+  admin: {
+    createUser: async (dados) => { registro.auth.chamadas.push(['createUser', dados]); if (registro.auth.erro) return { data: null, error: registro.auth.erro }; return { data: { user: { id: 'auth-' + (++registro.seq) } }, error: null } },
+    inviteUserByEmail: async (email, op) => { registro.auth.chamadas.push(['invite', email, op]); if (registro.auth.erro) return { data: null, error: registro.auth.erro }; return { data: { user: { id: 'auth-' + (++registro.seq) } }, error: null } },
+    updateUserById: async (id, dados) => { registro.auth.chamadas.push(['update', id, dados]); return { data: {}, error: null } },
+    deleteUser: async (id) => { registro.auth.chamadas.push(['delete', id]); return { data: {}, error: null } }
+  },
+  signInWithPassword: async (dados) => {
+    registro.auth.chamadas.push(['signIn', dados.email])
+    return registro.auth.falhaLogin ? { data: {}, error: { message: 'x' } } : { data: { session: { access_token: 'at-' + dados.email, refresh_token: 'rt', expires_in: 3600, expires_at: 999 } }, error: null }
+  }
+}
+
 const fakes = {
-  '@supabase/supabase-js': { createClient: () => ({ from: (t) => criarQuery(t), rpc: async () => ({ data: null, error: null }), storage: { from: () => ({}) } }) },
+  '@supabase/supabase-js': { createClient: () => ({ from: (t) => criarQuery(t), rpc: async () => ({ data: null, error: null }), storage: { from: () => ({}) }, auth: authFake }) },
   'node-cron': { schedule: () => { registro.crons++; return { stop() {} } } },
   'web-push': { setVapidDetails() {}, sendNotification: async () => ({}) },
   axios: {
     get: (url, ...r) => (registro.axiosGet ? registro.axiosGet(url, ...r) : Promise.reject(new Error('rede bloqueada no teste'))),
-    post: () => Promise.reject(new Error('rede bloqueada no teste')),
+    post: (url, ...r) => (registro.axiosPost ? registro.axiosPost(url, ...r) : Promise.reject(new Error('rede bloqueada no teste'))),
     put: () => Promise.reject(new Error('rede bloqueada no teste'))
   }
 }
@@ -70,7 +126,7 @@ async function chamar(app, metodo, caminho, { headers = {}, body } = {}) {
         headers: { ...(dados ? { 'content-type': 'application/json' } : {}), ...headers } }, (res) => {
         let txt = ''
         res.on('data', (c) => { txt += c })
-        res.on('end', () => resolve({ status: res.statusCode, texto: txt, location: res.headers.location }))
+        res.on('end', () => resolve({ status: res.statusCode, texto: txt, location: res.headers.location, headers: res.headers }))
       })
       req.on('error', reject)
       if (dados) req.write(dados)
