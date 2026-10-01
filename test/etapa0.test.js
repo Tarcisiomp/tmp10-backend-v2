@@ -155,8 +155,8 @@ test('modo report: deixa passar e registra no log', () => {
 })
 
 // ── 6. Rotinas automáticas continuam registradas ────────────────────
-test('as 12 rotinas automáticas (cron) continuam registradas', () => {
-  assert.equal(registro.crons, 12)
+test('as 12 rotinas automáticas (cron) continuam registradas + 1 do Super Admin (bloqueio por pagamento)', () => {
+  assert.equal(registro.crons, 13)
 })
 
 // ── 7. Perguntas passam a gravar a empresa ──────────────────────────
