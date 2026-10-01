@@ -51,10 +51,14 @@ const sb = createClient(
 // Login pelo Supabase Auth + id do usuário em SUPERADMIN_AUTH_IDS. O banco é acessado só aqui, com a chave de serviço.
 const { criarExigirSuperAdmin } = require('./src/superadmin/auth')
 const { criarRotasSuperAdmin } = require('./src/superadmin/rotas')
+// Assinatura: situação de pagamento e bloqueio por inadimplência (tolerância em dias: TOLERANCIA_DIAS, padrão 5)
+const { criarAssinatura, lerTolerancia } = require('./src/superadmin/assinatura')
+const assinatura = criarAssinatura({ sb, tolerancia: lerTolerancia(process.env.TOLERANCIA_DIAS) })
 app.use(criarRotasSuperAdmin({
   sb,
   exigirSuperAdmin: criarExigirSuperAdmin({ sb, ids: process.env.SUPERADMIN_AUTH_IDS }),
-  calcularStatusFaturamento: (empresaId) => calcularStatusFaturamento(empresaId)
+  calcularStatusFaturamento: (empresaId) => calcularStatusFaturamento(empresaId),
+  assinatura
 }))
 
 const ML_CLIENT_ID     = CONFIG.ML_CLIENT_ID
@@ -1496,6 +1500,16 @@ async function medirArmazenamentoTodasEmpresas() {
 //   { sucesso: false, erro: '...' }                          -> algo falhou de verdade, NADA foi gravado
 async function gerarFatura(empresaId, periodoInicio, periodoFim) {
   try {
+    // Empresa CANCELADA não recebe fatura nova (decisão do V4 final). Faturas antigas continuam como estão.
+    const { data: empresaGerar, error: empresaGerarErr } = await sb.from('empresas').select('status').eq('id', empresaId).maybeSingle()
+    if (empresaGerarErr) {
+      console.log(`❌ [Faturamento] Erro ao ler a empresa ${empresaId} antes de gerar fatura:`, empresaGerarErr.message)
+      return { sucesso: false, erro: empresaGerarErr.message }
+    }
+    if (empresaGerar && empresaGerar.status === 'cancelado') {
+      console.log(`⚠️ [Faturamento] Empresa ${empresaId} está CANCELADA — nenhuma fatura nova gerada.`)
+      return { sucesso: true, criada: false, motivo: 'empresa_cancelada' }
+    }
     // Proteção contra duplicidade — se já existe fatura pra esse empresa_id + período exato,
     // não insere outra nem altera a existente.
     const { data: faturaExistente, error: checagemErr } = await sb.from('faturas')
@@ -1586,7 +1600,8 @@ async function processarFechamentosDoDia() {
     const hojeStr = hoje.toISOString().slice(0, 10)
     const diaHoje = hoje.getDate()
 
-    const { data: empresas } = await sb.from('empresas').select('*').neq('status', 'inativo').neq('plano', 'interno')
+    // Fora da geração: inativo, cancelado (V4 final) e plano interno. Bloqueado continua gerando (o bloqueio é de acesso).
+    const { data: empresas } = await sb.from('empresas').select('*').neq('status', 'inativo').neq('status', 'cancelado').neq('plano', 'interno')
     for (const emp of (empresas || [])) {
       try {
         if (!emp.trial_fim) continue // empresa antiga, cadastrada antes de existir esse campo — não sabemos quando começar a contar
@@ -1692,6 +1707,8 @@ cron.schedule('0 */6 * * *', gerarFaturasCartao)
 cron.schedule('0 8 * * *', alertarContasVencendoHoje)
 cron.schedule('0 3 * * *', medirArmazenamentoTodasEmpresas)
 cron.schedule('0 4 * * *', processarFechamentosDoDia)
+// Bloqueio/desbloqueio automático por pagamento (06:30 de Brasília, depois dos fechamentos do dia)
+cron.schedule('30 6 * * *', () => assinatura.verificarAgendado(), { timezone: 'America/Sao_Paulo' })
 
 // ── Webhook ML ────────────────────────────────────────────────────
 app.post('/ml/notifications', async (req, res) => {
