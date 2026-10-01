@@ -109,6 +109,8 @@ function envTeste(extra = {}) {
     VAPID_PUBLIC_KEY: 'publica-falsa',
     VAPID_PRIVATE_KEY: 'privada-falsa',
     ADMIN_API_TOKEN: TOKEN_ADMIN,
+    SUPABASE_PUBLIC_KEY: 'sb_publishable_teste',
+    CADASTRO_LIMITE_POR_HORA: '1000',
     PORT: '0',
     ...extra
   })

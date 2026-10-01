@@ -23,14 +23,19 @@ try {
 const exigirAdmin = criarExigirAdmin({ token: CONFIG.ADMIN_API_TOKEN, modo: CONFIG.ADMIN_ROUTES_MODE })
 
 const app = express()
-// CORS: só o painel Super Admin (/api/superadmin/*) tem lista própria de origens.
-// Todas as outras rotas continuam exatamente como antes (cors() aberto, igual ao main).
+// CORS: o painel Super Admin (/api/superadmin/*) e a conta do ERP (/api/conta/*) têm listas próprias de origens.
+// Todas as outras rotas continuam exatamente como antes (cors() aberto).
 const corsGeral = cors()
 const ORIGENS_SUPERADMIN = (process.env.CORS_ORIGENS_SUPERADMIN || 'https://admin.tmp10.com.br,https://bright-mooncake-1b7cd3.netlify.app')
   .split(',').map((o) => o.trim()).filter(Boolean)
 const corsSuperAdmin = cors({ origin: (origem, cb) => cb(null, !origem || ORIGENS_SUPERADMIN.includes(origem)) })
+// Conta central do ERP (passo 0.4, /api/conta/*): só os endereços oficiais do TMP10 (ERP e site)
+const ORIGENS_CONTA = (process.env.CORS_ORIGENS_CONTA || 'https://tmp10.com.br,https://www.tmp10.com.br,https://sistema.tmp10.com.br,https://roaring-pixie-c02520.netlify.app,https://tmp10combr.netlify.app')
+  .split(',').map((o) => o.trim()).filter(Boolean)
+const corsConta = cors({ origin: (origem, cb) => cb(null, !origem || ORIGENS_CONTA.includes(origem)) })
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/superadmin/')) return corsSuperAdmin(req, res, next)
+  if (req.path.startsWith('/api/conta/')) return corsConta(req, res, next)
   return corsGeral(req, res, next)
 })
 app.use(express.json())
@@ -59,6 +64,21 @@ app.use(criarRotasSuperAdmin({
   exigirSuperAdmin: criarExigirSuperAdmin({ sb, ids: process.env.SUPERADMIN_AUTH_IDS }),
   calcularStatusFaturamento: (empresaId) => calcularStatusFaturamento(empresaId),
   assinatura
+}))
+
+// ── Conta central do ERP (passo 0.4): login por e-mail no Supabase Auth ──
+// Rotas /api/conta/* (ver src/conta/rotas.js). A empresa vem sempre da sessão, nunca do navegador.
+// Empresa sem acesso (bloqueado/inativo/cancelado) não cria nem reativa funcionário (mesma regra do V4).
+const { criarRotasConta } = require('./src/conta/rotas')
+const APP_URL = (process.env.APP_URL || 'https://sistema.tmp10.com.br').trim()
+app.use(criarRotasConta({ sb, appUrl: APP_URL }))
+// Cadastro de cliente novo vindo do site tmp10.com.br (substitui o cadastro feito direto no banco pelo navegador)
+const { criarRotaCadastro, criarLimitador } = require('./src/conta/cadastro')
+const SUPABASE_PUBLIC_KEY = (process.env.SUPABASE_PUBLIC_KEY || '').trim() // chave PÚBLICA (publishable/anon) — só para abrir a sessão do cliente recém-cadastrado
+app.use(criarRotaCadastro({
+  sb,
+  limitador: criarLimitador({ maxPorJanela: Number(process.env.CADASTRO_LIMITE_POR_HORA) || 5 }),
+  criarClientePublico: SUPABASE_PUBLIC_KEY ? () => createClient(CONFIG.SUPABASE_URL, SUPABASE_PUBLIC_KEY, { auth: { persistSession: false, autoRefreshToken: false }, realtime: { transport: ws } }) : null
 }))
 
 const ML_CLIENT_ID     = CONFIG.ML_CLIENT_ID
