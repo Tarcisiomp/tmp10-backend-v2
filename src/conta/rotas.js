@@ -4,11 +4,21 @@
 //   POST  /api/conta/usuarios         → cria acesso (só admin da empresa)   [substitui o insert com senha feito pelo navegador]
 //   PATCH /api/conta/usuarios/:id     → edita / ativa / desativa / troca senha (só admin da empresa)
 //
+// Funcionário SEM e-mail (opção A, ver src/conta/loginUsuario.js):
+//   POST com { name, username, password } e sem e-mail → cria o cadastro + uma conta no Supabase Auth com o
+//   identificador técnico interno <users.id>@<dominio> (nunca mostrado). Ele entra com usuário + senha.
+// Troca de senha (PATCH { password }):
+//   - quem tem conta no Supabase Auth (auth_id) → a senha muda no Auth;
+//   - usuário ANTIGO, ainda não migrado (sem auth_id) → a senha muda em users.password, que é onde o login
+//     antigo confere hoje (compatível com o fluxo atual até o 0.7). Depois o Super Admin migra normalmente.
+//
 // Regras:
 //  - a empresa SEMPRE é a da sessão (req.empresaId). Qualquer empresa_id enviado pelo navegador é ignorado;
 //  - um admin só enxerga e altera usuários da PRÓPRIA empresa (usuário de outra empresa = 404);
 //  - nada é apagado: "excluir" no ERP vira "desativar" (bloqueia o login no Supabase Auth e marca active=false);
-//  - senhas nunca são gravadas na tabela users (a coluna password recebe um valor inutilizável só porque é NOT NULL).
+//  - quem tem conta no Supabase Auth NUNCA tem senha gravada na tabela users (a coluna password recebe um valor
+//    inutilizável só porque é NOT NULL). A única exceção é a troca de senha de um usuário ANTIGO ainda não migrado
+//    (o login antigo confere users.password); ela some no 0.7.
 
 const crypto = require('crypto')
 const express = require('express')
@@ -16,6 +26,8 @@ const { criarAutenticar, exigirPapel } = require('../auth/sessao')
 
 const PAPEIS = ['admin', 'employee', 'vendedor']
 const EMAIL_OK = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/
+// Usuário de login (sem e-mail): minúsculas, números, ponto, hífen e sublinhado; 3 a 40; começa com letra/número
+const USUARIO_OK = /^[a-z0-9][a-z0-9._-]{2,39}$/
 const BLOQUEIO_LONGO = '876000h' // ~100 anos: usado para desativar o login sem apagar a conta
 // Empresa sem acesso ao TMP10 (mesma regra do Super Admin, src/superadmin/assinatura.js):
 // o admin da empresa NÃO consegue criar nem reativar funcionário enquanto a empresa estiver bloqueada, inativa ou cancelada.
@@ -33,19 +45,22 @@ function senhaInutilizavel() {
   return '!supabase-auth:' + crypto.randomBytes(24).toString('hex')
 }
 
+// 8 caracteres no mínimo; até 72 BYTES (limite do bcrypt do Supabase Auth); sem espaço no início/fim
+// (o login por usuário sempre confere a senha com trim(), então essa senha nunca funcionaria)
 function validarSenha(s) {
-  return typeof s === 'string' && s.length >= 8 && s.length <= 72
+  return typeof s === 'string' && s.length >= 8 && Buffer.byteLength(s, 'utf8') <= 72 && s === s.trim()
 }
+const MSG_SENHA = 'A senha precisa ter pelo menos 8 caracteres, sem espaço no início ou no fim.'
 
 function publico(u) {
   if (!u) return null
   return {
-    id: u.id, name: u.name, email: u.email || null, role: u.role, active: u.active,
+    id: u.id, name: u.name, email: u.email || null, username: u.username || null, role: u.role, active: u.active,
     empresa_id: u.empresa_id, is_vendedor_externo: !!u.is_vendedor_externo, cargo: u.cargo || null, phone: u.phone || null
   }
 }
 
-function criarRotasConta({ sb, appUrl, log = console.log }) {
+function criarRotasConta({ sb, appUrl, dominioTecnico = 'login.tmp10.com.br', log = console.log }) {
   const router = express.Router()
   const autenticar = criarAutenticar({ sb })
   const soAdmin = exigirPapel('admin')
@@ -80,8 +95,12 @@ function criarRotasConta({ sb, appUrl, log = console.log }) {
     const senha = b.password ? String(b.password) : null
 
     if (!nome) return res.status(400).json({ ok: false, error: 'Informe o nome.' })
-    if (!email || !EMAIL_OK.test(email)) return res.status(400).json({ ok: false, error: 'Informe um e-mail válido.' })
-    if (senha && !validarSenha(senha)) return res.status(400).json({ ok: false, error: 'A senha precisa ter pelo menos 8 caracteres.' })
+    // Sem e-mail + usuário informado = funcionário que entra com usuário + senha (conta técnica)
+    if (!email && b.username !== undefined && b.username !== null && String(b.username).trim()) {
+      return criarSemEmail(req, res, { nome, role, vendedorExterno, senha, b })
+    }
+    if (!email || !EMAIL_OK.test(email)) return res.status(400).json({ ok: false, error: 'Informe um e-mail válido (ou um usuário, para quem não usa e-mail).' })
+    if (senha && !validarSenha(senha)) return res.status(400).json({ ok: false, error: MSG_SENHA })
 
     const { data: jaExiste } = await sb.from('users').select('id').eq('email', email).maybeSingle()
     if (jaExiste) return res.status(409).json({ ok: false, error: 'Este e-mail já tem acesso ao TMP10.' })
@@ -126,9 +145,49 @@ function criarRotasConta({ sb, appUrl, log = console.log }) {
     res.status(201).json({ ok: true, usuario: publico(criado), convite })
   })
 
+  // Funcionário sem e-mail: cadastro → conta no Auth com o identificador técnico → liga o auth_id.
+  // Se algo falhar no meio, desfaz só o que acabou de criar (nada que já existia é tocado).
+  async function criarSemEmail(req, res, { nome, role, vendedorExterno, senha, b }) {
+    const usuario = String(b.username).trim().toLowerCase()
+    if (!USUARIO_OK.test(usuario)) return res.status(400).json({ ok: false, error: 'Usuário inválido: use de 3 a 40 letras minúsculas, números, ponto, hífen ou sublinhado (sem espaço e sem @).' })
+    if (!senha) return res.status(400).json({ ok: false, error: 'Defina uma senha para quem entra com usuário (não há e-mail para enviar convite).' })
+    if (!validarSenha(senha)) return res.status(400).json({ ok: false, error: MSG_SENHA })
+    // O login por usuário procura o usuário em TODAS as empresas: ele precisa ser único no TMP10 inteiro
+    const { data: repetidos, error: errBusca } = await sb.from('users').select('id').eq('username', usuario).limit(1)
+    if (errBusca) return res.status(500).json({ ok: false, error: 'Não foi possível criar o acesso. Tente de novo.' })
+    if (repetidos && repetidos.length) return res.status(409).json({ ok: false, error: 'Este usuário já existe no TMP10. Escolha outro.' })
+
+    const linha = {
+      empresa_id: req.empresaId, auth_id: null, email: null, username: usuario, password: senhaInutilizavel(),
+      name: nome, role: vendedorExterno ? 'vendedor' : role, is_vendedor_externo: vendedorExterno, active: true,
+      phone: limparTexto(b.phone, 40), cargo: limparTexto(b.cargo, 80)
+    }
+    const { data: criado, error: errInsert } = await sb.from('users').insert(linha).select('id, name, email, username, role, active, empresa_id, is_vendedor_externo, cargo, phone').single()
+    if (errInsert || !criado) {
+      log(`[CONTA] falha ao criar usuário (sem e-mail) na empresa ${req.empresaId}: ${errInsert ? errInsert.message : 'sem retorno'}`)
+      return res.status(500).json({ ok: false, error: 'Não foi possível criar o acesso. Tente de novo.' })
+    }
+    const desfazerCadastro = () => sb.from('users').delete().eq('id', criado.id).eq('empresa_id', req.empresaId).is('auth_id', null)
+    const { data: conta, error: errAuth } = await sb.auth.admin.createUser({
+      email: `${String(criado.id).toLowerCase()}@${dominioTecnico}`, password: senha, email_confirm: true, app_metadata: { tmp10_login_tecnico: true }
+    })
+    if (errAuth || !conta || !conta.user) {
+      await desfazerCadastro()
+      return res.status(400).json({ ok: false, error: traduzirErroAuth(errAuth) })
+    }
+    const { data: ligados, error: errLiga } = await sb.from('users').update({ auth_id: conta.user.id }).eq('id', criado.id).is('auth_id', null).select('id')
+    if (errLiga || !ligados || !ligados.length) {
+      await sb.auth.admin.deleteUser(conta.user.id).catch(() => {})
+      await desfazerCadastro()
+      return res.status(500).json({ ok: false, error: 'Não foi possível criar o acesso. Tente de novo.' })
+    }
+    log(`[CONTA][auditoria] usuário ${criado.id} (login por usuário) criado por ${req.usuario.id} na empresa ${req.empresaId} (papel ${criado.role})`)
+    return res.status(201).json({ ok: true, usuario: publico(criado), convite: false })
+  }
+
   // ── editar / ativar / desativar / trocar senha ───────────────────
   router.patch('/api/conta/usuarios/:id', autenticar, soAdmin, async (req, res) => {
-    const { data: alvo } = await sb.from('users').select('id, auth_id, empresa_id, active, role, email').eq('id', req.params.id).eq('empresa_id', req.empresaId).maybeSingle()
+    const { data: alvo } = await sb.from('users').select('id, auth_id, empresa_id, active, role, email, username').eq('id', req.params.id).eq('empresa_id', req.empresaId).maybeSingle()
     // usuário de outra empresa é tratado como inexistente
     if (!alvo || alvo.empresa_id !== req.empresaId) return res.status(404).json({ ok: false, error: 'Usuário não encontrado.' })
 
@@ -159,7 +218,7 @@ function criarRotasConta({ sb, appUrl, log = console.log }) {
       } else novoEmail = null
     }
     const senha = b.password ? String(b.password) : null
-    if (senha && !validarSenha(senha)) return res.status(400).json({ ok: false, error: 'A senha precisa ter pelo menos 8 caracteres.' })
+    if (senha && !validarSenha(senha)) return res.status(400).json({ ok: false, error: MSG_SENHA })
 
     // Reativar funcionário só se a empresa tiver acesso ao TMP10 (antes de mexer no Auth ou no banco)
     if (upd.active === true && alvo.active === false) {
@@ -182,8 +241,12 @@ function criarRotasConta({ sb, appUrl, log = console.log }) {
         const { error } = await sb.auth.admin.updateUserById(alvo.auth_id, mudancaAuth)
         if (error) return res.status(400).json({ ok: false, error: traduzirErroAuth(error) })
       }
-    } else if (senha || novoEmail) {
-      return res.status(409).json({ ok: false, error: 'Este usuário ainda não tem conta de login. Informe o e-mail e use "Criar acesso".' })
+    } else if (novoEmail) {
+      return res.status(409).json({ ok: false, error: 'Este usuário ainda não tem conta de login nova. Troque só a senha; a migração do login é feita pelo suporte TMP10.' })
+    } else if (senha) {
+      // Usuário ANTIGO (ainda não migrado): o login antigo confere users.password — a nova senha vale a partir de agora
+      // e a antiga deixa de funcionar. Depois disso a migração (Super Admin) copia esta senha para o Supabase Auth.
+      upd.password = senha
     }
 
     if (Object.keys(upd).length) {
@@ -191,7 +254,7 @@ function criarRotasConta({ sb, appUrl, log = console.log }) {
       if (error && error.code === '23505') return res.status(409).json({ ok: false, error: 'Este e-mail já tem acesso ao TMP10.' })
       if (error) return res.status(500).json({ ok: false, error: 'Não foi possível salvar. Tente de novo.' })
     }
-    log(`[CONTA][auditoria] usuário ${alvo.id} alterado por ${req.usuario.id} na empresa ${req.empresaId}: ${[...Object.keys(upd), senha ? 'senha' : null].filter(Boolean).join(', ') || 'nada'}`)
+    log(`[CONTA][auditoria] usuário ${alvo.id} alterado por ${req.usuario.id} na empresa ${req.empresaId}: ${[...Object.keys(upd).filter((k) => k !== 'password'), senha ? 'senha' : null].filter(Boolean).join(', ') || 'nada'}`)
     res.json({ ok: true })
   })
 
@@ -207,4 +270,4 @@ function traduzirErroAuth(error) {
   return 'Não foi possível concluir. Tente de novo.'
 }
 
-module.exports = { criarRotasConta, PAPEIS, EMPRESA_SEM_ACESSO }
+module.exports = { criarRotasConta, PAPEIS, EMPRESA_SEM_ACESSO, validarSenha, USUARIO_OK }
