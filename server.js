@@ -71,7 +71,7 @@ app.use(criarRotasSuperAdmin({
 // Empresa sem acesso (bloqueado/inativo/cancelado) não cria nem reativa funcionário (mesma regra do V4).
 const { criarRotasConta } = require('./src/conta/rotas')
 const APP_URL = (process.env.APP_URL || 'https://sistema.tmp10.com.br').trim()
-app.use(criarRotasConta({ sb, appUrl: APP_URL }))
+app.use(criarRotasConta({ sb, appUrl: APP_URL, dominioTecnico: (process.env.LOGIN_DOMINIO_TECNICO || 'login.tmp10.com.br').trim().toLowerCase() }))
 // Cadastro de cliente novo vindo do site tmp10.com.br (substitui o cadastro feito direto no banco pelo navegador)
 const { criarRotaCadastro, criarLimitador } = require('./src/conta/cadastro')
 const SUPABASE_PUBLIC_KEY = (process.env.SUPABASE_PUBLIC_KEY || '').trim() // chave PÚBLICA (publishable/anon) — só para abrir a sessão do cliente recém-cadastrado
@@ -112,6 +112,11 @@ function shopeeSign(path, timestamp, accessToken = '', shopId = '') {
 const VAPID_PUBLIC_KEY  = CONFIG.VAPID_PUBLIC_KEY
 const VAPID_PRIVATE_KEY = CONFIG.VAPID_PRIVATE_KEY
 webpush.setVapidDetails('mailto:contato@tmp10.com.br', VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY)
+
+// Proteção (pacote final): com sessão, empresa/usuário vêm da sessão; sem sessão, só enquanto PUSH_EXIGIR_SESSAO != 1
+const { criarProtecaoPush } = require('./src/conta/pushSeguro')
+app.use(['/api/push/subscribe', '/api/push/notificar-venda', '/api/push/notificar-mensagem'],
+  criarProtecaoPush({ sb, exigirSessao: process.env.PUSH_EXIGIR_SESSAO === '1' }))
 
 // Salva a inscrição de notificação de um usuário (chamado pelo frontend)
 app.post('/api/push/subscribe', async (req, res) => {
