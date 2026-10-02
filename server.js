@@ -80,6 +80,17 @@ app.use(criarRotaCadastro({
   limitador: criarLimitador({ maxPorJanela: Number(process.env.CADASTRO_LIMITE_POR_HORA) || 5 }),
   criarClientePublico: SUPABASE_PUBLIC_KEY ? () => createClient(CONFIG.SUPABASE_URL, SUPABASE_PUBLIC_KEY, { auth: { persistSession: false, autoRefreshToken: false }, realtime: { transport: ws } }) : null
 }))
+// Login por USUÁRIO + SENHA para funcionários sem e-mail (conta no Auth com identificador técnico interno) + migração
+// por usuário feita pelo Super Admin. Ver src/conta/loginUsuario.js.
+// O login abre a sessão num cliente NOVO a cada pedido (nunca no cliente "sb" do servidor). Usa a chave pública se existir.
+const { criarRotasLoginUsuario } = require('./src/conta/loginUsuario')
+app.use(criarRotasLoginUsuario({
+  sb,
+  exigirSuperAdmin: criarExigirSuperAdmin({ sb, ids: process.env.SUPERADMIN_AUTH_IDS }),
+  criarClienteLogin: () => createClient(CONFIG.SUPABASE_URL, SUPABASE_PUBLIC_KEY || CONFIG.SUPABASE_SERVICE_KEY, { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }, realtime: { transport: ws } }),
+  dominio: (process.env.LOGIN_DOMINIO_TECNICO || 'login.tmp10.com.br').trim().toLowerCase(),
+  senhaMinima: Number(process.env.SENHA_MINIMA_AUTH) || 6
+}))
 
 const ML_CLIENT_ID     = CONFIG.ML_CLIENT_ID
 const ML_CLIENT_SECRET = CONFIG.ML_CLIENT_SECRET
