@@ -4,6 +4,30 @@ const { brl, pct, ND } = require('./agentes')
 
 const PESO = { critico: 3, atencao: 2, oportunidade: 1 }
 
+// Números de hoje e do mês (vêm dos indicadores oficiais — os mesmos do Painel Executivo)
+function blocoNumeros(dreHoje, dreMes) {
+  return {
+    hoje: { faturamento: dreHoje.faturamento, lucro: dreHoje.lucro_operacional, margem: dreHoje.faturamento ? Math.round(dreHoje.lucro_operacional / dreHoje.faturamento * 10000) / 100 : null, vendas: dreHoje.pedidos },
+    mes: { faturamento: dreMes.faturamento, lucro: dreMes.lucro, margem: dreMes.margem, vendas: dreMes.pedidos, despesas: dreMes.despesas },
+    produtos_vendidos_hoje: dreHoje.produtos_vendidos || 0
+  }
+}
+function frasesNumeros(dreHoje, dreMes) {
+  return [
+    dreHoje.pedidos
+      ? `Hoje: ${dreHoje.pedidos} venda(s), faturamento ${brl(dreHoje.faturamento)}, lucro das vendas ${brl(dreHoje.lucro_operacional)} (margem ${pct(dreHoje.faturamento ? dreHoje.lucro_operacional / dreHoje.faturamento * 100 : null)}).`
+      : 'Hoje ainda não há vendas registradas.',
+    `No mês: ${dreMes.pedidos} venda(s), faturamento ${brl(dreMes.faturamento)}, lucro líquido ${brl(dreMes.lucro)} (margem ${pct(dreMes.margem)}) já descontando despesas fixas rateadas (${brl(dreMes.despesas_fixas)}).`
+  ]
+}
+// Relatório guardado (análise de até 60 min) com os números de hoje/mês do MOMENTO
+function atualizarNumeros(relatorio, dreHoje, dreMes) {
+  const r = { ...relatorio, numeros: { ...(relatorio.numeros || {}), ...blocoNumeros(dreHoje, dreMes) }, numeros_em: new Date().toISOString() }
+  const frases = frasesNumeros(dreHoje, dreMes)
+  r.o_que_esta_acontecendo = [...frases, ...((relatorio.o_que_esta_acontecendo || []).slice(2))]
+  return r
+}
+
 function montarRelatorio({ hoje, dreHoje, dreMes, agentes, alertasAbertos = [], memoria = [] }) {
   const { prejuizo, margem, estoque, anuncios, financeiro, vendas, publicidade } = agentes
   const ordenados = alertasAbertos.slice().sort((a, b) => (PESO[b.nivel] - PESO[a.nivel]) || (b.prioridade - a.prioridade))
@@ -11,11 +35,7 @@ function montarRelatorio({ hoje, dreHoje, dreMes, agentes, alertasAbertos = [], 
   const oportunidades = ordenados.filter((a) => a.nivel === 'oportunidade')
 
   const estoqueBaixo = estoque.alertas.filter((a) => ['estoque_baixo', 'risco_ruptura', 'estoque_zerado'].includes(a.tipo))
-  const acontecendo = []
-  acontecendo.push(dreHoje.pedidos
-    ? `Hoje: ${dreHoje.pedidos} venda(s), faturamento ${brl(dreHoje.faturamento)}, lucro das vendas ${brl(dreHoje.lucro_operacional)} (margem ${pct(dreHoje.faturamento ? dreHoje.lucro_operacional / dreHoje.faturamento * 100 : null)}).`
-    : 'Hoje ainda não há vendas registradas.')
-  acontecendo.push(`No mês: ${dreMes.pedidos} venda(s), faturamento ${brl(dreMes.faturamento)}, lucro líquido ${brl(dreMes.lucro)} (margem ${pct(dreMes.margem)}) já descontando despesas fixas rateadas (${brl(dreMes.despesas_fixas)}).`)
+  const acontecendo = [...frasesNumeros(dreHoje, dreMes)]
   if (vendas.visao.suficiente) acontecendo.push(`Últimos 7 dias: ${vendas.visao.atual} vendas (média semanal ${vendas.visao.media_semanal}; variação ${pct(vendas.visao.variacao_pct)}).`)
   else acontecendo.push(`Tendência de vendas: ${vendas.visao.motivo}`)
 
@@ -34,9 +54,7 @@ function montarRelatorio({ hoje, dreHoje, dreMes, agentes, alertasAbertos = [], 
     data: hoje,
     gerado_em: new Date().toISOString(),
     numeros: {
-      hoje: { faturamento: dreHoje.faturamento, lucro: dreHoje.lucro_operacional, margem: dreHoje.faturamento ? Math.round(dreHoje.lucro_operacional / dreHoje.faturamento * 10000) / 100 : null, vendas: dreHoje.pedidos },
-      mes: { faturamento: dreMes.faturamento, lucro: dreMes.lucro, margem: dreMes.margem, vendas: dreMes.pedidos, despesas: dreMes.despesas },
-      produtos_vendidos_hoje: dreHoje.produtos_vendidos || 0,
+      ...blocoNumeros(dreHoje, dreMes),
       prejuizos_7_dias: { vendas: prejuizo.visao.vendas.length, total: prejuizo.visao.total_prejuizo },
       anuncios_parados: anuncios.visao.anuncios.length,
       estoque_baixo: estoqueBaixo.length,
@@ -56,4 +74,4 @@ function montarRelatorio({ hoje, dreHoje, dreMes, agentes, alertasAbertos = [], 
   }
 }
 
-module.exports = { montarRelatorio }
+module.exports = { montarRelatorio, atualizarNumeros, blocoNumeros }
