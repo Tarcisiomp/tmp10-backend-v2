@@ -238,20 +238,56 @@ if (process.env.INTELIGENCIA_AGENDADA === '1') {
   })
 }
 
+// ── Fase 2: proteção das rotas antigas do Mercado Livre / Shopee (achados A1–A4) ──
+// Ver src/seguranca/legado.js. A empresa vem SEMPRE da sessão; sem sessão (ou X-Admin-Token da plataforma) nada roda.
+const { criarGuardaLegado, criarTicket, lerTicket, segredoOAuth } = require('./src/seguranca/legado')
+const guarda = criarGuardaLegado({ adminToken: CONFIG.ADMIN_API_TOKEN, autenticar: criarAutenticarPush({ sb }) })
+const SEGREDO_OAUTH = segredoOAuth()
+const ID_CONTA_VALIDO = /^[A-Za-z0-9_-]{1,64}$/
+
+// O ERP pede, COM a sessão do administrador, o link de conexão. O backend devolve o endereço com um ticket
+// assinado (conta + empresa da sessão, válido por 15 min). O navegador abre esse endereço.
+app.post('/api/ml/auth-link', guarda.sessaoAdmin, (req, res) => {
+  const accountId = String((req.body && req.body.account_id) || 'conta1')
+  if (!ID_CONTA_VALIDO.test(accountId)) return res.status(400).json({ ok: false, error: 'Conta inválida.' })
+  const t = criarTicket({ p: 'ml', accountId, empresaId: req.empresaId, u: req.usuario.id }, SEGREDO_OAUTH)
+  res.json({ ok: true, url: `${RAILWAY_URL}/ml/auth/${encodeURIComponent(accountId)}?t=${encodeURIComponent(t)}` })
+})
+app.post('/api/shopee/auth-link', guarda.sessaoAdmin, async (req, res) => {
+  const accountId = String((req.body && req.body.account_id) || '')
+  if (!ID_CONTA_VALIDO.test(accountId)) return res.status(400).json({ ok: false, error: 'Conta inválida.' })
+  // a conta (linha em ml_accounts) tem que ser da empresa de quem está logado
+  const { data: conta, error } = await sb.from('ml_accounts').select('id').eq('id', accountId).eq('empresa_id', req.empresaId).maybeSingle()
+  if (error || !conta) return res.status(404).json({ ok: false, error: 'Conta não encontrada.' })
+  const t = criarTicket({ p: 'shopee', accountId, empresaId: req.empresaId, u: req.usuario.id }, SEGREDO_OAUTH)
+  res.json({ ok: true, url: `${RAILWAY_URL}/shopee/auth/${encodeURIComponent(accountId)}?t=${encodeURIComponent(t)}` })
+})
+function paginaErroConexao(res, msg) {
+  return res.status(400).send(`<!doctype html><meta charset="utf-8"><title>TMP10</title><p style="font-family:sans-serif;padding:24px">${msg}</p>`)
+}
+
 // ── Auth ──────────────────────────────────────────────────────────
-// state carrega "accountId:empresaId" pra sabermos, no callback, de qual
-// empresa (cliente) é essa conexão — sem isso a conta ML fica sem dono.
+// O "state" é o ticket assinado (conta + empresa da SESSÃO) — o callback sabe de qual empresa é a conexão
+// sem confiar em nada que venha do navegador.
 app.get('/ml/auth/:accountId', (req, res) => {
-  const empresaId = req.query.empresa_id || ''
+  const ticket = lerTicket(req.query.t, SEGREDO_OAUTH)
+  if (!ticket || ticket.p !== 'ml' || ticket.accountId !== req.params.accountId) {
+    return paginaErroConexao(res, 'Link de conexão inválido ou vencido. Volte ao TMP10, atualize a página (Ctrl+F5) e clique em Conectar de novo.')
+  }
   const redirectUri = `${RAILWAY_URL}/ml/callback`
-  const state = `${req.params.accountId}:${empresaId}`
+  const state = String(req.query.t)
   const url = `https://auth.mercadolivre.com.br/authorization?response_type=code&client_id=${ML_CLIENT_ID}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state)}`
   res.redirect(url)
 })
 
 app.get('/ml/callback', async (req, res) => {
   const { code, state } = req.query
-  const [accountId, empresaId] = String(state || '').split(':')
+  const ticket = lerTicket(state, SEGREDO_OAUTH)
+  if (!ticket || ticket.p !== 'ml') {
+    console.error('Auth error: state inválido ou vencido (conexão recusada)')
+    return res.redirect(`${ERP_URL}?ml_error=true`)
+  }
+  const { accountId, empresaId } = ticket
   try {
     const { data: tok } = await axios.post('https://api.mercadolibre.com/oauth/token', {
       grant_type: 'authorization_code',
@@ -264,6 +300,12 @@ app.get('/ml/callback', async (req, res) => {
       `https://api.mercadolibre.com/users/${tok.user_id}`,
       { headers: { Authorization: `Bearer ${tok.access_token}` } }
     )
+    // uma conta do ML já ligada a OUTRA empresa não muda de dono por aqui
+    const { data: existente } = await sb.from('ml_accounts').select('empresa_id').eq('ml_user_id', String(tok.user_id)).maybeSingle()
+    if (existente && existente.empresa_id && existente.empresa_id !== empresaId) {
+      console.error(`Auth error: conta ML ${tok.user_id} já pertence a outra empresa — conexão recusada`)
+      return res.redirect(`${ERP_URL}?ml_error=true`)
+    }
     await sb.from('ml_accounts').upsert({
       account_id: accountId,
       empresa_id: empresaId || null,
@@ -289,11 +331,15 @@ app.get('/shopee/auth/:accountId', (req, res) => {
   if (!SHOPEE_PARTNER_ID || !SHOPEE_PARTNER_KEY) {
     return res.status(500).send('SHOPEE_PARTNER_ID / SHOPEE_PARTNER_KEY não configurados no Railway')
   }
-  const empresaId = req.query.empresa_id || ''
+  const ticket = lerTicket(req.query.t, SEGREDO_OAUTH)
+  if (!ticket || ticket.p !== 'shopee' || ticket.accountId !== req.params.accountId) {
+    return paginaErroConexao(res, 'Link de conexão inválido ou vencido. Volte ao TMP10, atualize a página (Ctrl+F5) e clique em Conectar de novo.')
+  }
   const path = '/api/v2/shop/auth_partner'
   const timestamp = Math.floor(Date.now() / 1000)
   const sign = shopeeSign(path, timestamp)
-  const redirectBack = `${RAILWAY_URL}/shopee/callback?account_id=${req.params.accountId}&empresa_id=${empresaId}`
+  // a conta e a empresa voltam DENTRO do ticket assinado (não em parâmetros soltos que qualquer um poderia trocar)
+  const redirectBack = `${RAILWAY_URL}/shopee/callback?t=${encodeURIComponent(String(req.query.t))}`
   const url = `${SHOPEE_HOST}${path}?partner_id=${SHOPEE_PARTNER_ID}&timestamp=${timestamp}&sign=${sign}&redirect=${encodeURIComponent(redirectBack)}`
 
   // ── Diagnóstico temporário (seguro — nunca loga a Partner Key em si) ──
@@ -313,7 +359,13 @@ app.get('/shopee/auth/:accountId', (req, res) => {
 })
 
 app.get('/shopee/callback', async (req, res) => {
-  const { code, shop_id, account_id, empresa_id } = req.query
+  const { code, shop_id } = req.query
+  const ticket = lerTicket(req.query.t, SEGREDO_OAUTH)
+  if (!ticket || ticket.p !== 'shopee') {
+    console.error('Shopee auth error: ticket inválido ou vencido (conexão recusada)')
+    return res.redirect(`${ERP_URL}?shopee_error=${encodeURIComponent('Link de conexão inválido ou vencido')}`)
+  }
+  const account_id = ticket.accountId, empresa_id = ticket.empresaId
   try {
     if (!code || !shop_id) throw new Error('Shopee não devolveu code/shop_id — autorização cancelada ou incompleta')
     const path = '/api/v2/auth/token/get'
@@ -334,7 +386,10 @@ app.get('/shopee/callback', async (req, res) => {
       active: true
     }
     if (account_id) {
-      await sb.from('ml_accounts').update(updatePayload).eq('id', account_id)
+      // só a linha DESTA empresa (a do ticket) é atualizada
+      const { data: atualizadas, error: errUpd } = await sb.from('ml_accounts').update(updatePayload).eq('id', account_id).eq('empresa_id', empresa_id).select('id')
+      if (errUpd) throw new Error(errUpd.message)
+      if (!atualizadas || !atualizadas.length) throw new Error('Conta não encontrada nesta empresa')
     } else {
       await sb.from('ml_accounts').insert({ ...updatePayload, empresa_id: empresa_id || null, nickname: `Shopee ${shop_id}` })
     }
@@ -1806,30 +1861,32 @@ app.post('/ml/notifications', async (req, res) => {
 })
 
 // ── Endpoints ─────────────────────────────────────────────────────
-app.post('/api/sync-perguntas', async (req, res) => {
+app.post('/api/sync-perguntas', guarda.sessaoOuToken, async (req, res) => {
   res.json({ ok: true })
   syncPerguntas()
 })
 
-app.post('/api/pergunta-respondida/:id', async (req, res) => {
-  await sb.from('ml_perguntas').update({
+app.post('/api/pergunta-respondida/:id', guarda.sessaoOperacional, async (req, res) => {
+  // só a pergunta da empresa de quem está logado
+  const { error } = await sb.from('ml_perguntas').update({
     status: 'respondido',
     respondido_at: new Date().toISOString()
-  }).eq('pergunta_id', req.params.id)
+  }).eq('pergunta_id', req.params.id).eq('empresa_id', req.empresaId)
+  if (error) return res.status(500).json({ ok: false, error: 'Não foi possível marcar a pergunta.' })
   res.json({ ok: true })
 })
 
-app.post('/api/check-deliveries', async (req, res) => {
+app.post('/api/check-deliveries', guarda.sessaoOuToken, async (req, res) => {
   await checkDeliveries()
   res.json({ ok: true })
 })
 
-app.get('/api/shopee/check-tracking', async (req, res) => {
+app.get('/api/shopee/check-tracking', guarda.sessaoOuToken, async (req, res) => {
   await retentarRastreioShopee()
   res.json({ ok: true })
 })
 
-app.post('/api/shopee/check-tracking', async (req, res) => {
+app.post('/api/shopee/check-tracking', guarda.sessaoOuToken, async (req, res) => {
   await retentarRastreioShopee()
   res.json({ ok: true })
 })
@@ -2024,7 +2081,7 @@ app.get('/api/faturamento/verificar-fatura/:empresaId', exigirAdmin, async (req,
   }
 })
 
-app.post('/api/sync-estoque', async (req, res) => {
+app.post('/api/sync-estoque', guarda.sessaoOuToken, async (req, res) => {
   res.json({ ok: true })
   syncEstoqueML()
 })
@@ -2248,7 +2305,7 @@ app.post('/api/recalcular-um/:mlOrderId', exigirAdmin, async (req, res) => {
   }
 })
 
-app.post('/api/recalcular-custos', async (req, res) => {
+app.post('/api/recalcular-custos', guarda.sessaoOuToken, async (req, res) => {
   const offset = parseInt(req.query.offset || '0')
   const limit = 30
   res.json({ ok: true, message: `Recalculando custos v9 (offset=${offset})...` })
@@ -2337,7 +2394,7 @@ app.post('/api/reclassify', exigirAdmin, async (req, res) => {
   res.json({ ok: true })
 })
 
-app.post('/api/reclassify-all', async (req, res) => {
+app.post('/api/reclassify-all', guarda.sessaoOuToken, async (req, res) => {
   res.json({ ok: true, message: 'Reclassificação em massa iniciada...' })
   ;(async () => {
     const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
@@ -2461,16 +2518,21 @@ app.patch('/api/orders/:id', exigirAdmin, async (req, res) => {
   res.json(data)
 })
 
-app.get('/api/sync', async (req, res) => {
+// total de pedidos: com sessão, SÓ da empresa de quem chamou (antes contava todas as empresas)
+async function totalPedidos(req) {
+  let q = sb.from('ml_orders').select('*', { count: 'exact', head: true })
+  if (!req.viaTokenAdmin) q = q.eq('empresa_id', req.empresaId)
+  const { count } = await q
+  return count
+}
+app.get('/api/sync', guarda.sessaoOuToken, async (req, res) => {
   await syncAll()
-  const { count } = await sb.from('ml_orders').select('*', { count: 'exact', head: true })
-  res.json({ ok: true, total: count })
+  res.json({ ok: true, total: await totalPedidos(req) })
 })
 
-app.post('/api/sync', async (req, res) => {
+app.post('/api/sync', guarda.sessaoOuToken, async (req, res) => {
   await syncAll()
-  const { count } = await sb.from('ml_orders').select('*', { count: 'exact', head: true })
-  res.json({ ok: true, total: count })
+  res.json({ ok: true, total: await totalPedidos(req) })
 })
 
 app.get('/api/stats', exigirAdmin, async (req, res) => {
@@ -2585,20 +2647,30 @@ async function rodarImportProducts(empresa_id) {
   }
 }
 
-app.post('/api/ml/import-products', (req, res) => {
-  const { empresa_id } = req.body
+// empresa da importação = empresa da SESSÃO (o empresa_id enviado pelo navegador é ignorado).
+// Só com X-Admin-Token (ferramenta da plataforma) o empresa_id do corpo é aceito.
+let importEmpresaML = null
+function statusDaEmpresa(status, empresaDona, req) {
+  if (req.viaTokenAdmin || empresaDona === req.empresaId) return status
+  // importação de OUTRA empresa: não mostra nada dela
+  return { running: false, imported: 0, linked: 0, contaAtual: null, terminadoEm: null, erro: null, outra_importacao_em_andamento: !!status.running }
+}
+app.post('/api/ml/import-products', guarda.sessaoOuToken, (req, res) => {
+  const empresa_id = req.viaTokenAdmin ? (req.body && req.body.empresa_id) : req.empresaId
   if (!empresa_id) {
     return res.status(400).json({ ok: false, error: 'empresa_id é obrigatório — não é permitido importar sem saber de qual empresa é o pedido.' })
   }
   if (importStatus.running) {
+    if (importEmpresaML !== empresa_id && !req.viaTokenAdmin) return res.json({ ok: true, message: 'Outra importação está em andamento. Tente de novo em alguns minutos.', status: statusDaEmpresa(importStatus, importEmpresaML, req) })
     return res.json({ ok: true, message: 'Já está rodando, confere o progresso em /api/ml/import-products/status', status: importStatus })
   }
+  importEmpresaML = empresa_id
   rodarImportProducts(empresa_id) // não aguarda — roda em segundo plano
   res.json({ ok: true, message: 'Importação iniciada em segundo plano. Isso pode levar alguns minutos.' })
 })
 
-app.get('/api/ml/import-products/status', (req, res) => {
-  res.json(importStatus)
+app.get('/api/ml/import-products/status', guarda.sessaoOuToken, (req, res) => {
+  res.json(statusDaEmpresa(importStatus, importEmpresaML, req))
 })
 
 // ── Importar Produtos da Shopee ──────────────────────────────────────
@@ -2756,20 +2828,23 @@ async function rodarImportProductsShopee(empresa_id) {
   }
 }
 
-app.post('/api/shopee/import-products', (req, res) => {
-  const { empresa_id } = req.body
+let importEmpresaShopee = null
+app.post('/api/shopee/import-products', guarda.sessaoOuToken, (req, res) => {
+  const empresa_id = req.viaTokenAdmin ? (req.body && req.body.empresa_id) : req.empresaId
   if (!empresa_id) {
     return res.status(400).json({ ok: false, error: 'empresa_id é obrigatório' })
   }
   if (importStatusShopee.running) {
+    if (importEmpresaShopee !== empresa_id && !req.viaTokenAdmin) return res.json({ ok: true, message: 'Outra importação está em andamento. Tente de novo em alguns minutos.', status: statusDaEmpresa(importStatusShopee, importEmpresaShopee, req) })
     return res.json({ ok: true, message: 'Já está rodando, confere o progresso em /api/shopee/import-products/status', status: importStatusShopee })
   }
+  importEmpresaShopee = empresa_id
   rodarImportProductsShopee(empresa_id)
   res.json({ ok: true, message: 'Importação iniciada em segundo plano. Isso pode levar alguns minutos.' })
 })
 
-app.get('/api/shopee/import-products/status', (req, res) => {
-  res.json(importStatusShopee)
+app.get('/api/shopee/import-products/status', guarda.sessaoOuToken, (req, res) => {
+  res.json(statusDaEmpresa(importStatusShopee, importEmpresaShopee, req))
 })
 
 const PORT = process.env.PORT || 3001
