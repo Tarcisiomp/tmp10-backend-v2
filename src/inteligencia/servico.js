@@ -3,7 +3,7 @@
 const dados = require('./dados')
 const dre = require('./dre')
 const ag = require('./agentes')
-const { montarRelatorio } = require('./diretor')
+const { montarRelatorio, atualizarNumeros } = require('./diretor')
 const { resolverPeriodo, diaBrasilia, somarDias, inicioDoDia, fimDoDia } = require('./periodo')
 const { criarAlertas, erroBanco, tabelaAusente } = require('./alertas')
 
@@ -98,6 +98,38 @@ function criarServico({ sb, envioPush = null, log = console.log, agora = () => n
     return { periodo: { tipo: per.periodo, de: per.de, ate: per.ate, dias: per.dias }, filtros, resumo: res, vendas: filtradas.map(dre.linhaPublica) }
   }
 
+  // ── INDICADORES OFICIAIS (hoje / ontem / mês) ─────────────────────────────────────────
+  // Regra única de "vendas/faturamento" usada pela Central (relatório) e pelo Painel Executivo:
+  //   · fonte: pedidos do Mercado Livre e da Shopee (ml_orders) + vendas externas (revenda_pedidos);
+  //   · dia/mês no horário de Brasília: de 00:00:00.000 até 23:59:59.999 (nada de pedido com data futura);
+  //   · fora: pedidos com status "cancelado" (mesma regra de todas as telas);
+  //   · faturamento = valor total do pedido (total_amount / valor_total), sem descontar taxa nem frete.
+  // Os números saem de dre.resumo — exatamente os mesmos do DRE da Central para o mesmo período.
+  async function indicadores(empresaId) {
+    const hoje = diaBrasilia(agora())
+    const ontem = somarDias(hoje, -1)
+    const inicioMes = hoje.slice(0, 8) + '01'
+    const de = ontem < inicioMes ? ontem : inicioMes
+    const per = { ini: inicioDoDia(de), fim: fimDoDia(hoje), de, ate: hoje, dias: Math.round((fimDoDia(hoje) - inicioDoDia(de) + 1) / 86400000) }
+    const { linhas, fin, ext } = await vendasDaJanela(empresaId, per)
+    const diaDe = (l) => diaBrasilia(new Date(l.data))
+    const resumoEntre = (d1, d2) => {
+      const ls = linhas.filter((l) => { const d = diaDe(l); return d >= d1 && d <= d2 })
+      const dias = Math.round((fimDoDia(d2) - inicioDoDia(d1) + 1) / 86400000)
+      const r = dre.resumo(ls, { despesasFixas: fin.despesasFixas, gastosExternos: ((ext && ext.gastos) || []).filter((g) => g.data >= d1 && g.data <= d2), dias, impostoGlobalPct: fin.impostoGlobalPct })
+      r.produtos_vendidos = ls.reduce((t, l) => t + l.itens.reduce((u, i) => u + i.quantidade, 0), 0)
+      return { resumo: r, linhas: ls }
+    }
+    const h = resumoEntre(hoje, hoje), o = resumoEntre(ontem, ontem), m = resumoEntre(inicioMes, hoje)
+    return {
+      gerado_em: agora().toISOString(), data: hoje,
+      regra: 'Mercado Livre + Shopee + Vendas Externas; dia no horário de Brasília (00:00–23:59:59); cancelados fora; faturamento = valor total do pedido.',
+      hoje: h.resumo, ontem: o.resumo, mes: m.resumo,
+      canais_hoje: dre.agrupar(h.linhas, 'marketplace'),
+      canais_ontem: dre.agrupar(o.linhas, 'marketplace')
+    }
+  }
+
   // ── Agentes + alertas + relatório ─────────────────────────────────────────────────────
   async function rodarAgentes(empresaId, { pushCriticos } = {}) {
     if (emExecucao.has(empresaId)) return emExecucao.get(empresaId)
@@ -121,13 +153,9 @@ function criarServico({ sb, envioPush = null, log = console.log, agora = () => n
       const candidatos = Object.values(r).flatMap((x) => x.alertas)
       const gravacao = await alertas.registrar(empresaId, candidatos, { pushCriticos: pushCriticos !== undefined ? pushCriticos : config.push_alertas_criticos !== false, resolverChaves: r.prejuizo.resolver || [] })
 
-      const doDia = dre.filtrar(linhas, {}).filter((l) => diaBrasilia(new Date(l.data)) === hoje)
-      const doMes = linhas.filter((l) => diaBrasilia(new Date(l.data)) >= hoje.slice(0, 8) + '01')
-      const dreHoje = dre.resumo(doDia, { dias: 1, impostoGlobalPct: fin.impostoGlobalPct })
-      dreHoje.produtos_vendidos = doDia.reduce((s, l) => s + l.itens.reduce((t, i) => t + i.quantidade, 0), 0)
-      const diasMes = Number(hoje.slice(8, 10))
-      const inicioMes = hoje.slice(0, 8) + '01'
-      const dreMes = dre.resumo(doMes, { despesasFixas: fin.despesasFixas, gastosExternos: ((ext && ext.gastos) || []).filter((g) => g.data >= inicioMes), dias: diasMes, impostoGlobalPct: fin.impostoGlobalPct }) // = /dre?periodo=mes
+      // números de hoje e do mês: MESMA função do Painel Executivo (indicadores oficiais)
+      const ind = await indicadores(empresaId)
+      const dreHoje = ind.hoje, dreMes = ind.mes
       const abertos = await alertas.listar(empresaId, { status: 'abertos', limite: 500 })
       const memoria = await listarMemoria(empresaId)
       const relatorio = montarRelatorio({ hoje, dreHoje, dreMes, agentes: r, alertasAbertos: abertos, memoria })
@@ -155,7 +183,11 @@ function criarServico({ sb, envioPush = null, log = console.log, agora = () => n
     const hoje = diaBrasilia(agora())
     const { data, error } = await sb.from('relatorios_diarios').select('conteudo, gerado_em').eq('empresa_id', empresaId).eq('data', hoje).maybeSingle()
     if (error) throw erroBanco(error)
-    if (data && (agora() - new Date(data.gerado_em)) / 60000 <= maxIdadeMin) return { relatorio: data.conteudo, recalculado: false }
+    if (data && (agora() - new Date(data.gerado_em)) / 60000 <= maxIdadeMin) {
+      // análise dos agentes pode ter até 60 min, mas faturamento/vendas/lucro de hoje e do mês são SEMPRE do momento
+      const ind = await indicadores(empresaId)
+      return { relatorio: atualizarNumeros(data.conteudo, ind.hoje, ind.mes), recalculado: false }
+    }
     const r = await rodarAgentes(empresaId)
     return { relatorio: r.relatorio, recalculado: true }
   }
@@ -202,7 +234,7 @@ function criarServico({ sb, envioPush = null, log = console.log, agora = () => n
     return true
   }
 
-  return { calcularDRE, vendasDetalhadas, rodarAgentes, relatorioDoDia, lerConfig, salvarConfig, listarMemoria, criarMemoria, alterarMemoria, apagarMemoria, alertas, CONFIG_PADRAO }
+  return { calcularDRE, vendasDetalhadas, indicadores, rodarAgentes, relatorioDoDia, lerConfig, salvarConfig, listarMemoria, criarMemoria, alterarMemoria, apagarMemoria, alertas, CONFIG_PADRAO }
 }
 
 module.exports = { criarServico, CATEGORIAS_MEMORIA, SENSIVEL }
