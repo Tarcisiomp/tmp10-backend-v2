@@ -52,6 +52,9 @@ function criarRotasInteligencia({ sb, autenticar, exigirPapel, envioPush = null,
   // DRE / lucro real
   router.get('/api/inteligencia/dre', ...admin, limitar, responder(async (req) => servico.calcularDRE(req.empresaId, req.query)))
 
+  // Vendas do período uma a uma, já calculadas pelo MESMO serviço do DRE (usado pela tela Financeiro)
+  router.get('/api/inteligencia/vendas', ...admin, limitar, responder(async (req) => servico.vendasDetalhadas(req.empresaId, req.query)))
+
   // Relatório diário (recalcula se tiver mais de 60 min)
   router.get('/api/inteligencia/relatorio', ...admin, limitar, responder(async (req) => servico.relatorioDoDia(req.empresaId)))
 
