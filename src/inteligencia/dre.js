@@ -158,6 +158,7 @@ function calcularVendas({ pedidosMarketplace = [], produtos = [], impostoGlobalP
 // Filtros (todos opcionais). A empresa NÃO é filtro: os dados já chegam só da empresa da sessão.
 function filtrar(linhas, f = {}) {
   return linhas.filter((l) => {
+    if (f.origem && l.origem !== f.origem) return false // 'marketplace' = só Mercado Livre + Shopee (a tela Financeiro)
     if (f.marketplace && l.marketplace !== f.marketplace) return false
     if (f.conta && l.conta !== f.conta) return false
     if (f.vendedor && l.vendedor_id !== f.vendedor) return false
@@ -244,4 +245,17 @@ function resumo(linhas, { despesasFixas = [], gastosExternos = [], dias = 1, imp
   }
 }
 
-module.exports = { calcularVendas, calcularPedidoMarketplace, filtrar, agrupar, resumo, formatar, marketplaceDo, itensDo, mapaProdutos, DIMENSOES, MARKETPLACES, r2 }
+// Linha de venda para enviar ao navegador: os MESMOS valores do DRE, só arredondados (nenhuma conta nova)
+function linhaPublica(l) {
+  const v = {}
+  for (const [k, x] of Object.entries(l.valores)) v[k] = r2(x)
+  return {
+    origem: l.origem, pedido: l.pedido, data: l.data, marketplace: l.marketplace, conta: l.conta, tipo_envio: l.tipo_envio, vendedor: l.vendedor,
+    valores: v, custo: r2(l.valores.custo_produto + l.valores.embalagem + l.valores.frete_produto + l.valores.outros),
+    margem: l.valores.faturamento > 0 ? r2(l.valores.lucro / l.valores.faturamento * 100) : null,
+    itens: l.itens.map((i) => { const x = {}; for (const [k, y] of Object.entries(i.valores)) x[k] = r2(y); return { sku: i.sku, nome: i.nome, quantidade: i.quantidade, anuncio: i.anuncio, valores: x, pendencias: i.pendencias } }),
+    pendencias: l.pendencias
+  }
+}
+
+module.exports = { linhaPublica, calcularVendas, calcularPedidoMarketplace, filtrar, agrupar, resumo, formatar, marketplaceDo, itensDo, mapaProdutos, DIMENSOES, MARKETPLACES, r2 }
