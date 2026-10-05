@@ -36,6 +36,7 @@ const corsConta = cors({ origin: (origem, cb) => cb(null, !origem || ORIGENS_CON
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/superadmin/')) return corsSuperAdmin(req, res, next)
   if (req.path.startsWith('/api/conta/')) return corsConta(req, res, next)
+  if (req.path.startsWith('/api/inteligencia/')) return corsConta(req, res, next) // mesmas origens oficiais do ERP
   return corsGeral(req, res, next)
 })
 app.use(express.json())
@@ -215,6 +216,27 @@ app.post('/api/push/testar', criarAutenticarPush({ sb }), async (req, res) => {
     res.status(500).json({ ok: false, error: e.message })
   }
 })
+
+// ── Central de Inteligência (DRE, alertas, agentes, relatório diário, memória, assistente) ──
+// Rotas /api/inteligencia/* (ver src/inteligencia/). Sempre com sessão; empresa da sessão; dados financeiros só para admin.
+// Tabelas novas da migração docs/sql/20-inteligencia.sql (sem ela, o DRE funciona e o resto responde 503 explicando).
+const { criarRotasInteligencia } = require('./src/inteligencia/rotas')
+const { exigirPapel: exigirPapelInteligencia } = require('./src/auth/sessao')
+const inteligencia = criarRotasInteligencia({ sb, autenticar: criarAutenticarPush({ sb }), exigirPapel: exigirPapelInteligencia, envioPush, limitePorMinuto: Number(process.env.INTELIGENCIA_LIMITE_POR_MINUTO) || 30 })
+app.use(inteligencia.router)
+// Rotina automática (desligada por padrão): INTELIGENCIA_AGENDADA=1 no Railway roda os agentes de hora em hora
+// para as empresas com acesso. Sem ela, os agentes rodam quando o admin abre a Central (relatório com mais de 60 min).
+if (process.env.INTELIGENCIA_AGENDADA === '1') {
+  cron.schedule('7 * * * *', async () => {
+    try {
+      const { data: emps, error } = await sb.from('empresas').select('id, status')
+      if (error) throw new Error(error.message)
+      for (const e of (emps || []).filter((x) => !['bloqueado', 'inativo', 'cancelado'].includes(x.status))) {
+        try { await inteligencia.servico.rodarAgentes(e.id) } catch (err) { console.log(`[INTELIGENCIA] rotina: empresa ${e.id}: ${err.message}`) }
+      }
+    } catch (err) { console.log(`[INTELIGENCIA] rotina automática falhou: ${err.message}`) }
+  })
+}
 
 // ── Auth ──────────────────────────────────────────────────────────
 // state carrega "accountId:empresaId" pra sabermos, no callback, de qual
