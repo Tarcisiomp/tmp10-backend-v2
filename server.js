@@ -112,11 +112,24 @@ function shopeeSign(path, timestamp, accessToken = '', shopId = '') {
 const VAPID_PUBLIC_KEY  = CONFIG.VAPID_PUBLIC_KEY
 const VAPID_PRIVATE_KEY = CONFIG.VAPID_PRIVATE_KEY
 webpush.setVapidDetails('mailto:contato@tmp10.com.br', VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY)
+// Envio único para todo o backend (src/push/enviar.js): urgência alta, validade 24 h, erros registrados no log
+const { criarEnvioPush, conferirParVapid } = require('./src/push/enviar')
+const envioPush = criarEnvioPush({ sb, webpush })
+{ const par = conferirParVapid(VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY)
+  if (par.ok) console.log('🔔 [PUSH] chaves VAPID OK (pública e privada formam um par)')
+  else console.error('❌ [PUSH] ' + par.motivo + ' — NENHUMA notificação push vai chegar enquanto isso não for corrigido.') }
 
 // Proteção (pacote final): com sessão, empresa/usuário vêm da sessão; sem sessão, só enquanto PUSH_EXIGIR_SESSAO != 1
 const { criarProtecaoPush } = require('./src/conta/pushSeguro')
 app.use(['/api/push/subscribe', '/api/push/notificar-venda', '/api/push/notificar-mensagem'],
   criarProtecaoPush({ sb, exigirSessao: process.env.PUSH_EXIGIR_SESSAO === '1' }))
+
+// Chave PÚBLICA do VAPID (não é segredo). O ERP inscreve o aparelho SEMPRE com a chave que o backend usa para
+// assinar — se as chaves forem trocadas no Railway, os aparelhos se reinscrevem sozinhos no próximo acesso.
+app.get('/api/push/chave-publica', (req, res) => {
+  res.set('Cache-Control', 'no-store')
+  res.json({ ok: true, chave: VAPID_PUBLIC_KEY })
+})
 
 // Salva a inscrição de notificação de um usuário (chamado pelo frontend)
 app.post('/api/push/subscribe', async (req, res) => {
@@ -124,6 +137,9 @@ app.post('/api/push/subscribe', async (req, res) => {
     const { empresa_id, user_id, subscription } = req.body
     if (!empresa_id || !user_id || !subscription?.endpoint) {
       return res.status(400).json({ error: 'Dados incompletos' })
+    }
+    if (!subscription.keys?.p256dh || !subscription.keys?.auth) {
+      return res.status(400).json({ error: 'Inscrição sem as chaves do aparelho. Ative as notificações de novo.' })
     }
     const { error } = await sb.from('push_subscriptions').upsert({
       empresa_id,
@@ -151,39 +167,18 @@ app.post('/api/push/unsubscribe', async (req, res) => {
   }
 })
 
-// Envia notificação push pra todos os inscritos de uma empresa (usado quando o vendedor finaliza uma venda)
+// Envia notificação push pra todos os inscritos de uma empresa (usado quando o vendedor finaliza uma venda).
+// Quem fez a venda (excluir_user_id) não recebe o aviso da própria venda.
 app.post('/api/push/notificar-venda', async (req, res) => {
   try {
     const { empresa_id, titulo, mensagem, excluir_user_id } = req.body
     if (!empresa_id) return res.status(400).json({ error: 'empresa_id obrigatório' })
-
-    let query = sb.from('push_subscriptions').select('*').eq('empresa_id', empresa_id)
-    const { data: subs, error } = await query
-    if (error) return res.status(500).json({ error: error.message })
-
-    const payload = JSON.stringify({
+    const r = await envioPush.enviarParaEmpresa(empresa_id, {
       title: titulo || '🔔 Nova venda!',
       body: mensagem || 'Um pedido novo foi registrado.',
       tag: 'nova-venda'
-    })
-
-    let enviados = 0
-    for (const s of (subs || [])) {
-      if (excluir_user_id && s.user_id === excluir_user_id) continue
-      try {
-        await webpush.sendNotification({
-          endpoint: s.endpoint,
-          keys: { p256dh: s.p256dh, auth: s.auth }
-        }, payload)
-        enviados++
-      } catch (err) {
-        // Inscrição expirada/inválida — remove do banco
-        if (err.statusCode === 404 || err.statusCode === 410) {
-          await sb.from('push_subscriptions').delete().eq('endpoint', s.endpoint)
-        }
-      }
-    }
-    res.json({ ok: true, enviados })
+    }, { excluirUserId: excluir_user_id || null })
+    res.json({ ok: true, enviados: r.enviados, falhas: r.falhas, inscricoes: r.inscricoes })
   } catch (e) {
     res.status(500).json({ error: e.message })
   }
@@ -194,37 +189,30 @@ app.post('/api/push/notificar-mensagem', async (req, res) => {
   try {
     const { empresa_id, titulo, mensagem, user_ids } = req.body
     if (!empresa_id || !mensagem) return res.status(400).json({ error: 'empresa_id e mensagem são obrigatórios' })
-
-    let query = sb.from('push_subscriptions').select('*').eq('empresa_id', empresa_id)
-    if (Array.isArray(user_ids) && user_ids.length > 0) {
-      query = query.in('user_id', user_ids)
-    }
-    const { data: subs, error } = await query
-    if (error) return res.status(500).json({ error: error.message })
-
-    const payload = JSON.stringify({
+    const r = await envioPush.enviarParaEmpresa(empresa_id, {
       title: titulo || '📢 Aviso',
       body: mensagem,
       tag: 'aviso-equipe'
-    })
-
-    let enviados = 0
-    for (const s of (subs || [])) {
-      try {
-        await webpush.sendNotification({
-          endpoint: s.endpoint,
-          keys: { p256dh: s.p256dh, auth: s.auth }
-        }, payload)
-        enviados++
-      } catch (err) {
-        if (err.statusCode === 404 || err.statusCode === 410) {
-          await sb.from('push_subscriptions').delete().eq('endpoint', s.endpoint)
-        }
-      }
-    }
-    res.json({ ok: true, enviados })
+    }, { userIds: Array.isArray(user_ids) ? user_ids : null })
+    res.json({ ok: true, enviados: r.enviados, falhas: r.falhas, inscricoes: r.inscricoes })
   } catch (e) {
     res.status(500).json({ error: e.message })
+  }
+})
+
+// TESTE: manda uma notificação SÓ para os aparelhos de quem está logado (sempre exige sessão) e devolve,
+// aparelho por aparelho, se o serviço de push aceitou — e o motivo quando não aceitou.
+const { criarAutenticar: criarAutenticarPush } = require('./src/auth/sessao')
+app.post('/api/push/testar', criarAutenticarPush({ sb }), async (req, res) => {
+  try {
+    const r = await envioPush.enviarParaEmpresa(req.empresaId, {
+      title: '🔔 Teste de notificação — TMP10',
+      body: `Olá, ${req.usuario.name || 'tudo certo'}! Se você está vendo isto, as notificações deste aparelho estão funcionando.`,
+      tag: 'teste'
+    }, { userIds: [req.usuario.id] })
+    res.json({ ok: true, inscricoes: r.inscricoes, enviados: r.enviados, falhas: r.falhas, aparelhos: r.detalhes })
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message })
   }
 })
 
@@ -1350,16 +1338,7 @@ async function alertarContasVencendoHoje() {
         ? `${contas[0].fornecedor} — R$ ${Number(contas[0].valor).toFixed(2)}`
         : `Total de R$ ${totalHoje.toFixed(2)} — ${contas.map(c => c.fornecedor).join(', ')}`
 
-      const payload = JSON.stringify({ title: titulo, body: corpo, tag: 'conta-vencendo' })
-      for (const s of subs) {
-        try {
-          await webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, payload)
-        } catch (err) {
-          if (err.statusCode === 404 || err.statusCode === 410) {
-            await sb.from('push_subscriptions').delete().eq('endpoint', s.endpoint)
-          }
-        }
-      }
+      await envioPush.enviarParaInscricoes(subs, { title: titulo, body: corpo, tag: 'conta-vencendo' })
       empresasAvisadas++
     }
     if (empresasAvisadas > 0) console.log(`⚠️ Alerta de vencimento enviado pra ${empresasAvisadas} empresa(s)`)
