@@ -55,6 +55,9 @@ function criarRotasInteligencia({ sb, autenticar, exigirPapel, envioPush = null,
   // Vendas do período uma a uma, já calculadas pelo MESMO serviço do DRE (usado pela tela Financeiro)
   router.get('/api/inteligencia/vendas', ...admin, limitar, responder(async (req) => servico.vendasDetalhadas(req.empresaId, req.query)))
 
+  // Indicadores oficiais de hoje / ontem / mês — a MESMA regra do relatório da Central (usado pelo Painel Executivo)
+  router.get('/api/inteligencia/indicadores', ...admin, limitar, responder(async (req) => servico.indicadores(req.empresaId)))
+
   // Relatório diário (recalcula se tiver mais de 60 min)
   router.get('/api/inteligencia/relatorio', ...admin, limitar, responder(async (req) => servico.relatorioDoDia(req.empresaId)))
 
