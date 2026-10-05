@@ -55,22 +55,34 @@ function criarServico({ sb, envioPush = null, log = console.log, agora = () => n
   }
 
   // ── DRE ─────────────────────────────────────────────────────────────────────────────
-  async function calcularDRE(empresaId, q = {}) {
+  // Cálculo único do DRE (usado pela Central, pela tela Financeiro e pelo assistente)
+  const ORIGENS = ['marketplace', 'venda_externa']
+  async function calcular(empresaId, q = {}) {
     const per = resolverPeriodo({ periodo: q.periodo || 'mes', de: q.de, ate: q.ate }, agora())
-    const dimensao = q.agrupar || 'marketplace'
-    if (!dre.DIMENSOES.includes(dimensao)) throw Object.assign(new Error('Agrupamento inválido. Use: ' + dre.DIMENSOES.join(', ')), { status: 400 })
-    const filtros = { marketplace: q.marketplace || null, conta: q.conta || null, vendedor: q.vendedor || null, sku: q.sku || null, anuncio: q.anuncio || null, tipo_envio: q.tipo_envio || null }
+    const filtros = { origem: q.origem || null, marketplace: q.marketplace || null, conta: q.conta || null, vendedor: q.vendedor || null, sku: q.sku || null, anuncio: q.anuncio || null, tipo_envio: q.tipo_envio || null }
     if (filtros.marketplace && !dre.MARKETPLACES[filtros.marketplace]) throw Object.assign(new Error('Marketplace inválido.'), { status: 400 })
-    const { linhas, fin, ext } = await vendasDaJanela(empresaId, per, { externas: !filtros.marketplace || filtros.marketplace === 'venda_externa', marketplace: filtros.marketplace !== 'venda_externa' && !filtros.vendedor })
+    if (filtros.origem && !ORIGENS.includes(filtros.origem)) throw Object.assign(new Error('Origem inválida.'), { status: 400 })
+    const soMarketplace = filtros.origem === 'marketplace' || (filtros.marketplace && filtros.marketplace !== 'venda_externa')
+    const soExterna = filtros.origem === 'venda_externa' || filtros.marketplace === 'venda_externa' || !!filtros.vendedor
+    const { linhas, fin, ext } = await vendasDaJanela(empresaId, per, { externas: !soMarketplace, marketplace: !soExterna })
     const filtradas = dre.filtrar(linhas, filtros)
-    // despesas fixas e gastos externos só entram no DRE "da empresa toda" (sem filtro de produto/anúncio/conta/vendedor)
+    // Despesas fixas: só no resultado "da empresa" (sem filtro de canal único, conta, produto, anúncio, vendedor ou envio).
+    // "Mercado Livre + Shopee" (origem=marketplace) também é visão da empresa — é a visão da tela Financeiro.
+    // Gastos das vendas externas: só quando as vendas externas estão na conta.
     const geral = !filtros.conta && !filtros.vendedor && !filtros.sku && !filtros.anuncio && !filtros.tipo_envio
     const res = dre.resumo(filtradas, {
-      despesasFixas: geral && !filtros.marketplace ? fin.despesasFixas : [],
-      gastosExternos: geral && (!filtros.marketplace || filtros.marketplace === 'venda_externa') && ext ? ext.gastos : [],
+      despesasFixas: geral && !filtros.marketplace && filtros.origem !== 'venda_externa' ? fin.despesasFixas : [],
+      gastosExternos: geral && !soMarketplace && ext ? ext.gastos : [],
       dias: per.dias, impostoGlobalPct: fin.impostoGlobalPct
     })
     res.produtos_vendidos = filtradas.reduce((s, l) => s + l.itens.reduce((t, i) => t + i.quantidade, 0), 0)
+    return { per, filtros, linhas, filtradas, res, ext }
+  }
+
+  async function calcularDRE(empresaId, q = {}) {
+    const dimensao = q.agrupar || 'marketplace'
+    if (!dre.DIMENSOES.includes(dimensao)) throw Object.assign(new Error('Agrupamento inválido. Use: ' + dre.DIMENSOES.join(', ')), { status: 400 })
+    const { per, filtros, linhas, filtradas, res, ext } = await calcular(empresaId, q)
     const opcoes = {
       marketplaces: [...new Set(linhas.map((l) => l.marketplace))].map((m) => ({ valor: m, rotulo: dre.MARKETPLACES[m] })),
       contas: [...new Set(linhas.filter((l) => l.origem === 'marketplace').map((l) => l.conta))].sort(),
@@ -78,6 +90,12 @@ function criarServico({ sb, envioPush = null, log = console.log, agora = () => n
       agrupamentos: dre.DIMENSOES
     }
     return { periodo: { tipo: per.periodo, de: per.de, ate: per.ate, dias: per.dias }, filtros, resumo: res, agrupado_por: dimensao, grupos: dre.agrupar(filtradas, dimensao).slice(0, 500), opcoes }
+  }
+
+  // As vendas do período, uma a uma, já calculadas (a tela Financeiro monta os quadros a partir daqui)
+  async function vendasDetalhadas(empresaId, q = {}) {
+    const { per, filtros, filtradas, res } = await calcular(empresaId, q)
+    return { periodo: { tipo: per.periodo, de: per.de, ate: per.ate, dias: per.dias }, filtros, resumo: res, vendas: filtradas.map(dre.linhaPublica) }
   }
 
   // ── Agentes + alertas + relatório ─────────────────────────────────────────────────────
@@ -184,7 +202,7 @@ function criarServico({ sb, envioPush = null, log = console.log, agora = () => n
     return true
   }
 
-  return { calcularDRE, rodarAgentes, relatorioDoDia, lerConfig, salvarConfig, listarMemoria, criarMemoria, alterarMemoria, apagarMemoria, alertas, CONFIG_PADRAO }
+  return { calcularDRE, vendasDetalhadas, rodarAgentes, relatorioDoDia, lerConfig, salvarConfig, listarMemoria, criarMemoria, alterarMemoria, apagarMemoria, alertas, CONFIG_PADRAO }
 }
 
 module.exports = { criarServico, CATEGORIAS_MEMORIA, SENSIVEL }
