@@ -34,20 +34,13 @@ const ROTAS_ADMIN = [
   ['GET', '/api/stats']
 ]
 
-// Rotas que o ERP usa (ou que são chamadas por ML/Shopee) → continuam funcionando como antes no passo 0.1
+// Rotas que continuam abertas: raiz, push (protegido pelo pushSeguro) e o aviso do próprio Mercado Livre.
+// As rotas de Mercado Livre / Shopee usadas pelo ERP passaram a exigir sessão na Fase 2 (test/fase2-seguranca.test.js).
 const ROTAS_ABERTAS = [
   ['GET', '/'],
-  ['GET', '/api/sync'], ['POST', '/api/sync'],
-  ['POST', '/api/sync-estoque'], ['POST', '/api/sync-perguntas'],
-  ['POST', '/api/check-deliveries'],
-  ['GET', '/api/shopee/check-tracking'], ['POST', '/api/shopee/check-tracking'],
-  ['POST', '/api/recalcular-custos'], ['POST', '/api/reclassify-all'],
   ['POST', '/api/push/subscribe'], ['POST', '/api/push/unsubscribe'],
   ['POST', '/api/push/notificar-venda'], ['POST', '/api/push/notificar-mensagem'],
-  ['POST', '/api/pergunta-respondida/1'],
-  ['POST', '/api/ml/import-products'], ['GET', '/api/ml/import-products/status'],
-  ['POST', '/api/shopee/import-products'], ['GET', '/api/shopee/import-products/status'],
-  ['GET', '/ml/auth/conta1?empresa_id=emp-1'],
+  ['GET', '/api/push/chave-publica'],
   ['POST', '/ml/notifications']
 ]
 
@@ -99,9 +92,11 @@ test('config: modo inválido é recusado', () => {
 })
 
 // ── 2. Inventário de rotas (nenhuma rota esquecida) ─────────────────
-test('as 44 rotas continuam registradas e todas estão classificadas', () => {
+test('as 48 rotas continuam registradas e todas estão classificadas', () => {
   const regs = [...SERVER.matchAll(/app\.(get|post|put|patch|delete|all)\('([^']+)'/g)]
-  assert.equal(regs.length, 44, 'número de rotas mudou — revisar a classificação')
+  // 44 + 2 do push definitivo: GET /api/push/chave-publica (aberta: chave PÚBLICA) e POST /api/push/testar (exige sessão)
+  // + 2 da Fase 2: POST /api/ml/auth-link e POST /api/shopee/auth-link (exigem sessão de administrador)
+  assert.equal(regs.length, 48, 'número de rotas mudou — revisar a classificação')
   const comAdmin = [...SERVER.matchAll(/app\.(get|post|put|patch|delete|all)\('([^']+)', exigirAdmin,/g)]
   assert.equal(comAdmin.length, ROTAS_ADMIN.length, 'quantidade de rotas protegidas')
 })
@@ -155,8 +150,8 @@ test('modo report: deixa passar e registra no log', () => {
 })
 
 // ── 6. Rotinas automáticas continuam registradas ────────────────────
-test('as 12 rotinas automáticas (cron) continuam registradas + 1 do Super Admin (bloqueio por pagamento)', () => {
-  assert.equal(registro.crons, 13)
+test('as 12 rotinas automáticas (cron) continuam registradas + 1 do Super Admin + 2 do Estoque Central (conferência Shopee e fila)', () => {
+  assert.equal(registro.crons, 15)
 })
 
 // ── 7. Perguntas passam a gravar a empresa ──────────────────────────
@@ -169,7 +164,7 @@ test('syncPerguntas grava empresa_id da conta', async () => {
     return Promise.reject(new Error('não usado'))
   }
   try {
-    const r = await chamar(app, 'POST', '/api/sync-perguntas', { body: {} })
+    const r = await chamar(app, 'POST', '/api/sync-perguntas', { headers: { 'x-admin-token': TOKEN_ADMIN }, body: {} })
     assert.equal(r.status, 200)
     let op
     for (let i = 0; i < 40 && !op; i++) {

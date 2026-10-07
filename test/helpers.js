@@ -48,7 +48,8 @@ function criarQuery(tabela) {
       if (q.acao === 'upsert') {
         const chave = (q.opcoes && q.opcoes.onConflict) || 'id'
         for (const n of (Array.isArray(q.payload) ? q.payload : [q.payload])) {
-          const existente = linhas.find((r) => r[chave] !== undefined && r[chave] === n[chave])
+          const cols = String(chave).split(',').map((c) => c.trim())
+          const existente = linhas.find((r) => cols.every((c) => r[c] !== undefined && r[c] === n[c]))
           if (existente) Object.assign(existente, n); else linhas.push({ id: 'id-' + (++registro.seq), ...n })
         }
         return { data: q.payload, error: null }
@@ -74,7 +75,8 @@ const authFake = {
     return id ? { data: { user: { id } }, error: null } : { data: { user: null }, error: { message: 'invalid JWT' } }
   },
   admin: {
-    createUser: async (dados) => { registro.auth.chamadas.push(['createUser', dados]); if (registro.auth.erro) return { data: null, error: registro.auth.erro }; return { data: { user: { id: 'auth-' + (++registro.seq) } }, error: null } },
+    createUser: async (dados) => { registro.auth.chamadas.push(['createUser', dados]); if (registro.auth.erro) return { data: null, error: registro.auth.erro }; const id = 'auth-' + (++registro.seq); (registro.auth.emails = registro.auth.emails || {})[id] = dados.email; return { data: { user: { id } }, error: null } },
+    getUserById: async (id) => ({ data: { user: { id, email: (registro.auth.emails || {})[id] || null } }, error: null }),
     inviteUserByEmail: async (email, op) => { registro.auth.chamadas.push(['invite', email, op]); if (registro.auth.erro) return { data: null, error: registro.auth.erro }; return { data: { user: { id: 'auth-' + (++registro.seq) } }, error: null } },
     updateUserById: async (id, dados) => { registro.auth.chamadas.push(['update', id, dados]); return { data: {}, error: null } },
     deleteUser: async (id) => { registro.auth.chamadas.push(['delete', id]); return { data: {}, error: null } }
@@ -86,13 +88,23 @@ const authFake = {
 }
 
 const fakes = {
-  '@supabase/supabase-js': { createClient: () => ({ from: (t) => criarQuery(t), rpc: async () => ({ data: null, error: null }), storage: { from: () => ({}) }, auth: authFake }) },
+  '@supabase/supabase-js': { createClient: () => ({ from: (t) => criarQuery(t), rpc: async (nome, args) => { (registro.rpcs = registro.rpcs || []).push([nome, args]); return registro.rpc && registro.rpc[nome] ? registro.rpc[nome](args) : { data: null, error: null } }, storage: { from: () => ({}) }, auth: authFake }) },
   'node-cron': { schedule: () => { registro.crons++; return { stop() {} } } },
-  'web-push': { setVapidDetails() {}, sendNotification: async () => ({}) },
+  'web-push': {
+    setVapidDetails() {},
+    // registro.push = { enviados: [[inscricao, payload, opcoes]], erros: { <endpoint>: { statusCode, body } } }
+    sendNotification: async (inscricao, payload, opcoes) => {
+      const p = registro.push || (registro.push = { enviados: [], erros: {} })
+      const erro = (p.erros || {})[inscricao.endpoint]
+      if (erro) { const e = new Error('push falhou'); Object.assign(e, erro); throw e }
+      p.enviados.push([inscricao, payload, opcoes])
+      return { statusCode: 201 }
+    }
+  },
   axios: {
     get: (url, ...r) => (registro.axiosGet ? registro.axiosGet(url, ...r) : Promise.reject(new Error('rede bloqueada no teste'))),
     post: (url, ...r) => (registro.axiosPost ? registro.axiosPost(url, ...r) : Promise.reject(new Error('rede bloqueada no teste'))),
-    put: () => Promise.reject(new Error('rede bloqueada no teste'))
+    put: (url, ...r) => (registro.axiosPut ? registro.axiosPut(url, ...r) : Promise.reject(new Error('rede bloqueada no teste')))
   }
 }
 const loadOriginal = Module._load
