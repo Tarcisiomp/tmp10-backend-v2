@@ -224,6 +224,23 @@ const { criarRotasInteligencia } = require('./src/inteligencia/rotas')
 const { exigirPapel: exigirPapelInteligencia } = require('./src/auth/sessao')
 const inteligencia = criarRotasInteligencia({ sb, autenticar: criarAutenticarPush({ sb }), exigirPapel: exigirPapelInteligencia, envioPush, limitePorMinuto: Number(process.env.INTELIGENCIA_LIMITE_POR_MINUTO) || 30 })
 app.use(inteligencia.router)
+
+// ── Estoque Central (migração 21; ver src/estoque/) ──────────────────────────────────────────────────
+// O TMP10 é a fonte oficial do estoque. Toda alteração vira movimento rastreável; os anúncios vinculados recebem
+// o número do TMP10 por uma fila. ENVIO REAL só com ESTOQUE_ENVIO_HABILITADO=1 E a empresa em 'piloto' (SKUs da
+// lista) ou 'ativo' — fora disso tudo roda em SIMULAÇÃO (nada é enviado ao Mercado Livre / Shopee).
+const { criarServicoEstoque } = require('./src/estoque/servico')
+const { criarMercadoLivre, criarShopee } = require('./src/estoque/plataformas')
+const { criarRotasEstoque } = require('./src/estoque/rotas')
+const estoque = criarServicoEstoque({
+  sb,
+  ml: criarMercadoLivre({ axios, getToken, refreshToken }),
+  shopee: criarShopee({ axios, host: SHOPEE_HOST, partnerId: SHOPEE_PARTNER_ID, assinar: shopeeSign, getToken: getShopeeToken, refreshToken: refreshShopeeToken }),
+  envioHabilitado: () => process.env.ESTOQUE_ENVIO_HABILITADO === '1',
+  permitirSandbox: process.env.ESTOQUE_PERMITIR_SHOPEE_SANDBOX === '1'
+})
+app.use(criarRotasEstoque({ sb, estoque, autenticar: criarAutenticarPush({ sb }), exigirPapel: exigirPapelInteligencia }))
+console.log(`📦 [ESTOQUE] envio aos marketplaces: ${process.env.ESTOQUE_ENVIO_HABILITADO === '1' ? 'HABILITADO (respeita o modo de cada empresa)' : 'DESLIGADO (simulação)'}${/test-stable/i.test(SHOPEE_HOST) ? ' · ⚠️ SHOPEE_HOST é o sandbox' : ''}`)
 // Rotina automática (desligada por padrão): INTELIGENCIA_AGENDADA=1 no Railway roda os agentes de hora em hora
 // para as empresas com acesso. Sem ela, os agentes rodam quando o admin abre a Central (relatório com mais de 60 min).
 if (process.env.INTELIGENCIA_AGENDADA === '1') {
@@ -594,7 +611,7 @@ async function syncShopeeOrders(account) {
         for (const order of (detailData?.response?.order_list || [])) {
           try {
             const { data: existing } = await sb.from('ml_orders')
-              .select('id, tracking_number, platform, empresa_id')
+              .select('id, tracking_number, platform, empresa_id, status')
               .eq('ml_order_id', String(order.order_sn))
               .eq('empresa_id', account.empresa_id)
               .maybeSingle()
@@ -604,6 +621,18 @@ async function syncShopeeOrders(account) {
             // tracking_number = NULL para sempre e a bipagem da etiqueta não encontraria o pedido.
             // Só consultamos a Shopee novamente quando o pedido existente ainda não tem rastreio.
             if (existing) {
+              // Cancelamento Shopee → devolve o estoque (só o que a venda baixou). Liga com ESTOQUE_SHOPEE_CANCELAMENTO=1.
+              // PRECISA CONFIRMAR: o valor de order_status de pedido cancelado (padrão 'CANCELLED'; ajuste em SHOPEE_STATUS_CANCELADO).
+              const statusCancelado = (process.env.SHOPEE_STATUS_CANCELADO || 'CANCELLED').split(',').map((x) => x.trim()).filter(Boolean)
+              if (process.env.ESTOQUE_SHOPEE_CANCELAMENTO === '1' && existing.platform === 'shopee' && existing.status !== 'cancelado'
+                  && statusCancelado.includes(String(order.order_status || ''))) {
+                const { error: errCanc } = await sb.from('ml_orders').update({ status: 'cancelado', ml_status: order.order_status, updated_at: new Date().toISOString() })
+                  .eq('id', existing.id).eq('empresa_id', account.empresa_id)
+                if (!errCanc) {
+                  const dev = await estoque.registrarCancelamento({ empresaId: account.empresa_id, plataforma: 'shopee', pedidoId: String(order.order_sn) })
+                  console.log(`↩️ [Shopee] pedido ${order.order_sn} cancelado — estoque: ${JSON.stringify(dev)}`)
+                }
+              }
               if (existing.platform === 'shopee' && !existing.tracking_number) {
                 const trackingNumberAtualizado = await getShopeeTrackingNumber(account, order.order_sn, token)
                 if (trackingNumberAtualizado) {
@@ -676,7 +705,7 @@ async function syncShopeeOrders(account) {
             // Pedidos FULL (fulfillment da própria Shopee) não descontam daqui, porque esse estoque já
             // fica fisicamente no centro de distribuição da Shopee, fora do controle do TMP10.
             if (!insertErr && !isFBS) {
-              await processarBaixaEstoque(items, account.empresa_id, account, 'shopee')
+              await processarBaixaEstoque(items, account.empresa_id, account, 'shopee', order.order_sn)
             }
 
             // Auto cadastra produto (só os que o vendedor mesmo envia, igual já fazemos no ML)
@@ -862,91 +891,15 @@ async function calcCustosFallback(order, token) {
   return { saleFeeLiquido: saleFeeTot, freteVendedor, bonusCampanha: 0 }
 }
 
-// ── Estoque Central TMP10 ────────────────────────────────────────────
-// O TMP10 é a fonte da verdade do estoque. Toda vez que um pedido novo entra
-// (ML ou Shopee), desconta na hora (sem esperar o próximo ciclo) e avisa as duas plataformas.
-
-// Desconto atômico — usa a função do banco (decrementar_estoque_central), que trava a linha
-// durante a operação, então duas vendas simultâneas do último item nunca deixam o estoque negativo.
-async function descontarEstoqueCentral(sku, empresaId, quantidade) {
-  if (!sku || !empresaId) return null
+// ── Estoque Central TMP10 ────────────────────────────────────────────────────────────────────────
+// Venda nova (ML ou Shopee, não Full): baixa pelo serviço único (src/estoque/servico.js) — movimento rastreável,
+// uma única vez por pedido+SKU, e todos os anúncios vinculados do SKU vão para a fila de sincronização.
+async function processarBaixaEstoque(items, empresaId, contaOrigem, plataformaOrigem, pedidoId) {
+  if (!pedidoId) { console.error(`[Estoque] venda ${plataformaOrigem} sem número de pedido — estoque NÃO baixado`); return }
   try {
-    const { data, error } = await sb.rpc('decrementar_estoque_central', {
-      p_sku: sku,
-      p_empresa_id: empresaId,
-      p_quantidade: quantidade
-    })
-    if (error) {
-      console.error(`[Estoque] Erro ao descontar SKU ${sku}:`, error.message)
-      return null
-    }
-    return data // novo estoque, já atualizado
+    await estoque.registrarVenda({ empresaId, plataforma: plataformaOrigem, pedidoId: String(pedidoId), itens: items })
   } catch (e) {
-    console.error(`[Estoque] Erro ao descontar SKU ${sku}:`, e.message)
-    return null
-  }
-}
-
-// Avisa o Mercado Livre do novo estoque, usando o vínculo já existente (product_ml_links)
-async function pushEstoqueParaML(sku, empresaId, novoEstoque, account) {
-  try {
-    const { data: link } = await sb.from('product_ml_links')
-      .select('*').eq('sku', sku).eq('empresa_id', empresaId).maybeSingle()
-    if (!link?.item_id) return // produto ainda não tá vinculado a um anúncio do ML, não tem pra onde mandar
-    const token = await getToken(account)
-    if (!token) return
-    await axios.put(
-      `https://api.mercadolibre.com/items/${link.item_id}`,
-      { available_quantity: novoEstoque },
-      { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
-    )
-  } catch (e) {
-    console.error(`[Estoque→ML] Erro ao empurrar estoque do SKU ${sku}:`, e.response?.data || e.message)
-  }
-}
-
-// Avisa a Shopee do novo estoque, usando o vínculo (product_shopee_links)
-async function pushEstoqueParaShopee(sku, empresaId, novoEstoque, account) {
-  try {
-    const { data: link } = await sb.from('product_shopee_links')
-      .select('*').eq('sku', sku).eq('empresa_id', empresaId).maybeSingle()
-    if (!link?.item_id) return // produto ainda não tá vinculado a um anúncio da Shopee
-    const token = await getShopeeToken(account)
-    if (!token) return
-    const shopId = Number(account.ml_user_id)
-    const path = '/api/v2/product/update_stock'
-    const timestamp = Math.floor(Date.now() / 1000)
-    const sign = shopeeSign(path, timestamp, token, shopId)
-    const stockList = link.model_id
-      ? [{ model_id: link.model_id, seller_stock: [{ stock: novoEstoque }] }]
-      : [{ seller_stock: [{ stock: novoEstoque }] }]
-    await axios.post(`${SHOPEE_HOST}${path}`, {
-      partner_id: Number(SHOPEE_PARTNER_ID),
-      shop_id: shopId,
-      timestamp,
-      access_token: token,
-      item_id: link.item_id,
-      stock_list: stockList
-    }, { params: { partner_id: Number(SHOPEE_PARTNER_ID), timestamp, sign, shop_id: shopId, access_token: token } })
-  } catch (e) {
-    console.error(`[Estoque→Shopee] Erro ao empurrar estoque do SKU ${sku}:`, e.response?.data || e.message)
-  }
-}
-
-// Função única chamada sempre que um pedido novo (de qualquer plataforma) é gravado —
-// desconta o estoque central de cada item vendido e já avisa as duas plataformas.
-async function processarBaixaEstoque(items, empresaId, contaOrigem, plataformaOrigem) {
-  for (const item of (items || [])) {
-    if (!item.sku) continue
-    const qtd = item.qty || 1
-    const novoEstoque = await descontarEstoqueCentral(item.sku, empresaId, qtd)
-    if (novoEstoque == null) continue
-    // Avisa as duas plataformas em paralelo — não trava uma esperando a outra
-    const { data: contasAtivas } = await sb.from('ml_accounts').select('*').eq('empresa_id', empresaId).eq('active', true)
-    await Promise.all((contasAtivas || []).map(acc => {
-      if (acc.platform === 'shopee') return pushEstoqueParaShopee(item.sku, empresaId, novoEstoque, acc)
-      return pushEstoqueParaML(item.sku, empresaId, novoEstoque, acc)
-    }))
+    console.error(`[Estoque] falha ao registrar a venda ${plataformaOrigem} ${pedidoId}: ${e.message}`)
   }
 }
 
@@ -1062,7 +1015,7 @@ async function syncMLOrders(account) {
               // Pedidos FULL (fulfillment do próprio ML) não descontam daqui — o estoque físico já está
               // no centro de distribuição do ML, fora do controle direto do TMP10.
               if (!insertErrML && !isFull) {
-                await processarBaixaEstoque(items, account.empresa_id, account, 'mercadolivre')
+                await processarBaixaEstoque(items, account.empresa_id, account, 'mercadolivre', String(order.id))
               }
 
               // Auto cadastra produto (apenas nao-FULL)
@@ -1296,88 +1249,23 @@ async function syncPerguntas() {
   }
 }
 
-// ── Sync Estoque ML (multi-conta, somado por empresa+SKU) ─────────
-// Relê a quantidade de cada anúncio já vinculado em product_ml_links
-// (usando o token da conta dona do anúncio) e depois soma tudo por
-// empresa_id+sku, gravando o total em products.estoque_atual.
+// ── Conferência de estoque (antigo syncEstoqueML) ─────────────────────────────────────────────────
+// Só LÊ os anúncios e compara cada um com o número oficial do TMP10. Diferença = UMA divergência por anúncio
+// (a contagem sobe; não grava linha nova a cada rodada). Nunca altera o estoque do TMP10.
 async function syncEstoqueML() {
   try {
-    const { data: links } = await sb.from('product_ml_links').select('*')
-    if (!links?.length) {
-      console.log('ℹ️ Nenhum anúncio vinculado ainda em product_ml_links (rode "Importar Produtos do ML")')
-      return
-    }
-    const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
-    const accByNick = {}
-    for (const acc of accounts || []) accByNick[acc.nickname] = acc
-
-    const byAccount = {}
-    for (const link of links) {
-      if (!byAccount[link.account_nickname]) byAccount[link.account_nickname] = []
-      byAccount[link.account_nickname].push(link)
-    }
-
-    for (const [nickname, accLinks] of Object.entries(byAccount)) {
-      const account = accByNick[nickname]
-      if (!account) continue
-      const token = await getToken(account)
-      if (!token) continue
-
-      for (let i = 0; i < accLinks.length; i += 20) {
-        const batch = accLinks.slice(i, i + 20)
-        const ids = batch.map(l => l.ml_item_id).join(',')
-        try {
-          const { data } = await axios.get(
-            `https://api.mercadolibre.com/items?ids=${ids}`,
-            { headers: { Authorization: `Bearer ${token}` }, timeout: 8000 }
-          )
-          for (const entry of data || []) {
-            if (entry.code !== 200) continue
-            const item = entry.body
-            const link = batch.find(l => l.ml_item_id === String(item.id))
-            if (!link) continue
-            await sb.from('product_ml_links')
-              .update({ quantity: item.available_quantity || 0, updated_at: new Date().toISOString() })
-              .eq('id', link.id)
-          }
-        } catch (e) {
-          console.log(`Erro estoque lote (${nickname}): ${e.message}`)
-        }
-        await new Promise(r => setTimeout(r, 300))
-      }
-    }
-
-    const { data: fresh } = await sb.from('product_ml_links').select('empresa_id,sku,quantity')
-    const totals = {}
-    for (const l of fresh || []) {
-      const key = `${l.empresa_id}::${l.sku}`
-      totals[key] = (totals[key] || 0) + (l.quantity || 0)
-    }
-    // Não sobrescreve mais o estoque central — o TMP10 é quem manda agora.
-    // Só compara com o que o ML está mostrando e registra um alerta se tiver diferença,
-    // pra dar pra investigar (produto vendido fora do sistema, ajuste manual no ML, etc).
-    let divergenciasEncontradas = 0
-    for (const [key, totalML] of Object.entries(totals)) {
-      const [empresa_id, sku] = key.split('::')
-      const { data: produtoAtual } = await sb.from('products')
-        .select('estoque_atual').eq('empresa_id', empresa_id).eq('sku', sku).maybeSingle()
-      if (!produtoAtual) continue
-      const estoqueTMP10 = produtoAtual.estoque_atual || 0
-      if (estoqueTMP10 !== totalML) {
-        await sb.from('estoque_divergencias').insert({
-          empresa_id,
-          sku,
-          estoque_tmp10: estoqueTMP10,
-          estoque_ml: totalML,
-          diferenca: totalML - estoqueTMP10
-        })
-        divergenciasEncontradas++
-      }
-    }
-
-    console.log(`✅ Sync estoque ML concluído (${links.length} anúncios verificados${divergenciasEncontradas > 0 ? `, ⚠️ ${divergenciasEncontradas} divergência(s) encontrada(s)` : ', nenhuma divergência'})`)
+    const r = await estoque.conferirTodas({ plataformas: ['mercadolivre'] })
+    console.log(`✅ Conferência de estoque ML: ${JSON.stringify(r)}`)
   } catch (e) {
-    console.log('Erro sync estoque:', e.message)
+    console.log('Erro conferência de estoque ML:', e.message)
+  }
+}
+async function conferirEstoqueShopee() {
+  try {
+    const r = await estoque.conferirTodas({ plataformas: ['shopee'] })
+    console.log(`✅ Conferência de estoque Shopee: ${JSON.stringify(r)}`)
+  } catch (e) {
+    console.log('Erro conferência de estoque Shopee:', e.message)
   }
 }
 
@@ -1790,6 +1678,11 @@ async function gerarContasRecorrentes() {
 
 cron.schedule('*/2 * * * *', syncAll)
 cron.schedule('*/30 * * * *', syncEstoqueML)
+cron.schedule('20 */2 * * *', conferirEstoqueShopee)
+// fila de sincronização de estoque: a cada minuto (além do disparo imediato depois de cada movimento)
+cron.schedule('* * * * *', async () => {
+  try { await estoque.processarMovimentosPendentes(); await estoque.processarFila({ limite: 30 }) } catch (e) { console.log('[ESTOQUE] fila:', e.message) }
+})
 cron.schedule('*/15 * * * *', checkDeliveries)
 cron.schedule('*/5 * * * *', retentarRastreioShopee)
 cron.schedule('*/5 * * * *', syncPerguntas)
@@ -1810,7 +1703,10 @@ app.post('/ml/notifications', async (req, res) => {
     if (topic !== 'shipments' && topic !== 'orders_v2') return
     const { data: accounts } = await sb.from('ml_accounts').select('*').eq('active', true)
     if (!accounts?.length) return
-    const account = accounts.find(a => String(a.ml_user_id) === String(user_id)) || accounts[0]
+    // a conta é SEMPRE a do user_id do aviso; sem ela (ou com mais de uma) o aviso é ignorado — nunca usa outra empresa
+    const doUsuario = accounts.filter(a => a.platform !== 'shopee' && String(a.ml_user_id) === String(user_id))
+    if (doUsuario.length !== 1) { console.log(`Webhook ML: user_id ${user_id} sem conta única ativa (${doUsuario.length}) — ignorado`); return }
+    const account = doUsuario[0]
     const token = await getToken(account)
 
     if (topic === 'shipments' && resource) {
@@ -1844,14 +1740,20 @@ app.post('/ml/notifications', async (req, res) => {
       )
       if (mlOrder.status === 'cancelled') {
         const { data: order } = await sb.from('ml_orders')
-          .select('id, status')
+          .select('id, status, empresa_id')
           .eq('ml_order_id', String(orderId))
+          .eq('empresa_id', account.empresa_id)
           .maybeSingle()
         if (order && !['finalizado', 'cancelado'].includes(order.status)) {
-          await sb.from('ml_orders').update({
+          const { error: errCanc } = await sb.from('ml_orders').update({
             status: 'cancelado',
             updated_at: new Date().toISOString()
           }).eq('id', order.id)
+          // devolve SÓ o que a venda baixou pelo fluxo oficial (uma única vez, mesmo com aviso repetido)
+          if (!errCanc) {
+            const dev = await estoque.registrarCancelamento({ empresaId: account.empresa_id, plataforma: 'mercadolivre', pedidoId: String(orderId) })
+            console.log(`↩️ Webhook: pedido ${orderId} cancelado — estoque: ${JSON.stringify(dev)}`)
+          }
         }
       }
     }
@@ -2082,8 +1984,10 @@ app.get('/api/faturamento/verificar-fatura/:empresaId', exigirAdmin, async (req,
 })
 
 app.post('/api/sync-estoque', guarda.sessaoOuToken, async (req, res) => {
-  res.json({ ok: true })
-  syncEstoqueML()
+  // com sessão: confere SÓ a empresa da sessão (ML + Shopee); com o token da plataforma: todas as empresas (ML)
+  if (req.viaTokenAdmin) { res.json({ ok: true }); return syncEstoqueML() }
+  const t = estoque.iniciarConferencia(req.empresaId, { registrar: true })
+  res.json({ ok: true, conferencia: { rodando: t.rodando, iniciado_em: t.iniciado_em } })
 })
 
 // ✅ v9.0: Recalcular custos usando billing_info (correto) + fallback paid_amount
@@ -2551,6 +2455,20 @@ app.get('/api/stats', exigirAdmin, async (req, res) => {
   })
 })
 
+// Importação: produto que JÁ existe só atualiza nome/foto/ativo/origem (o estoque oficial do TMP10 não muda);
+// produto NOVO é criado com o estoque do anúncio (fica registrado como "cadastro_produto" nos movimentos).
+async function salvarProdutoImportado(dados, estoqueInicial) {
+  if (!dados.empresa_id || !dados.sku) return
+  const { data: existentes, error } = await sb.from('products').select('id').eq('empresa_id', dados.empresa_id).eq('sku', dados.sku).limit(2)
+  if (error) throw new Error(error.message)
+  if (existentes && existentes.length) {
+    await sb.from('products').update({ name: dados.name, photo: dados.photo, active: dados.active, source: dados.source })
+      .eq('empresa_id', dados.empresa_id).eq('sku', dados.sku)
+    return
+  }
+  await sb.from('products').insert({ ...dados, estoque_atual: Number(estoqueInicial) || 0 })
+}
+
 let importStatus = { running: false, imported: 0, linked: 0, produtos_com_estoque_somado: 0, contaAtual: null, terminadoEm: null, erro: null }
 
 async function rodarImportProducts(empresa_id) {
@@ -2591,15 +2509,14 @@ async function rodarImportProducts(empresa_id) {
               const skuReal = skuAttr?.value_name || item.seller_custom_field || null
               const sku = String(skuReal || item.id).trim()
 
-              await sb.from('products').upsert({
+              await salvarProdutoImportado({
                 sku,
                 empresa_id: acc.empresa_id || null,
                 name: item.title,
                 photo: item.thumbnail ? item.thumbnail.replace('-I.jpg', '-O.jpg').replace('http://', 'https://') : null,
                 active: true,
-                source: 'mercadolivre',
-                estoque_atual: item.available_quantity || 0
-              }, { onConflict: 'empresa_id,sku', ignoreDuplicates: false })
+                source: 'mercadolivre'
+              }, item.available_quantity || 0)
               importStatus.imported++
 
               await sb.from('product_ml_links').upsert({
@@ -2623,20 +2540,9 @@ async function rodarImportProducts(empresa_id) {
       }
     }
 
-    // Depois de importar tudo, soma o estoque de todas as contas por SKU
-    const { data: fresh } = await sb.from('product_ml_links').select('empresa_id,sku,quantity')
-    const totals = {}
-    for (const l of fresh || []) {
-      const key = `${l.empresa_id}::${l.sku}`
-      totals[key] = (totals[key] || 0) + (l.quantity || 0)
-    }
-    for (const [key, total] of Object.entries(totals)) {
-      const [empresa_id, sku] = key.split('::')
-      await sb.from('products')
-        .update({ estoque_atual: total })
-        .eq('empresa_id', empresa_id).eq('sku', sku)
-    }
-    importStatus.produtos_com_estoque_somado = Object.keys(totals).length
+    // O estoque oficial é o do TMP10: a importação NÃO soma nem sobrescreve o estoque de produto que já existe
+    // (antes somava as contas — o mesmo SKU em 2 contas dobrava). Produto NOVO começa com o número do anúncio.
+    importStatus.produtos_com_estoque_somado = 0
   } catch (e) {
     importStatus.erro = e.message
     console.log('Erro import-products:', e.message)
@@ -2762,15 +2668,14 @@ async function rodarImportProductsShopee(empresa_id) {
                 for (const modelo of modelos) {
                   const sku = String(modelo.model_sku || `${item.item_id}-${modelo.model_id}`).trim()
                   const estoque = modelo.stock_info_v2?.summary_info?.total_available_stock || 0
-                  await sb.from('products').upsert({
+                  await salvarProdutoImportado({
                     sku,
                     empresa_id,
                     name: `${item.item_name} - ${modelo.model_name || ''}`.trim(),
                     photo: imagem,
                     active: true,
-                    source: 'shopee',
-                    estoque_atual: estoque
-                  }, { onConflict: 'empresa_id,sku', ignoreDuplicates: false })
+                    source: 'shopee'
+                  }, estoque)
                   importStatusShopee.imported++
 
                   await sb.from('product_shopee_links').upsert({
@@ -2787,15 +2692,14 @@ async function rodarImportProductsShopee(empresa_id) {
                 // Produto simples, sem variação
                 const sku = String(item.item_sku || item.item_id).trim()
                 const estoque = item.stock_info_v2?.summary_info?.total_available_stock || 0
-                await sb.from('products').upsert({
+                await salvarProdutoImportado({
                   sku,
                   empresa_id,
                   name: item.item_name,
                   photo: imagem,
                   active: true,
-                  source: 'shopee',
-                  estoque_atual: estoque
-                }, { onConflict: 'empresa_id,sku', ignoreDuplicates: false })
+                  source: 'shopee'
+                }, estoque)
                 importStatusShopee.imported++
 
                 await sb.from('product_shopee_links').upsert({
