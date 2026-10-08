@@ -97,3 +97,21 @@ test('rotas /api/estoque exigem sessão de administrador', async () => {
   assert.equal((await chamar(app, 'GET', '/api/estoque/painel')).status, 401)
   assert.equal((await chamar(app, 'POST', '/api/estoque/ajustar', { body: { sku: 'X', novo_estoque: 1 } })).status, 401)
 })
+
+test('Sincronizar Agora: prévia só lê; confirmar grava a fila em LOTE (1 chamada ao banco, não 1 por anúncio)', async () => {
+  registro.db.product_ml_links = [{ empresa_id: A, sku: 'RALO', account_nickname: 'CONTA1', ml_item_id: 'MLB1', ml_user_id: '111' }, { empresa_id: A, sku: 'RALO', account_nickname: 'CONTA1', ml_item_id: 'MLB2', ml_user_id: '111' }]
+  registro.db.products = [{ id: 'p1', empresa_id: A, sku: 'RALO', estoque_atual: 5 }]
+  registro.rpc.estoque_anuncios_full = () => ({ data: [], error: null })
+  registro.rpc.estoque_fila_enfileirar_lote = (a) => ({ data: { destinos: 2, skus_com_anuncio: 1 }, error: null })
+  const pr = await chamar(app, 'POST', '/api/estoque/sincronizar/previa', { headers: { authorization: 'Bearer tok-a' }, body: { skus: ['RALO'] } })
+  assert.equal(pr.status, 200)
+  const previa = JSON.parse(pr.texto).previa
+  assert.equal(previa.anuncios, 2); assert.equal(previa.produtos, 1)
+  assert.ok(!registro.ops.some((o) => o.acao !== 'select' && o.tabela === 'estoque_sync_fila'), 'prévia não grava na fila')
+  assert.ok(!registro.rpcs.some(([n]) => n === 'estoque_fila_enfileirar_lote' || n === 'estoque_fila_enfileirar'), 'prévia não enfileira')
+  const r = await chamar(app, 'POST', '/api/estoque/sincronizar', { headers: { authorization: 'Bearer tok-a' }, body: { skus: ['RALO'], empresa_id: B } })
+  assert.equal(r.status, 200); assert.equal(JSON.parse(r.texto).destinos, 2); assert.equal(JSON.parse(r.texto).modo, 'lote')
+  const lote = registro.rpcs.filter(([n]) => n === 'estoque_fila_enfileirar_lote')
+  assert.equal(lote.length, 1, 'uma chamada só'); assert.equal(lote[0][1].p_empresa, A, 'empresa da sessão'); assert.deepEqual(lote[0][1].p_skus, ['RALO'])
+  assert.equal(registro.rpcs.filter(([n]) => n === 'estoque_fila_enfileirar').length, 0, 'nenhuma gravação um a um')
+})
