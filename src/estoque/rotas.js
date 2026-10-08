@@ -53,6 +53,9 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
   router.get('/api/estoque/conferir/status', ...admin, responder(async (req) => ({ conferencia: estoque.statusConferencia(req.empresaId) })))
 
   // Passo 2: SINCRONIZAR os produtos escolhidos (coloca na fila; respeita o modo desligado/piloto/ativo)
+  // Passo 2a: PRÉVIA — "X produtos → Y anúncios" (diferentes / iguais / bloqueados / erro). Só lê, não grava nada.
+  router.post('/api/estoque/sincronizar/previa', ...admin, responder(async (req) => ({ previa: await estoque.previa({ empresaId: req.empresaId, skus: corpo(req).skus }) })))
+
   router.post('/api/estoque/sincronizar', ...admin, responder(async (req) => estoque.sincronizar({ empresaId: req.empresaId, skus: corpo(req).skus, usuarioId: req.usuario.id })))
 
   // Divergência: aceitar o número da plataforma (vira movimento) | enviar o número do TMP10 | ignorar

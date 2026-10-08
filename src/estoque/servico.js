@@ -246,6 +246,11 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
         return concluir('ok', { alvo, enviada: alvo, confirmada, http: r.http, resposta: `antes ${antes.quantidade} → enviado ${alvo} → lido ${confirmada}`,
           erro: confirmada !== null && confirmada !== alvo ? `enviado ${alvo}, o ML mostra ${confirmada} — conferir` : null })
       }
+      // Shopee: lê o anúncio ANTES de enviar (como já é feito no ML). Se a leitura falhar ou o item/variação não
+      // existir na loja, NÃO envia (anúncio com erro continua sem envio). Erro de rede/limite: tenta de novo depois.
+      const lerShopee = () => item.variacao_id ? shopee.lerModelos(destino.conta, item.anuncio_id) : shopee.lerItens(destino.conta, [item.anuncio_id])
+      const antesSh = (await lerShopee()).get(item.variacao_id || item.anuncio_id)
+      if (!antesSh || antesSh.quantidade === null) return concluir('erro', { alvo, erro: `item${item.variacao_id ? '/variação' : ''} não encontrado na loja Shopee ${destino.conta.nickname} — envio não feito` })
       const r = await shopee.enviar(destino.conta, item.anuncio_id, item.variacao_id || null, alvo)
       let confirmada = null
       try {
@@ -311,6 +316,7 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
       else if (p.estoque_atual === null || p.estoque_atual === undefined) linha.situacao = 'sem_estoque_oficial'
       else if (base.sincronizar === false) linha.situacao = 'desligado'
       else if (!leitura || leitura.erro || leitura.quantidade === null) { linha.situacao = 'erro_leitura'; linha.erro = leitura ? leitura.erro : 'sem leitura' }
+      else if (leitura.variacoes > 0) { linha.situacao = 'variacao_ml'; linha.erro = `anúncio com ${leitura.variacoes} variação(ões) no ML — envio bloqueado (PRECISA CONFIRMAR)` }
       else if (f && ['pendente', 'enviando', 'erro_temporario'].includes(f.status)) linha.situacao = 'em_envio'
       else if (leitura.quantidade === Math.max(0, p.estoque_atual)) {
         linha.situacao = 'igual'
@@ -378,7 +384,7 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     }
     const resumo = {}
     for (const l of linhas) resumo[l.situacao] = (resumo[l.situacao] || 0) + 1
-    const ordem = { diferente: 0, erro_leitura: 1, em_envio: 2, full: 3, sem_estoque_oficial: 4, sem_produto: 5, sku_duplicado: 6, desligado: 7, igual: 8 }
+    const ordem = { diferente: 0, erro_leitura: 1, em_envio: 2, full: 3, variacao_ml: 4, sem_estoque_oficial: 5, sem_produto: 6, sku_duplicado: 7, desligado: 8, igual: 9 }
     linhas.sort((a, b) => (ordem[a.situacao] ?? 9) - (ordem[b.situacao] ?? 9) || String(a.sku).localeCompare(String(b.sku)))
     return { total: linhas.length, resumo, linhas }
   }
@@ -415,14 +421,116 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
   }
 
   // ── Ações explícitas ────────────────────────────────────────────────────────────────────────────────────
-  async function sincronizar({ empresaId, skus, usuarioId }) {
+  // ── Sincronizar Agora: PRÉVIA (o que será processado) e ENVIO para a fila em lote ──────────────────────
+  // Regra central mantida: o SKU é a unidade; TODOS os anúncios vinculados ao SKU recebem o mesmo número do TMP10.
+  function listaDeSkus(skus) {
     const lista = [...new Set((Array.isArray(skus) ? skus : []).map((s) => String(s).trim()).filter(Boolean))]
     if (!lista.length) throw Object.assign(new Error('Escolha pelo menos um produto.'), { status: 400 })
     if (lista.length > 200) throw Object.assign(new Error('No máximo 200 produtos por vez.'), { status: 400 })
-    let destinos = 0
-    for (const sku of lista) destinos += await enfileirarSku(empresaId, sku, `Sincronizar agora (usuário ${usuarioId || '-'})`)
+    return lista
+  }
+  async function lerTodos(montar, contexto) { // pagina de 1000 em 1000 (limite padrão da API do banco)
+    const todos = []
+    for (let de = 0; ; de += 1000) {
+      const lote = await q(montar().range(de, de + 999), contexto)
+      todos.push(...(lote || []))
+      if (!lote || lote.length < 1000) return todos
+    }
+  }
+  // Destinos (anúncio/variação) dos SKUs — MESMA regra da fila: ML com ml_item_id; Shopee com item_id e shop_id;
+  // o mesmo anúncio ligado a 2 SKUs conta UMA vez (fica com o 1º SKU em ordem alfabética, como no banco).
+  async function destinosDosSkus(empresaId, lista) {
+    const ml = await lerTodos(() => sb.from('product_ml_links').select('sku, account_nickname, ml_item_id, ml_user_id, sincronizar, ml_variation_id').eq('empresa_id', empresaId).in('sku', lista), 'vínculos ML')
+    const sh = await lerTodos(() => sb.from('product_shopee_links').select('sku, shop_id, item_id, model_id, sincronizar').eq('empresa_id', empresaId).in('sku', lista), 'vínculos Shopee')
+    const porChave = new Map()
+    const add = (d) => { const atual = porChave.get(d.chave); if (!atual || String(d.sku) < String(atual.sku)) porChave.set(d.chave, d) }
+    for (const l of ml) {
+      if (!l.ml_item_id) continue
+      const conta_ref = l.ml_user_id ? String(l.ml_user_id) : `nick:${l.account_nickname}`
+      add({ sku: l.sku, destino: 'mercadolivre', conta_ref, conta_nome: l.account_nickname, anuncio_id: String(l.ml_item_id), variacao_id: '', sincronizar: l.sincronizar, ml_variation_id: l.ml_variation_id,
+        chave: `mercadolivre:${conta_ref}:${l.ml_item_id}:` })
+    }
+    for (const l of sh) {
+      if (!l.item_id || !l.shop_id) continue
+      const variacao_id = l.model_id ? String(l.model_id) : ''
+      add({ sku: l.sku, destino: 'shopee', conta_ref: String(l.shop_id), anuncio_id: String(l.item_id), variacao_id, sincronizar: l.sincronizar,
+        chave: `shopee:${l.shop_id}:${l.item_id}:${variacao_id}` })
+    }
+    return [...porChave.values()]
+  }
+
+  // PRÉVIA: só LÊ (banco + resultado da última conferência). Não grava nada, não chama ML/Shopee.
+  async function previa({ empresaId, skus }) {
+    const lista = listaDeSkus(skus)
+    const destinos = await destinosDosSkus(empresaId, lista)
+    const produtos = new Map()
+    for (const p of await lerTodos(() => sb.from('products').select('sku, estoque_atual').eq('empresa_id', empresaId).in('sku', lista), 'produtos')) {
+      produtos.set(p.sku, produtos.has(p.sku) ? { duplicado: true } : p)
+    }
+    const contas = await q(sb.from('ml_accounts').select('nickname, ml_user_id, platform, active').eq('empresa_id', empresaId), 'contas')
+    let full = new Set()
+    try { full = new Set(((await rpc('estoque_anuncios_full', { p_empresa: empresaId, p_dias: 90 })) || []).map((x) => String(typeof x === 'object' && x !== null ? Object.values(x)[0] : x))) }
+    catch (e) { log(`[ESTOQUE] prévia sem a lista de Full (migração 22 aplicada?): ${e.message}`) }
+    const conf = statusConferencia(empresaId)
+    const situacaoConf = new Map(((conf.resultado && conf.resultado.linhas) || []).map((l) => [l.chave, l.situacao]))
+    const contaAtiva = (d) => (contas || []).some((c) => c.active === true && (d.destino === 'shopee'
+      ? c.platform === 'shopee' && String(c.ml_user_id) === d.conta_ref
+      : c.platform !== 'shopee' && (d.conta_ref.startsWith('nick:') ? c.nickname === d.conta_ref.slice(5) : String(c.ml_user_id) === d.conta_ref)))
+    const categorias = { diferente: 0, igual: 0, bloqueado: 0, erro: 0, em_envio: 0, nao_conferido: 0 }
+    const motivosBloqueio = {}
+    const porSku = new Map(lista.map((sku) => [sku, { sku, anuncios: 0 }]))
+    for (const d of destinos) {
+      const p = produtos.get(d.sku)
+      let cat, motivo = null
+      if (!p) { cat = 'bloqueado'; motivo = 'produto não cadastrado' }
+      else if (p.duplicado) { cat = 'bloqueado'; motivo = 'SKU duplicado' }
+      else if (p.estoque_atual === null || p.estoque_atual === undefined) { cat = 'bloqueado'; motivo = 'sem estoque oficial no TMP10' }
+      else if (d.sincronizar === false) { cat = 'bloqueado'; motivo = 'sincronização desligada no anúncio' }
+      else if (full.has(d.anuncio_id)) { cat = 'bloqueado'; motivo = d.destino === 'shopee' ? 'FBS (Full da Shopee)' : 'Full' }
+      else if (d.ml_variation_id) { cat = 'bloqueado'; motivo = 'variação no ML (precisa confirmar)' }
+      else if (!contaAtiva(d)) { cat = 'bloqueado'; motivo = 'conta não conectada/ativa nesta empresa' }
+      else if (d.destino === 'shopee' && shopee.ehSandbox() && !permitirSandbox) { cat = 'bloqueado'; motivo = 'Shopee em sandbox' }
+      else {
+        const sc = situacaoConf.get(d.chave)
+        if (sc === 'diferente') cat = 'diferente'
+        else if (sc === 'igual') cat = 'igual'
+        else if (sc === 'erro_leitura') cat = 'erro'
+        else if (sc === 'em_envio') cat = 'em_envio'
+        else if (sc === 'full') { cat = 'bloqueado'; motivo = 'Full' }
+        else if (sc === 'variacao_ml') { cat = 'bloqueado'; motivo = 'variação no ML (precisa confirmar)' }
+        else if (sc) { cat = 'bloqueado'; motivo = sc }
+        else cat = 'nao_conferido'
+      }
+      categorias[cat]++
+      if (motivo) motivosBloqueio[motivo] = (motivosBloqueio[motivo] || 0) + 1
+      if (porSku.has(d.sku)) porSku.get(d.sku).anuncios++
+    }
+    const semAnuncio = [...porSku.values()].filter((x) => x.anuncios === 0).map((x) => x.sku)
+    return {
+      produtos: lista.length, produtos_com_anuncio: lista.length - semAnuncio.length, sem_anuncio: semAnuncio.slice(0, 50),
+      anuncios: destinos.length, categorias, motivos_bloqueio: motivosBloqueio,
+      // até quantos podem receber o número: todos menos os bloqueados (Full, conta, variação ML...). Os com "erro" na
+      // última leitura entram na fila e são lidos de novo no envio; se a leitura do ML falhar, NÃO enviam.
+      receberao_envio: destinos.length - categorias.bloqueado,
+      conferencia_em: conf.terminado_em || null, config: await lerConfig(empresaId), envio_habilitado: envioHabilitado()
+    }
+  }
+
+  // ENVIO para a fila: uma operação no banco para todos os SKUs (migração 22). Sem a 22, grava um a um como antes.
+  async function sincronizar({ empresaId, skus, usuarioId }) {
+    const lista = listaDeSkus(skus)
+    const motivo = `Sincronizar agora (usuário ${usuarioId || '-'})`
+    let destinos = 0, modo = 'lote'
+    const r = await sb.rpc('estoque_fila_enfileirar_lote', { p_empresa: empresaId, p_skus: lista, p_motivo: motivo })
+    if (r && r.error) {
+      const faltaFuncao = r.error.code === 'PGRST202' || /estoque_fila_enfileirar_lote/.test(String(r.error.message || '')) && /(does not exist|Could not find)/i.test(String(r.error.message || ''))
+      if (!faltaFuncao) throw new Error(`rpc estoque_fila_enfileirar_lote: ${r.error.message}`)
+      log('[ESTOQUE] migração 22 ainda não aplicada — fila gravada anúncio por anúncio (mais lento, mesmo resultado)')
+      modo = 'um_a_um'
+      for (const sku of lista) destinos += await enfileirarSku(empresaId, sku, motivo)
+    } else destinos = (r && r.data && r.data.destinos) || 0
     agendarProcessamento()
-    return { skus: lista.length, destinos, config: await lerConfig(empresaId), envio_habilitado: envioHabilitado() }
+    return { skus: lista.length, destinos, modo, config: await lerConfig(empresaId), envio_habilitado: envioHabilitado() }
   }
 
   async function resolverDivergencia({ empresaId, id, acao, usuarioId, estoqueEsperado }) {
@@ -482,7 +590,7 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
   }
 
   return { movimentar, registrarVenda, registrarCancelamento, ajustar, enfileirarSku, processarMovimentosPendentes, processarFila, processarItem,
-    conferir, iniciarConferencia, statusConferencia, conferirTodas, sincronizar, resolverDivergencia, salvarConfig, lerConfig, painel,
+    conferir, iniciarConferencia, statusConferencia, conferirTodas, previa, sincronizar, resolverDivergencia, salvarConfig, lerConfig, painel,
     movimentosDoSku, liberarPausa, agendarProcessamento }
 }
 
