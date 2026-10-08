@@ -159,6 +159,15 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     return { modo: (c && c.modo) || 'desligado', skus_piloto: (c && c.skus_piloto) || [], atualizado_em: c ? c.atualizado_em : null }
   }
 
+  // Decisão de envio de UM SKU com a configuração ATUAL (a mesma usada no processamento da fila e mostrada na tela):
+  // real só com ESTOQUE_ENVIO_HABILITADO=1 E (empresa 'ativo' OU 'piloto' com o SKU na lista, comparação exata).
+  function decidirEnvio(cfg, sku) {
+    if (!envioHabilitado()) return { real: false, motivo: 'envio desligado no servidor (ESTOQUE_ENVIO_HABILITADO≠1)' }
+    if (cfg.modo === 'ativo') return { real: true, motivo: 'modo ativo' }
+    if (cfg.modo === 'piloto') return (cfg.skus_piloto || []).includes(sku) ? { real: true, motivo: 'SKU no piloto' } : { real: false, motivo: 'SKU fora do piloto' }
+    return { real: false, motivo: `modo da empresa: ${cfg.modo}` }
+  }
+
   async function registrarLog(item, resultado, extra = {}) {
     try {
       await q(sb.from('estoque_sync_log').insert({ fila_id: item.id, empresa_id: item.empresa_id, sku: item.sku, destino: item.destino,
@@ -222,11 +231,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     if (item.destino === 'shopee' && shopee.ehSandbox() && !permitirSandbox) return concluir('bloqueado', { alvo, erro: 'SHOPEE_HOST aponta para o ambiente de TESTE (sandbox) — envio bloqueado' })
     // 4) modo de envio
     const cfg = await lerConfig(item.empresa_id)
-    const liberado = envioHabilitado() && (cfg.modo === 'ativo' || (cfg.modo === 'piloto' && cfg.skus_piloto.includes(item.sku)))
-    if (!liberado) {
-      const porque = !envioHabilitado() ? 'envio desligado no servidor (ESTOQUE_ENVIO_HABILITADO≠1)' : cfg.modo === 'piloto' ? 'SKU fora do piloto' : `modo da empresa: ${cfg.modo}`
-      return concluir('simulado', { alvo, erro: `SIMULAÇÃO — enviaria ${alvo}. Não enviado: ${porque}` })
-    }
+    const decisao = decidirEnvio(cfg, item.sku)
+    if (!decisao.real) return concluir('simulado', { alvo, erro: `SIMULAÇÃO — enviaria ${alvo}. Não enviado: ${decisao.motivo}` })
     // 5) proteção contra loop: envios demais no mesmo anúncio em pouco tempo
     const desde = new Date(Date.now() - LIMITE_LOOP.minutos * 60000).toISOString()
     const recentes = await q(sb.from('estoque_sync_log').select('id').eq('fila_id', item.id).in('resultado', ['ok', 'erro', 'erro_temporario']).gte('criado_em', desde), 'log recente')
@@ -299,7 +305,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
       if (!lote || lote.length < 1000) break
     }
     const contas = await q(sb.from('ml_accounts').select('id, nickname, ml_user_id, platform, active, empresa_id, access_token, refresh_token, expires_at').eq('empresa_id', empresaId), 'contas')
-    const fila = await q(sb.from('estoque_sync_fila').select('destino, conta_ref, anuncio_id, variacao_id, status, quantidade_enviada, enviado_em, ultimo_erro').eq('empresa_id', empresaId), 'fila')
+    const fila = await q(sb.from('estoque_sync_fila').select('destino, conta_ref, anuncio_id, variacao_id, status, quantidade_enviada, enviado_em, ultimo_erro, atualizado_em').eq('empresa_id', empresaId), 'fila')
+    const cfgAgora = await lerConfig(empresaId)
     const filaPor = new Map((fila || []).map((f) => [`${f.destino}:${f.conta_ref}:${f.anuncio_id}:${f.variacao_id}`, f]))
     const abertas = await q(sb.from('estoque_divergencias').select('id, chave').eq('empresa_id', empresaId).not('chave', 'is', null).not('resolvido', 'is', true), 'divergências abertas')
     const chavesAbertas = new Set((abertas || []).map((d) => d.chave))
@@ -309,8 +316,12 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
       const p = produtos.get(base.sku)
       const chave = `${base.destino}:${base.conta_ref}:${base.anuncio_id}:${base.variacao_id}`
       const f = filaPor.get(chave)
+      const envioAgora = decidirEnvio(cfgAgora, base.sku)
       const linha = { ...base, chave, nome: p ? p.name : null, tmp10: p ? p.estoque_atual : null, plataforma_qtd: leitura && !leitura.erro ? leitura.quantidade : null,
-        fila_status: f ? f.status : null, fila_erro: f ? f.ultimo_erro : null }
+        fila_status: f ? f.status : null, fila_erro: f ? f.ultimo_erro : null, fila_atualizado_em: f ? f.atualizado_em : null,
+        // decisão com a configuração de AGORA (o texto da fila é do último processamento e pode ser de antes do piloto)
+        envio_agora: envioAgora,
+        fila_desatualizada: !!(f && f.status === 'simulado' && envioAgora.real) }
       if (!p) linha.situacao = 'sem_produto'
       else if (p.duplicado) linha.situacao = 'sku_duplicado'
       else if (p.estoque_atual === null || p.estoque_atual === undefined) linha.situacao = 'sem_estoque_oficial'
@@ -477,6 +488,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
       ? c.platform === 'shopee' && String(c.ml_user_id) === d.conta_ref
       : c.platform !== 'shopee' && (d.conta_ref.startsWith('nick:') ? c.nickname === d.conta_ref.slice(5) : String(c.ml_user_id) === d.conta_ref)))
     const categorias = { diferente: 0, igual: 0, bloqueado: 0, erro: 0, em_envio: 0, nao_conferido: 0 }
+    const cfgAgora = await lerConfig(empresaId)
+    let envioReal = 0, envioSimulado = 0
     const motivosBloqueio = {}
     const porSku = new Map(lista.map((sku) => [sku, { sku, anuncios: 0 }]))
     for (const d of destinos) {
@@ -502,6 +515,7 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
         else cat = 'nao_conferido'
       }
       categorias[cat]++
+      if (cat !== 'bloqueado') { if (decidirEnvio(cfgAgora, d.sku).real) envioReal++; else envioSimulado++ }
       if (motivo) motivosBloqueio[motivo] = (motivosBloqueio[motivo] || 0) + 1
       if (porSku.has(d.sku)) porSku.get(d.sku).anuncios++
     }
@@ -512,7 +526,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
       // até quantos podem receber o número: todos menos os bloqueados (Full, conta, variação ML...). Os com "erro" na
       // última leitura entram na fila e são lidos de novo no envio; se a leitura do ML falhar, NÃO enviam.
       receberao_envio: destinos.length - categorias.bloqueado,
-      conferencia_em: conf.terminado_em || null, config: await lerConfig(empresaId), envio_habilitado: envioHabilitado()
+      envio_real: envioReal, envio_simulado: envioSimulado, // dos que podem receber: quantos de verdade x simulação (modo/piloto de AGORA)
+      conferencia_em: conf.terminado_em || null, config: cfgAgora, envio_habilitado: envioHabilitado()
     }
   }
 
