@@ -301,7 +301,7 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     const contas = await q(sb.from('ml_accounts').select('id, nickname, ml_user_id, platform, active, empresa_id, access_token, refresh_token, expires_at').eq('empresa_id', empresaId), 'contas')
     const fila = await q(sb.from('estoque_sync_fila').select('destino, conta_ref, anuncio_id, variacao_id, status, quantidade_enviada, enviado_em, ultimo_erro').eq('empresa_id', empresaId), 'fila')
     const filaPor = new Map((fila || []).map((f) => [`${f.destino}:${f.conta_ref}:${f.anuncio_id}:${f.variacao_id}`, f]))
-    const abertas = await q(sb.from('estoque_divergencias').select('id, chave').eq('empresa_id', empresaId).not('chave', 'is', null).or('resolvido.is.null,resolvido.eq.false'), 'divergências abertas')
+    const abertas = await q(sb.from('estoque_divergencias').select('id, chave').eq('empresa_id', empresaId).not('chave', 'is', null).not('resolvido', 'is', true), 'divergências abertas')
     const chavesAbertas = new Set((abertas || []).map((d) => d.chave))
     const linhas = []
 
@@ -570,11 +570,38 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     const fila = await q(sb.from('estoque_sync_fila').select('id, sku, destino, conta_ref, anuncio_id, variacao_id, status, quantidade_alvo, quantidade_enviada, quantidade_confirmada, tentativas, proxima_tentativa, ultimo_erro, atualizado_em, enviado_em').eq('empresa_id', empresaId).order('atualizado_em', { ascending: false }).limit(300), 'fila')
     const contagem = {}
     for (const f of (fila || [])) contagem[f.status] = (contagem[f.status] || 0) + 1
-    const divergencias = await q(sb.from('estoque_divergencias').select('id, sku, plataforma, conta_ref, anuncio_id, variacao_id, estoque_tmp10, estoque_ml, diferenca, ocorrencias, detectado_em, atualizado_em').eq('empresa_id', empresaId).not('chave', 'is', null).or('resolvido.is.null,resolvido.eq.false').order('ocorrencias', { ascending: false }).limit(300), 'divergências')
-    const legado = await sb.from('estoque_divergencias').select('id', { count: 'exact', head: true }).eq('empresa_id', empresaId).is('chave', null).or('resolvido.is.null,resolvido.eq.false')
+    // Divergências ATUAIS (uma por anúncio, com chave): no máximo 300, as mais repetidas primeiro.
+    // Filtro "aberta" = NOT (resolvido IS TRUE): usa o índice parcial da migração 23 e lê só as linhas novas,
+    // nunca as ~220 mil antigas. Se mesmo assim falhar, o painel continua (fila, modo e movimentos) e avisa.
+    let divergencias = [], divergenciasErro = null
+    try {
+      divergencias = await q(sb.from('estoque_divergencias').select('id, sku, plataforma, conta_ref, anuncio_id, variacao_id, estoque_tmp10, estoque_ml, diferenca, ocorrencias, detectado_em, atualizado_em').eq('empresa_id', empresaId).not('chave', 'is', null).not('resolvido', 'is', true).order('ocorrencias', { ascending: false }).limit(300), 'divergências')
+    } catch (e) {
+      divergenciasErro = 'Não foi possível carregar as divergências agora.'
+      log(`[ESTOQUE] painel: ${e.message}`)
+    }
     const movimentos = await q(sb.from('estoque_movimentos').select('id, sku, estoque_anterior, estoque_novo, quantidade, origem, motivo, aplicado, observacao, criado_em').eq('empresa_id', empresaId).order('criado_em', { ascending: false }).limit(50), 'movimentos')
     return { config, envio_habilitado: envioHabilitado(), shopee_sandbox: shopee.ehSandbox(), fila: fila || [], fila_contagem: contagem,
-      divergencias: divergencias || [], divergencias_legado_abertas: legado && !legado.error ? legado.count : null, movimentos: movimentos || [] }
+      divergencias: divergencias || [], divergencias_erro: divergenciasErro, divergencias_legado_abertas: await contarLegado(empresaId), movimentos: movimentos || [] }
+  }
+
+  // Quantidade de divergências ANTIGAS (sem chave, gravadas pela rotina antiga) ainda abertas — só informativo.
+  // Não muda mais (a rotina antiga parou), então é contada no máximo 1 vez por hora por empresa, e nunca
+  // derruba o painel: se a contagem falhar, mostra o último número conhecido (ou nada).
+  const cacheLegado = new Map()
+  async function contarLegado(empresaId) {
+    const c = cacheLegado.get(empresaId)
+    if (c && Date.now() - c.em < 60 * 60 * 1000) return c.valor
+    try {
+      const r = await sb.from('estoque_divergencias').select('id', { count: 'exact', head: true }).eq('empresa_id', empresaId).is('chave', null).not('resolvido', 'is', true)
+      if (r && r.error) throw new Error(r.error.message)
+      cacheLegado.set(empresaId, { valor: r.count, em: Date.now() })
+      return r.count
+    } catch (e) {
+      log(`[ESTOQUE] painel: contagem das divergências antigas indisponível: ${e.message}`)
+      if (c) { cacheLegado.set(empresaId, { valor: c.valor, em: Date.now() - 50 * 60 * 1000 }); return c.valor } // tenta de novo em ~10 min
+      return null
+    }
   }
 
   async function movimentosDoSku(empresaId, sku) {
