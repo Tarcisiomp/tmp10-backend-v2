@@ -40,6 +40,11 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
     return { movimento: r }
   }))
 
+  // Diagnóstico Shopee (só lê): TMP10 × Shopee (disponível, reserva de promoção, promoções), fila e últimas tentativas
+  router.get('/api/estoque/shopee/diagnostico', ...admin, responder(async (req) => ({ diagnostico: await estoque.diagnosticoShopee(req.empresaId, String(req.query.sku || '')) })))
+  // Tentar 1 vez (Shopee): recoloca só este item na fila, com todas as proteções (piloto, reserva, Full, conta)
+  router.post('/api/estoque/shopee/tentar', ...admin, responder(async (req) => estoque.tentarShopeeUmaVez({ empresaId: req.empresaId, filaId: String(corpo(req).fila_id || '') })))
+
   // Histórico de um SKU
   router.get('/api/estoque/movimentos', ...admin, responder(async (req) => ({ movimentos: await estoque.movimentosDoSku(req.empresaId, String(req.query.sku || '')) })))
 

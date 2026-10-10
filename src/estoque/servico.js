@@ -19,6 +19,25 @@ const MAX_TENTATIVAS = 6
 const LIMITE_LOOP = { envios: 10, minutos: 10 } // mais que isso no mesmo anúncio = pausa ("pausado_loop")
 const ROTULO = { mercadolivre: 'Mercado Livre', shopee: 'Shopee' }
 const ehShopee = (conta) => conta.platform === 'shopee'
+const tentarJson = (t) => { try { return JSON.parse(t) } catch { return t } }
+
+// Diagnóstico de cada chamada de envio à Shopee (gravado em estoque_sync_log.resposta como JSON; SEM credenciais).
+// classificacao: sucesso | erro_negocio (HTTP 200 com "error"/failure_list) | reserva_promocao | erro_comunicacao | erro_autenticacao
+const CLASSIFICACAO = { negocio: 'erro_negocio', comunicacao: 'erro_comunicacao', autenticacao: 'erro_autenticacao', reserva_promocao: 'reserva_promocao' }
+const ROTULO_CLASSE = { erro_negocio: 'Erro de negócio da Shopee (HTTP 200 com recusa)', erro_comunicacao: 'Falha de comunicação com a Shopee',
+  erro_autenticacao: 'Falha de autenticação/permissão na Shopee', reserva_promocao: 'Reserva de promoção da Shopee' }
+function registroShopee(item, conta, alvo, { classificacao, http = null, dados = null, requisicao = null, extra = {} }) {
+  const d = dados && typeof dados === 'object' ? dados : {}
+  const r = d.response && typeof d.response === 'object' ? d.response : {}
+  return JSON.stringify({ classificacao, quando: new Date().toISOString(), loja: conta ? conta.nickname : null, shop_id: item.conta_ref,
+    item_id: item.anuncio_id, model_id: item.variacao_id || null, quantidade: alvo, http_status: http,
+    request_id: d.request_id ?? null, error: d.error ?? null, message: d.message ?? null,
+    failure_list: Array.isArray(r.failure_list) ? r.failure_list.map((f) => ({ model_id: f && f.model_id !== undefined ? f.model_id : null, failed_reason: f && (f.failed_reason ?? f.fail_reason ?? null) })) : [],
+    success_list: Array.isArray(r.success_list) ? r.success_list : [], ...extra, requisicao, resposta: dados })
+}
+const mensagemReserva = (reserva, alvo, quando) => `RESERVA DA SHOPEE: a Shopee tem ${reserva} unidade(s) em estoque reservado para promoção e só aceita estoque maior ou igual a isso; o TMP10 tem ${alvo}. ` +
+  `${quando}. O TMP10 NÃO aumenta o número. A Shopee continua com o estoque antigo — risco de vender sem ter: reduza a reserva ou tire a variação da promoção ` +
+  `(Central do Vendedor → Marketing) e depois use "Tentar 1 vez". Veja "Diagnóstico Shopee".`
 const inteiro = (v) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Math.trunc(Number(v)))
 
 function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitado = () => false, permitirSandbox = false,
@@ -172,7 +191,7 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     try {
       await q(sb.from('estoque_sync_log').insert({ fila_id: item.id, empresa_id: item.empresa_id, sku: item.sku, destino: item.destino,
         conta_ref: item.conta_ref, anuncio_id: item.anuncio_id, variacao_id: item.variacao_id, versao: item.versao,
-        quantidade: extra.quantidade ?? null, resultado, http_status: extra.http ?? null, resposta: extra.resposta ? resumir(extra.resposta) : null }), 'log')
+        quantidade: extra.quantidade ?? null, resultado, http_status: extra.http ?? null, resposta: extra.resposta ? resumir(extra.resposta, 6000) : null }), 'log')
     } catch (e) { log(`[ESTOQUE] não gravou o log: ${e.message}`) }
   }
 
@@ -235,7 +254,7 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     if (!decisao.real) return concluir('simulado', { alvo, erro: `SIMULAÇÃO — enviaria ${alvo}. Não enviado: ${decisao.motivo}` })
     // 5) proteção contra loop: envios demais no mesmo anúncio em pouco tempo
     const desde = new Date(Date.now() - LIMITE_LOOP.minutos * 60000).toISOString()
-    const recentes = await q(sb.from('estoque_sync_log').select('id').eq('fila_id', item.id).in('resultado', ['ok', 'erro', 'erro_temporario']).gte('criado_em', desde), 'log recente')
+    const recentes = await q(sb.from('estoque_sync_log').select('id').eq('fila_id', item.id).or('resultado.in.(ok,erro,erro_temporario),and(resultado.eq.bloqueado,http_status.not.is.null)').gte('criado_em', desde), 'log recente')
     if ((recentes || []).length >= LIMITE_LOOP.envios) {
       log(`🛑 [ESTOQUE] anúncio ${item.anuncio_id} (${item.sku}) pausado: ${recentes.length} envios em ${LIMITE_LOOP.minutos} min`)
       return concluir('pausado_loop', { alvo, erro: `${recentes.length} envios em ${LIMITE_LOOP.minutos} minutos — pausado para conferência manual` })
@@ -257,21 +276,43 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
       const lerShopee = () => item.variacao_id ? shopee.lerModelos(destino.conta, item.anuncio_id) : shopee.lerItens(destino.conta, [item.anuncio_id])
       const antesSh = (await lerShopee()).get(item.variacao_id || item.anuncio_id)
       if (!antesSh || antesSh.quantidade === null) return concluir('erro', { alvo, erro: `item${item.variacao_id ? '/variação' : ''} não encontrado na loja Shopee ${destino.conta.nickname} — envio não feito` })
+      if (!item.variacao_id && antesSh.tem_variacao) return concluir('bloqueado', { alvo, erro: 'item com variações na Shopee, mas o vínculo está sem model_id — vincule a variação certa (envio não feito)' })
+      // Reserva de PROMOÇÃO (doc da Shopee: estoque enviado tem de ser >= total_reserved_stock). Se a Shopee informou a reserva e o
+      // TMP10 tem menos, NÃO envia (seria recusado) e NÃO aumenta o número. Sem a informação, segue e a Shopee decide.
+      if (antesSh.reservada !== null && antesSh.reservada !== undefined && alvo < antesSh.reservada) {
+        log(`⛔ [ESTOQUE] shopee: SKU ${item.sku}, anúncio ${item.anuncio_id}${item.variacao_id ? '/' + item.variacao_id : ''} — reserva de promoção ${antesSh.reservada} > estoque TMP10 ${alvo}; envio NÃO feito`)
+        return concluir('bloqueado', { alvo, erro: mensagemReserva(antesSh.reservada, alvo, 'Verificado ANTES do envio: nada foi enviado'),
+          resposta: registroShopee(item, destino.conta, alvo, { classificacao: 'reserva_promocao', extra: { fonte: 'leitura antes do envio', total_reserved_stock: antesSh.reservada,
+            total_available_stock: antesSh.quantidade, stock_info_v2: antesSh.bruto ? antesSh.bruto.stock_info_v2 || null : null } }) })
+      }
       const r = await shopee.enviar(destino.conta, item.anuncio_id, item.variacao_id || null, alvo)
       let confirmada = null
       try {
         const mapa = item.variacao_id ? await shopee.lerModelos(destino.conta, item.anuncio_id) : await shopee.lerItens(destino.conta, [item.anuncio_id])
         const v = mapa.get(item.variacao_id || item.anuncio_id); confirmada = v ? v.quantidade : null
       } catch (e) { /* leitura de confirmação falhou: o envio continua válido; a conferência mostra depois */ }
-      return concluir('ok', { alvo, enviada: alvo, confirmada, http: r.http, resposta: r.resposta,
+      return concluir('ok', { alvo, enviada: alvo, confirmada, http: r.http,
+        resposta: r.dados ? registroShopee(item, destino.conta, alvo, { classificacao: 'sucesso', http: r.http, dados: r.dados, requisicao: r.requisicao, extra: { antes: antesSh.quantidade, lido_depois: confirmada } }) : r.resposta,
         erro: confirmada !== null && confirmada !== alvo ? `enviado ${alvo}, a Shopee mostra ${confirmada} — conferir` : null })
     } catch (e) {
       const erro = e instanceof ErroPlataforma ? e : new ErroPlataforma(e.message, { tipo: 'temporario' })
+      const sh = item.destino === 'shopee'
+      const classe = CLASSIFICACAO[erro.categoria] || 'erro_negocio'
+      const regSh = () => registroShopee(item, destino.conta, alvo, { classificacao: classe, http: erro.http, dados: erro.dados || (erro.resposta ? tentarJson(erro.resposta) : null), requisicao: erro.requisicao })
       if (erro.tipo === 'temporario' && item.tentativas < MAX_TENTATIVAS) {
         const atraso = ESPERAS[Math.min(Math.max(item.tentativas - 1, 0), ESPERAS.length - 1)]
-        return concluir('erro_temporario', { alvo, erro: `${erro.message} — nova tentativa em ${Math.round(atraso / 60)} min`, atraso, http: erro.http, resposta: erro.resposta })
+        return concluir('erro_temporario', { alvo, erro: `${sh ? ROTULO_CLASSE[classe] + ': ' : ''}${erro.message} — nova tentativa em ${Math.round(atraso / 60)} min`, atraso, http: erro.http, resposta: sh ? regSh() : erro.resposta })
       }
-      return concluir('erro', { alvo, erro: erro.message, http: erro.http, resposta: erro.resposta })
+      // recusa da plataforma: grava requisição (sem credenciais) + resposta COMPLETA no log e escreve no log do Railway
+      const detalhe = sh ? regSh() : (erro.requisicao ? JSON.stringify({ requisicao: erro.requisicao, resposta: erro.resposta ? tentarJson(erro.resposta) : null }) : erro.resposta)
+      log(`❌ [ESTOQUE] ${item.destino} recusou o envio — SKU ${item.sku}, anúncio ${item.anuncio_id}${item.variacao_id ? '/' + item.variacao_id : ''}, quantidade ${alvo}: ${erro.message}${erro.requisicao ? ' · ' + detalhe : ''}`)
+      // Shopee: estoque RESERVADO maior que o estoque do TMP10. Repetir não adianta e o TMP10 NUNCA sobe o número
+      // para caber na reserva (seria anunciar mais do que existe). Fica BLOQUEADO até o estoque mudar ou a reserva cair.
+      if (erro.tipo === 'reserva') {
+        return concluir('bloqueado', { alvo, http: erro.http, resposta: detalhe,
+          erro: `${mensagemReserva(erro.reserva, alvo, 'A Shopee RECUSOU o envio; o estoque dela não mudou')} Motivo da Shopee: ${erro.message}` })
+      }
+      return concluir('erro', { alvo, erro: sh ? `${ROTULO_CLASSE[classe]}: ${erro.message}` : erro.message, http: erro.http, resposta: detalhe })
     }
   }
 
@@ -631,7 +672,82 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     return { ok: true }
   }
 
-  return { movimentar, registrarVenda, registrarCancelamento, ajustar, enfileirarSku, processarMovimentosPendentes, processarFila, processarItem,
+  // DIAGNÓSTICO SHOPEE (só LÊ: banco + get_model_list/get_item_base_info + get_item_promotion). Não grava, não envia.
+  // Para cada item/variação vinculado ao SKU: estoque do TMP10 × Shopee (disponível, reservado p/ promoção, seller_stock),
+  // promoções que reservam estoque, a linha da fila e as últimas tentativas (com failure_list, request_id, classificação).
+  async function diagnosticoShopee(empresaId, sku) {
+    sku = String(sku || '').trim()
+    if (!sku) throw Object.assign(new Error('informe o SKU'), { status: 400 })
+    const links = (await q(sb.from('product_shopee_links').select('shop_id, item_id, model_id, sincronizar').eq('empresa_id', empresaId).eq('sku', sku), 'vínculos Shopee')) || []
+    const contas = (await q(sb.from('ml_accounts').select('id, nickname, ml_user_id, platform, active, empresa_id, access_token, refresh_token, expires_at').eq('empresa_id', empresaId).eq('platform', 'shopee'), 'contas Shopee')) || []
+    const prod = ((await q(sb.from('products').select('estoque_atual').eq('empresa_id', empresaId).eq('sku', sku), 'produto')) || [])[0]
+    const estoqueTmp10 = prod ? prod.estoque_atual : null
+    const alvo = estoqueTmp10 === null || estoqueTmp10 === undefined ? null : Math.max(0, inteiro(estoqueTmp10))
+    const cfg = await lerConfig(empresaId)
+    const anuncios = []
+    for (const l of links) {
+      const base = { item_id: String(l.item_id), model_id: l.model_id ? String(l.model_id) : '', shop_id: String(l.shop_id), sincronizar: l.sincronizar }
+      const fila = (await q(sb.from('estoque_sync_fila').select('id, status, quantidade_alvo, quantidade_enviada, quantidade_confirmada, tentativas, ultimo_erro, atualizado_em')
+        .eq('empresa_id', empresaId).eq('destino', 'shopee').eq('conta_ref', base.shop_id).eq('anuncio_id', base.item_id).eq('variacao_id', base.model_id), 'fila')) || []
+      const logs = fila.length ? ((await q(sb.from('estoque_sync_log').select('criado_em, resultado, quantidade, http_status, resposta').eq('fila_id', fila[0].id)
+        .order('criado_em', { ascending: false }).limit(5), 'tentativas')) || []) : []
+      const tentativas = logs.map((g) => {
+        const j = tentarJson(g.resposta)
+        const o = j && typeof j === 'object' ? j : {}
+        return { quando: g.criado_em, resultado: g.resultado, quantidade: g.quantidade, http_status: g.http_status, classificacao: o.classificacao || null,
+          request_id: o.request_id ?? (o.resposta && o.resposta.request_id) ?? null, error: o.error ?? (o.resposta && o.resposta.error) ?? null,
+          message: o.message ?? (o.resposta && o.resposta.message) ?? null,
+          failure_list: o.failure_list || (o.resposta && o.resposta.response && o.resposta.response.failure_list) || [], texto: typeof j === 'string' ? j : null }
+      })
+      const linha = { ...base, fila: fila[0] || null, tentativas, envio_agora: decidirEnvio(cfg, sku) }
+      const conta = contas.find((c) => c.active === true && String(c.ml_user_id) === base.shop_id)
+      if (!conta) { anuncios.push({ ...linha, erro: 'loja Shopee não conectada/ativa nesta empresa', conclusao: { pode_enviar: false, motivo: 'loja não conectada' } }); continue }
+      linha.loja = conta.nickname
+      try {
+        const mapa = base.model_id ? await shopee.lerModelos(conta, base.item_id) : await shopee.lerItens(conta, [base.item_id])
+        const v = mapa.get(base.model_id || base.item_id)
+        if (!v) linha.erro = 'item/variação não devolvido pela Shopee'
+        else {
+          const si = (v.bruto && v.bruto.stock_info_v2) || null
+          linha.shopee = { total_available_stock: v.quantidade, total_reserved_stock: v.reservada,
+            seller_stock: si && Array.isArray(si.seller_stock) ? si.seller_stock : null, shopee_stock: si && Array.isArray(si.shopee_stock) ? si.shopee_stock : null, stock_info_v2: si }
+        }
+      } catch (e) { linha.erro = `${ROTULO_CLASSE[CLASSIFICACAO[e.categoria]] || 'Erro'}: ${e.message}` }
+      try {
+        const { mapa, falhas } = await shopee.lerPromocoes(conta, [base.item_id])
+        const todas = mapa.get(base.item_id) || []
+        linha.promocoes = { lista: todas.filter((p) => !base.model_id || !p.model_id || p.model_id === base.model_id || p.model_id === '0'), falhas }
+      } catch (e) { linha.promocoes = { erro: `${ROTULO_CLASSE[CLASSIFICACAO[e.categoria]] || 'Erro'}: ${e.message}` } }
+      const res = linha.shopee ? linha.shopee.total_reserved_stock : null
+      linha.conclusao = alvo === null ? { pode_enviar: false, motivo: 'produto sem estoque oficial no TMP10' }
+        : linha.erro ? { pode_enviar: null, motivo: 'não foi possível ler a Shopee agora' }
+        : res === null ? { pode_enviar: null, motivo: 'a Shopee não informou a reserva (total_reserved_stock); a decisão fica com a Shopee no envio' }
+        : alvo < res ? { pode_enviar: false, motivo: `reserva de promoção ${res} maior que o estoque do TMP10 (${alvo}) — a Shopee recusa; reduza a reserva ou tire a variação da promoção` }
+        : { pode_enviar: true, motivo: `estoque do TMP10 (${alvo}) cobre a reserva de promoção (${res})` }
+      anuncios.push(linha)
+    }
+    return { sku, estoque_tmp10: estoqueTmp10, modo: cfg.modo, anuncios }
+  }
+
+  // TENTAR 1 VEZ (Shopee): recoloca SÓ este item na fila, uma vez. Passa por TODAS as proteções do processamento
+  // (piloto/ativo, Full, conta, leitura antes, reserva). Recusa se o item já está na fila ou se houve envio há menos de 1 minuto.
+  async function tentarShopeeUmaVez({ empresaId, filaId }) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(filaId || ''))) throw Object.assign(new Error('Informe o item da fila (fila_id).'), { status: 400 })
+    const f = await q(sb.from('estoque_sync_fila').select('id, sku, destino, status').eq('id', filaId).eq('empresa_id', empresaId).maybeSingle(), 'fila')
+    if (!f || f.destino !== 'shopee') throw Object.assign(new Error('Item da fila da Shopee não encontrado.'), { status: 404 })
+    if (['pendente', 'enviando'].includes(f.status)) throw Object.assign(new Error('Este item já está na fila — aguarde o resultado.'), { status: 409 })
+    const desde = new Date(Date.now() - 60000).toISOString()
+    const recente = await q(sb.from('estoque_sync_log').select('id').eq('fila_id', filaId).not('http_status', 'is', null).gte('criado_em', desde).limit(1), 'tentativa recente')
+    if ((recente || []).length) throw Object.assign(new Error('Houve um envio para este anúncio há menos de 1 minuto — aguarde antes de tentar de novo.'), { status: 429 })
+    const envioAgora = decidirEnvio(await lerConfig(empresaId), f.sku)
+    await q(sb.from('estoque_sync_fila').update({ status: 'pendente', tentativas: 0, proxima_tentativa: new Date().toISOString(), atualizado_em: new Date().toISOString() })
+      .eq('id', filaId).eq('empresa_id', empresaId).not('status', 'in', '(pendente,enviando)'), 'tentar 1 vez')
+    log(`🔁 [ESTOQUE] tentativa manual (1 vez) — fila ${filaId}, SKU ${f.sku}: ${envioAgora.real ? 'envio real' : 'simulação'} (${envioAgora.motivo})`)
+    agendarProcessamento()
+    return { ok: true, envio_agora: envioAgora }
+  }
+
+  return { diagnosticoShopee, tentarShopeeUmaVez, movimentar, registrarVenda, registrarCancelamento, ajustar, enfileirarSku, processarMovimentosPendentes, processarFila, processarItem,
     conferir, iniciarConferencia, statusConferencia, conferirTodas, previa, sincronizar, resolverDivergencia, salvarConfig, lerConfig, painel,
     movimentosDoSku, liberarPausa, agendarProcessamento }
 }
