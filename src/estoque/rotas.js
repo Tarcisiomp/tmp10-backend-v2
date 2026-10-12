@@ -47,9 +47,11 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
 
   // ── Ajuste em massa Marketplace → TMP10 (1ª versão: Mercado Livre) ──────────────────────────────────────────────
   // Lista da tela (só banco) · Simular (só lê ML; grava SÓ a auditoria) · Executar/retomar (estoque_movimentar) · Situação
-  router.get('/api/estoque/ajuste-massa/itens', ...admin, responder(async (req) => estoque.ajusteMassa.itens({ empresaId: req.empresaId, contaRef: String(req.query.conta || '') })))
+  // contas: uma ou várias contas do ML (?contas=111,222 · corpo { contas: [...] }); "conta" (uma) continua aceito
+  router.get('/api/estoque/ajuste-massa/itens', ...admin, responder(async (req) => estoque.ajusteMassa.itens({ empresaId: req.empresaId,
+    contaRef: String(req.query.conta || ''), contasRef: req.query.contas ? String(req.query.contas) : null })))
   router.post('/api/estoque/ajuste-massa/simular', ...admin, responder(async (req) => estoque.ajusteMassa.iniciarSimulacao({ empresaId: req.empresaId, usuarioId: req.usuario.id,
-    contaRef: corpo(req).conta, skus: corpo(req).skus })))
+    contaRef: corpo(req).conta, contasRef: Array.isArray(corpo(req).contas) ? corpo(req).contas.map(String).slice(0, 50) : null, skus: corpo(req).skus })))
   router.post('/api/estoque/ajuste-massa/executar', ...admin, responder(async (req) => estoque.ajusteMassa.iniciarExecucao({ empresaId: req.empresaId, usuarioId: req.usuario.id,
     execucaoId: String(corpo(req).execucao_id || '') })))
   router.get('/api/estoque/ajuste-massa/execucoes/:id', ...admin, responder(async (req) => ({ execucao: await estoque.ajusteMassa.status(req.empresaId, req.params.id) })))
