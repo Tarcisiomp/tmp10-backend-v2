@@ -38,10 +38,11 @@ function registroShopee(item, conta, alvo, { classificacao, http = null, dados =
 const mensagemReserva = (reserva, alvo, quando) => `RESERVA DA SHOPEE: a Shopee tem ${reserva} unidade(s) em estoque reservado para promoção e só aceita estoque maior ou igual a isso; o TMP10 tem ${alvo}. ` +
   `${quando}. O TMP10 NÃO aumenta o número. A Shopee continua com o estoque antigo — risco de vender sem ter: reduza a reserva ou tire a variação da promoção ` +
   `(Central do Vendedor → Marketing) e depois use "Tentar 1 vez". Veja "Diagnóstico Shopee".`
+const { criarAjusteMassa } = require('./ajusteMassa')
 const inteiro = (v) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Math.trunc(Number(v)))
 
 function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitado = () => false, permitirSandbox = false,
-  agendar = true, esperaEntreEnviosMs = 300 }) {
+  agendar = true, esperaEntreEnviosMs = 300, limiteAjusteMassa = 999 }) {
   const dormir = (ms) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve())
 
   async function q(promessa, contexto) {
@@ -747,7 +748,11 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     return { ok: true, envio_agora: envioAgora }
   }
 
-  return { diagnosticoShopee, tentarShopeeUmaVez, movimentar, registrarVenda, registrarCancelamento, ajustar, enfileirarSku, processarMovimentosPendentes, processarFila, processarItem,
+  // Ajuste em massa Marketplace → TMP10 (1ª versão: Mercado Livre) — módulo separado, usa o MESMO caminho oficial
+  const ajusteMassa = criarAjusteMassa({ sb, ml, q, rpc, movimentar, lerConfig, decidirEnvio, log, dormir: () => dormir(esperaEntreEnviosMs),
+    limiteQuantidade: limiteAjusteMassa })
+
+  return { ajusteMassa, diagnosticoShopee, tentarShopeeUmaVez, movimentar, registrarVenda, registrarCancelamento, ajustar, enfileirarSku, processarMovimentosPendentes, processarFila, processarItem,
     conferir, iniciarConferencia, statusConferencia, conferirTodas, previa, sincronizar, resolverDivergencia, salvarConfig, lerConfig, painel,
     movimentosDoSku, liberarPausa, agendarProcessamento }
 }

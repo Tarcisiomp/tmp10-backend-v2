@@ -45,6 +45,17 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
   // Tentar 1 vez (Shopee): recoloca só este item na fila, com todas as proteções (piloto, reserva, Full, conta)
   router.post('/api/estoque/shopee/tentar', ...admin, responder(async (req) => estoque.tentarShopeeUmaVez({ empresaId: req.empresaId, filaId: String(corpo(req).fila_id || '') })))
 
+  // ── Ajuste em massa Marketplace → TMP10 (1ª versão: Mercado Livre) ──────────────────────────────────────────────
+  // Lista da tela (só banco) · Simular (só lê ML; grava SÓ a auditoria) · Executar/retomar (estoque_movimentar) · Situação
+  router.get('/api/estoque/ajuste-massa/itens', ...admin, responder(async (req) => estoque.ajusteMassa.itens({ empresaId: req.empresaId, contaRef: String(req.query.conta || '') })))
+  router.post('/api/estoque/ajuste-massa/simular', ...admin, responder(async (req) => estoque.ajusteMassa.iniciarSimulacao({ empresaId: req.empresaId, usuarioId: req.usuario.id,
+    contaRef: corpo(req).conta, skus: corpo(req).skus })))
+  router.post('/api/estoque/ajuste-massa/executar', ...admin, responder(async (req) => estoque.ajusteMassa.iniciarExecucao({ empresaId: req.empresaId, usuarioId: req.usuario.id,
+    execucaoId: String(corpo(req).execucao_id || '') })))
+  router.get('/api/estoque/ajuste-massa/execucoes/:id', ...admin, responder(async (req) => ({ execucao: await estoque.ajusteMassa.status(req.empresaId, req.params.id) })))
+  // Diagnóstico ML (SÓ LEITURA): quantidade atual de cada anúncio vinculado — GET /api/estoque/diagnostico-ml?skus=A,B
+  router.get('/api/estoque/diagnostico-ml', ...admin, responder(async (req) => ({ diagnostico: await estoque.ajusteMassa.diagnosticoML({ empresaId: req.empresaId, skus: String(req.query.skus || '') }) })))
+
   // Histórico de um SKU
   router.get('/api/estoque/movimentos', ...admin, responder(async (req) => ({ movimentos: await estoque.movimentosDoSku(req.empresaId, String(req.query.sku || '')) })))
 

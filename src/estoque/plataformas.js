@@ -64,6 +64,13 @@ function classificarErroHttp(e, contexto) {
   return new ErroPlataforma(msg, { tipo: 'permanente', http: st, resposta: resumir(corpo), categoria: st === 403 ? 'autenticacao' : 'negocio', dados })
 }
 
+// SKU que o anúncio do ML declara — mesma regra da importação de produtos (server.js): SELLER_SKU → seller_custom_field
+const skuDeclaradoML = (corpo) => {
+  const attr = Array.isArray(corpo && corpo.attributes) ? corpo.attributes.find((a) => a && a.id === 'SELLER_SKU') : null
+  const v = (attr && attr.value_name) || (corpo && corpo.seller_custom_field) || null
+  return v ? String(v).trim() : null
+}
+
 function criarMercadoLivre({ axios, getToken, refreshToken, timeout = 8000 }) {
   // Executa com o token da conta; se o ML responder 401, renova o token UMA vez e tenta de novo.
   async function comToken(conta, fn, contexto) {
@@ -99,7 +106,11 @@ function criarMercadoLivre({ axios, getToken, refreshToken, timeout = 8000 }) {
           quantidade: Number.isFinite(Number(corpo.available_quantity)) && corpo.available_quantity !== null ? Number(corpo.available_quantity) : null,
           // PRECISA CONFIRMAR: "variations" — só usado para BLOQUEAR envio em anúncio com variação
           variacoes: Array.isArray(corpo.variations) ? corpo.variations.length : 0,
-          codigo: 200
+          codigo: 200,
+          // título e SKU declarado no anúncio: MESMOS campos que a importação de produtos do server.js já usa
+          // (title; atributo SELLER_SKU → seller_custom_field). Só leitura/diagnóstico.
+          titulo: corpo.title ?? null,
+          sku_declarado: skuDeclaradoML(corpo)
         })
       }
       // anúncio que o ML não devolveu para esta conta (de outra conta, apagado, sem permissão)
@@ -117,7 +128,39 @@ function criarMercadoLivre({ axios, getToken, refreshToken, timeout = 8000 }) {
     }, `ML PUT /items/${itemId} (${conta.nickname})`)
   }
 
-  return { lerAnuncios, enviar }
+  // Pedidos do vendedor por status, desde uma data (SÓ LEITURA). Mesma URL e parâmetros do syncMLOrders (server.js):
+  //   /orders/search?seller=…&order.status=…&order.date_created.from=…&sort=date_desc&limit=50&offset=…
+  // Devolve [{ id, status, criado, itens: [{ anuncio, sku, qtd }] }]. Acima de maxPaginas, recusa (não dá para conferir tudo).
+  async function buscarPedidos(conta, status, desde, { maxPaginas = 40 } = {}) {
+    const dataStr = new Date(desde).toISOString().slice(0, 19) + '.000-00:00'
+    return comToken(conta, async (token) => {
+      const pedidos = []
+      for (let pagina = 0, offset = 0; ; pagina++, offset += 50) {
+        if (pagina >= maxPaginas) throw new ErroPlataforma(`ML pedidos ${status} (${conta.nickname}): mais de ${maxPaginas * 50} pedidos em 30 dias — não foi possível conferir todos`, { tipo: 'permanente', categoria: 'negocio' })
+        const { data } = await axios.get(`${ML_API}/orders/search?seller=${encodeURIComponent(conta.ml_user_id)}&order.status=${encodeURIComponent(status)}&order.date_created.from=${encodeURIComponent(dataStr)}&sort=date_desc&limit=50&offset=${offset}`,
+          { headers: { Authorization: `Bearer ${token}` }, timeout })
+        const resultados = (data && Array.isArray(data.results)) ? data.results : []
+        const total = data && data.paging && Number.isFinite(Number(data.paging.total)) ? Number(data.paging.total) : 0
+        for (const o of resultados) {
+          pedidos.push({ id: String(o.id), status: o.status || status, criado: o.date_created || null,
+            itens: (o.order_items || []).map((it) => ({ anuncio: it && it.item && it.item.id ? String(it.item.id) : null,
+              sku: it && it.item && it.item.seller_sku ? String(it.item.seller_sku).trim() : null, qtd: Number(it && it.quantity) || 1 })) })
+        }
+        if (!resultados.length || offset + 50 >= total) break
+      }
+      return pedidos
+    }, `ML GET /orders/search ${status} (${conta.nickname})`)
+  }
+
+  // Um pedido (SÓ LEITURA) — mesmo endpoint do webhook orders_v2 do server.js: GET /orders/{id}
+  async function lerPedido(conta, id) {
+    return comToken(conta, async (token) => {
+      const { data } = await axios.get(`${ML_API}/orders/${encodeURIComponent(id)}`, { headers: { Authorization: `Bearer ${token}` }, timeout })
+      return { id: String(id), status: data && data.status ? String(data.status) : null }
+    }, `ML GET /orders/${id} (${conta.nickname})`)
+  }
+
+  return { lerAnuncios, enviar, buscarPedidos, lerPedido }
 }
 
 function criarShopee({ axios, host, partnerId, assinar, getToken, refreshToken, timeout = 10000 }) {
@@ -227,4 +270,4 @@ function criarShopee({ axios, host, partnerId, assinar, getToken, refreshToken, 
   return { lerItens, lerModelos, enviar, lerPromocoes, ehSandbox }
 }
 
-module.exports = { criarMercadoLivre, criarShopee, ErroPlataforma, classificarErroHttp, resumir, motivosFalha, reservaDoTexto }
+module.exports = { criarMercadoLivre, criarShopee, ErroPlataforma, classificarErroHttp, resumir, motivosFalha, reservaDoTexto, skuDeclaradoML }
