@@ -48,13 +48,26 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
   // ── Ajuste em massa Marketplace → TMP10 (1ª versão: Mercado Livre) ──────────────────────────────────────────────
   // Lista da tela (só banco) · Simular (só lê ML; grava SÓ a auditoria) · Executar/retomar (estoque_movimentar) · Situação
   // contas: uma ou várias contas do ML (?contas=111,222 · corpo { contas: [...] }); "conta" (uma) continua aceito
+  // Ajuste em massa (ML e Shopee → TMP10). Contas no formato 'ml:<id>' / 'sh:<shop_id>' (número puro = conta do ML).
+  const contasDoCorpo = (b) => (Array.isArray(b.contas) ? b.contas.map(String).slice(0, 100) : null)
+  const todosDoCorpo = (b) => (b.todos && typeof b.todos === 'object'
+    ? { filtro: ['todos', 'divergencia', 'sem_divergencia'].includes(b.todos.filtro) ? b.todos.filtro : 'todos', busca: String(b.todos.busca || '').slice(0, 200),
+        excluir: Array.isArray(b.todos.excluir) ? b.todos.excluir.map(String) : [] }
+    : null)
   router.get('/api/estoque/ajuste-massa/itens', ...admin, responder(async (req) => estoque.ajusteMassa.itens({ empresaId: req.empresaId,
     contaRef: String(req.query.conta || ''), contasRef: req.query.contas ? String(req.query.contas) : null })))
-  router.post('/api/estoque/ajuste-massa/simular', ...admin, responder(async (req) => estoque.ajusteMassa.iniciarSimulacao({ empresaId: req.empresaId, usuarioId: req.usuario.id,
-    contaRef: corpo(req).conta, contasRef: Array.isArray(corpo(req).contas) ? corpo(req).contas.map(String).slice(0, 50) : null, skus: corpo(req).skus })))
+  router.post('/api/estoque/ajuste-massa/simular', ...admin, responder(async (req) => {
+    const b = corpo(req)
+    return estoque.ajusteMassa.iniciarSimulacao({ empresaId: req.empresaId, usuarioId: req.usuario.id, contaRef: b.conta, contasRef: contasDoCorpo(b),
+      skus: Array.isArray(b.skus) ? b.skus : null, todos: todosDoCorpo(b) })
+  }))
+  router.post('/api/estoque/ajuste-massa/simular/retomar', ...admin, responder(async (req) => estoque.ajusteMassa.retomarSimulacao({ empresaId: req.empresaId, usuarioId: req.usuario.id,
+    execucaoId: String(corpo(req).execucao_id || '') })))
   router.post('/api/estoque/ajuste-massa/executar', ...admin, responder(async (req) => estoque.ajusteMassa.iniciarExecucao({ empresaId: req.empresaId, usuarioId: req.usuario.id,
     execucaoId: String(corpo(req).execucao_id || '') })))
   router.get('/api/estoque/ajuste-massa/execucoes/:id', ...admin, responder(async (req) => ({ execucao: await estoque.ajusteMassa.status(req.empresaId, req.params.id) })))
+  router.get('/api/estoque/ajuste-massa/execucoes/:id/itens', ...admin, responder(async (req) => estoque.ajusteMassa.itensDaExecucao(req.empresaId, req.params.id, {
+    pagina: Number(req.query.pagina) || 1, porPagina: Math.min(Number(req.query.por_pagina) || 100, 500), situacao: String(req.query.situacao || 'todos') })))
   // Diagnóstico ML (SÓ LEITURA): quantidade atual de cada anúncio vinculado — GET /api/estoque/diagnostico-ml?skus=A,B
   router.get('/api/estoque/diagnostico-ml', ...admin, responder(async (req) => ({ diagnostico: await estoque.ajusteMassa.diagnosticoML({ empresaId: req.empresaId, skus: String(req.query.skus || '') }) })))
 

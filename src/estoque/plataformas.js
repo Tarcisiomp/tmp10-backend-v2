@@ -131,7 +131,7 @@ function criarMercadoLivre({ axios, getToken, refreshToken, timeout = 8000 }) {
   // Pedidos do vendedor por status, desde uma data (SÓ LEITURA). Mesma URL e parâmetros do syncMLOrders (server.js):
   //   /orders/search?seller=…&order.status=…&order.date_created.from=…&sort=date_desc&limit=50&offset=…
   // Devolve [{ id, status, criado, itens: [{ anuncio, sku, qtd }] }]. Acima de maxPaginas, recusa (não dá para conferir tudo).
-  async function buscarPedidos(conta, status, desde, { maxPaginas = 40 } = {}) {
+  async function buscarPedidos(conta, status, desde, { maxPaginas = 200 } = {}) {
     const dataStr = new Date(desde).toISOString().slice(0, 19) + '.000-00:00'
     return comToken(conta, async (token) => {
       const pedidos = []
@@ -267,7 +267,40 @@ function criarShopee({ axios, host, partnerId, assinar, getToken, refreshToken, 
     return { mapa, falhas: r.failure_list || [] }
   }
 
-  return { lerItens, lerModelos, enviar, lerPromocoes, ehSandbox }
+  // Pedidos da loja criados desde uma data (SÓ LEITURA) — mesma chamada do syncShopeeOrders (server.js):
+  //   GET /api/v2/order/get_order_list · time_range_field=create_time · janelas de até 15 dias · page_size 50 · cursor
+  // Devolve [order_sn]. Acima de maxPaginas, recusa (não dá para conferir tudo).
+  async function buscarPedidos(conta, desde, ate = Date.now(), { maxPaginas = 400 } = {}) {
+    const sns = []; let paginas = 0
+    const fim = Math.floor(ate / 1000)
+    for (let ini = Math.floor(new Date(desde).getTime() / 1000); ini < fim; ini += 15 * 86400) {
+      const to = Math.min(ini + 15 * 86400, fim)
+      let cursor = ''
+      for (;;) {
+        if (++paginas > maxPaginas) throw new ErroPlataforma(`Shopee pedidos (${conta.nickname}): mais de ${maxPaginas * 50} pedidos no período — não foi possível conferir todos`, { tipo: 'permanente', categoria: 'negocio' })
+        const data = await chamar(conta, 'get', '/api/v2/order/get_order_list', { params: { time_range_field: 'create_time', time_from: ini, time_to: to, page_size: 50, cursor } }, `Shopee get_order_list (${conta.nickname})`)
+        const r = (data && data.response) || {}
+        for (const o of (r.order_list || [])) if (o && o.order_sn) sns.push(String(o.order_sn))
+        cursor = r.next_cursor || ''
+        if (!(r.more === true && cursor)) break
+      }
+    }
+    return [...new Set(sns)]
+  }
+
+  // Detalhe de até 50 pedidos (SÓ LEITURA) — mesma chamada do syncShopeeOrders: get_order_detail com item_list,
+  // order_status e fulfillment_flag (subconjunto dos response_optional_fields que o server.js já pede).
+  async function detalharPedidos(conta, sns) {
+    if (!sns.length) return []
+    if (sns.length > 50) throw new Error('detalharPedidos: no máximo 50 por vez')
+    const data = await chamar(conta, 'get', '/api/v2/order/get_order_detail', { params: { order_sn_list: sns.join(','), response_optional_fields: 'item_list,order_status,fulfillment_flag,create_time' } }, `Shopee get_order_detail (${conta.nickname})`)
+    return ((data && data.response && data.response.order_list) || []).map((o) => ({ sn: String(o.order_sn), status: o.order_status || null,
+      fbs: o.fulfillment_flag === 'fulfilled_by_shopee', criado: o.create_time || null,
+      // SKU do item: MESMA regra da importação de pedidos (model_sku || item_sku || item_id)
+      itens: (o.item_list || []).map((i) => ({ item_id: String(i.item_id), sku: String(i.model_sku || i.item_sku || i.item_id).trim(), qtd: Number(i.model_quantity_purchased) || 1 })) }))
+  }
+
+  return { lerItens, lerModelos, enviar, lerPromocoes, ehSandbox, buscarPedidos, detalharPedidos }
 }
 
 module.exports = { criarMercadoLivre, criarShopee, ErroPlataforma, classificarErroHttp, resumir, motivosFalha, reservaDoTexto, skuDeclaradoML }

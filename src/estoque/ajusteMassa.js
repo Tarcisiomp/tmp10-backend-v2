@@ -1,40 +1,45 @@
-// Estoque Central — AJUSTE EM MASSA (Marketplace → TMP10), 1ª versão: SÓ MERCADO LIVRE.
+// Estoque Central — AJUSTE EM MASSA (Marketplaces → TMP10): Mercado Livre e Shopee, uma ou várias contas/lojas.
 //
-// O que faz: o usuário escolhe uma conta do ML e os SKUs; a SIMULAÇÃO lê AO VIVO todos os anúncios vinculados a cada SKU,
-// confere vínculos e pedidos e diz, por SKU, se o número do ML pode virar o estoque oficial do TMP10. A EXECUÇÃO só aceita uma
-// simulação válida, revalida tudo item a item e grava pelo caminho oficial (estoque_movimentar), com referência idempotente
-// massa:{execução}:{sku}. Os anúncios do SKU entram na fila que já existe (que respeita PILOTO/ATIVO/DESLIGADO). Nunca envia
-// nada ao ML/Shopee daqui.
+// O usuário escolhe contas do ML e/ou lojas da Shopee e os SKUs (sem limite de quantidade). A SIMULAÇÃO roda em segundo
+// plano, em LOTES internos, lê AO VIVO todos os anúncios vinculados a cada SKU (nas duas plataformas, em todas as contas),
+// confere vínculos e pedidos e grava UM evento de auditoria por SKU. A EXECUÇÃO só aceita uma simulação concluída e válida,
+// revalida tudo em lotes e grava pelo caminho oficial (estoque_movimentar), com referência idempotente massa:{execução}:{sku}.
+// Os anúncios do SKU entram na fila que já existe (PILOTO/ATIVO/DESLIGADO + reserva da Shopee). Nunca envia nada daqui.
 //
-// Regras (todas BLOQUEIAM o SKU; nada é somado; nada é vinculado por nome):
-//   • produto inexistente, duplicado ou sem estoque oficial · sem anúncio vinculado na conta de origem
-//   • SKU com anúncio na Shopee ou com venda na Shopee nos últimos 30 dias (nesta versão só SKUs exclusivos do ML)
-//   • conta de algum vínculo não conectada · vínculo com variação (ml_variation_id) ou "não sincronizar"
-//   • anúncio ligado a mais de um SKU · anúncio com variações · leitura com erro
-//   • SKU declarado no anúncio (SELLER_SKU → seller_custom_field) diferente do SKU do vínculo
-//   • anúncios do SKU com números diferentes ("Anúncios discordam") — anúncios Full não entram na comparação nem servem de origem
-//   • número acima do LIMITE provisório (padrão 999): revisão manual (o limite NÃO confirma que números menores estão certos)
-//   • pedidos: (A) pedido ML paid/payment_in_process/confirmed ainda não importado; (B) venda importada sem baixa ou registrada
-//     com outro SKU no mesmo anúncio; (C) pedido ML cancelado/invalidado no ML e ainda aberto no TMP10; (D) falha ao consultar.
+// O SKU é BLOQUEADO (sozinho; os outros seguem) quando:
+//   • cadastro: produto inexistente, duplicado ou sem estoque oficial
+//   • vínculos: sem anúncio nas contas/lojas selecionadas · conta/loja de algum vínculo não conectada · vínculo ML com variação
+//     · "não sincronizar" · anúncio ML ligado a mais de um SKU · item/variação Shopee ligado a mais de um SKU · SKU ligado a
+//     duas variações do mesmo item Shopee · vínculo Shopee sem model_id em item que tem variações
+//   • leitura: falha · anúncio ML com variações · SKU declarado no anúncio diferente do vínculo · Shopee com reserva de
+//     promoção, estoque do vendedor ≠ disponível, estoque no armazém da Shopee ou sem "estoque do vendedor"
+//   • números: anúncios discordam (entre anúncios, contas, lojas ou plataformas) · origem só Full/FBS · acima do limite provisório
+//   • pedidos: (A) pedido ML paid/payment_in_process/confirmed ou pedido Shopee (qualquer status) ainda não importado
+//     (B) venda importada sem baixa ou registrada com outro SKU no mesmo anúncio (C) pedido cancelado/invalidado no ML ou
+//     cancelado na Shopee ainda aberto no TMP10 (D) falha ao consultar pedidos.
 const crypto = require('crypto')
 
-const LIMITE_SKUS = 100
 const LIMITE_QUANTIDADE_PADRAO = 999
-const VALIDADE_MINUTOS = 60
+const LOTE_SIMULACAO = 50          // SKUs por lote interno (não é limite para o usuário)
+const LOTE_EXECUCAO = 20
+const VALIDADE_MINUTOS = 60        // depois que a simulação TERMINA
+const VALIDADE_MAXIMA_HORAS = 24   // teto absoluto (gravado no cabeçalho, que é imutável)
 const JANELA_DIAS = 30
 const STATUS_PEDIDOS_ML = ['paid', 'payment_in_process', 'confirmed']   // confirmed: doc oficial do ML (desconta estoque)
-const STATUS_ML_CANCELADO = ['cancelled', 'invalid']
-const MAX_PEDIDOS_CANCELAMENTO_POR_SKU = 60
+const STATUS_ML_CANCELADO = ['cancelled', 'invalid']                      // valores oficiais do ML
 const TRAVA_SEGUNDOS = 120
+const MARGEM_PEDIDOS_MS = 10 * 60000 // ao reconsultar pedidos, volta 10 min (atraso de indexação)
 const AVISO_FIXO = 'Pedidos do ML em payment_required/partially_paid não são verificados: a documentação oficial não confirma se descontam o estoque.'
 const ehUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v || ''))
 const erroHttp = (msg, status) => Object.assign(new Error(msg), { status })
+const ROTULO_PLAT = { mercadolivre: 'ML', shopee: 'Shopee' }
 
-function criarAjusteMassa({ sb, ml, q, rpc, movimentar, lerConfig, decidirEnvio, log = console.log, limiteQuantidade = LIMITE_QUANTIDADE_PADRAO,
-  agora = () => new Date(), dormir = () => Promise.resolve() }) {
+function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decidirEnvio, log = console.log, limiteQuantidade = LIMITE_QUANTIDADE_PADRAO,
+  agora = () => new Date(), dormir = () => Promise.resolve(), statusCanceladoShopee = () => (process.env.SHOPEE_STATUS_CANCELADO || 'CANCELLED').split(',').map((x) => x.trim()).filter(Boolean) }) {
   const dono = `tmp10-${process.pid}-${crypto.randomBytes(4).toString('hex')}`
-  const jobs = new Map()          // execucao_id → { tipo, fase, processados, total, erro, iniciado_em, terminado_em }
+  const jobs = new Map()            // execucao_id → andamento (memória; o banco é a fonte da verdade)
   const executandoEmpresa = new Set()
+  const simulandoEmpresa = new Set()
 
   async function lerTodos(montar, contexto) {
     const todos = []
@@ -45,50 +50,113 @@ function criarAjusteMassa({ sb, ml, q, rpc, movimentar, lerConfig, decidirEnvio,
     }
   }
   const pedacos = (lista, n) => { const r = []; for (let i = 0; i < lista.length; i += n) r.push(lista.slice(i, i + n)); return r }
-  const contaRefDe = (c) => String(c.ml_user_id)
-  async function contasML(empresaId) {
+  const refDe = (c) => (c.platform === 'shopee' ? 'sh:' : 'ml:') + String(c.ml_user_id)
+  async function todasContas(empresaId) {
     const contas = await q(sb.from('ml_accounts').select('id, nickname, ml_user_id, platform, active, empresa_id, access_token, refresh_token, expires_at').eq('empresa_id', empresaId), 'contas')
-    return (contas || []).filter((c) => c.platform !== 'shopee' && c.active === true)
+    return (contas || []).filter((c) => c.active === true)
   }
+  async function contasML(empresaId) { return (await todasContas(empresaId)).filter((c) => c.platform !== 'shopee') }
   const contaDoLink = (contas, l) => {
-    const achadas = contas.filter((c) => (l.ml_user_id ? String(c.ml_user_id) === String(l.ml_user_id) : c.nickname === l.account_nickname))
+    const achadas = contas.filter((c) => c.platform !== 'shopee' && (l.ml_user_id ? String(c.ml_user_id) === String(l.ml_user_id) : c.nickname === l.account_nickname))
     return achadas.length === 1 ? achadas[0] : null
   }
+  const lojaDoLink = (contas, l) => { const a = contas.filter((c) => c.platform === 'shopee' && String(c.ml_user_id) === String(l.shop_id)); return a.length === 1 ? a[0] : null }
+  // aceita ['ml:111','sh:555'], 'ml:111,sh:555' e o formato antigo (só o número = conta do ML)
+  const refsDe = (contaRef, contasRef) => [...new Set((Array.isArray(contasRef) ? contasRef : String(contasRef || contaRef || '').split(','))
+    .map((x) => String(x).trim()).filter(Boolean).map((x) => (/^(ml|sh):/.test(x) ? x : 'ml:' + x)))]
   async function anunciosFull(empresaId, ids) {
     try {
       const r = await rpc('estoque_anuncios_full', { p_empresa: empresaId, p_dias: 90 })
       return new Set((r || []).map((x) => String(typeof x === 'object' && x !== null ? Object.values(x)[0] : x)))
-    } catch (e) { // sem a migração 22: consulta um a um (mesma regra)
+    } catch (e) {
       const s = new Set()
       for (const id of ids) if (await rpc('estoque_anuncio_tem_full', { p_empresa: empresaId, p_anuncio: id, p_dias: 90 })) s.add(id)
       return s
     }
   }
+  const somaEstoque = (lista) => (Array.isArray(lista) ? lista.reduce((t, x) => t + (Number(x && x.stock) || 0), 0) : null)
 
-  // ── Avaliação de um conjunto de SKUs (usada pela SIMULAÇÃO e de novo pela EXECUÇÃO) ─────────────────────────────────
-  // Ordem: 1) banco  2) leitura AO VIVO dos anúncios  3) DEPOIS, pedidos (assim toda venda que já pode estar no número lido
-  // aparece na consulta de pedidos). Devolve Map(sku → avaliação).
-  // contasOrigem: UMA ou VÁRIAS contas do ML escolhidas pelo usuário. O SKU precisa ter anúncio (não Full) em pelo menos uma
-  // delas; a comparação continua sendo entre TODOS os anúncios do SKU, em TODAS as contas — selecionar várias contas nunca
-  // ignora divergência.
-  async function avaliar(empresaId, skus, contasOrigemArg, progresso = () => {}) {
-    const contasOrigem = Array.isArray(contasOrigemArg) ? contasOrigemArg : [contasOrigemArg]
-    const refsOrigem = new Set(contasOrigem.map((c) => contaRefDe(c)))
-    const nomesOrigem = contasOrigem.map((c) => c.nickname).join(', ')
+  // ── Contexto de pedidos de UMA corrida (simulação ou execução): consultado DEPOIS da leitura de cada lote, ──────────
+  // incremental (só o que é novo desde a última consulta, com margem). O que mudar o estoque do TMP10 entre a foto e a
+  // gravação é barrado pelo "estoque esperado" do estoque_movimentar.
+  function novoContexto(empresaId) {
+    return { empresaId, ml: new Map(), sh: new Map(), importados: new Set(), naoImportados: new Map(), statusSh: new Map(), erroConta: new Map(),
+      pedidosTmp: null, pedidosTmpEm: 0, corte: undefined }
+  }
+  async function atualizarPedidos(ctx, contas) {
+    const desdeJanela = new Date(agora().getTime() - JANELA_DIAS * 86400000)
+    for (const conta of contas) {
+      const ref = refDe(conta)
+      if (ctx.erroConta.has(ref)) continue
+      try {
+        if (conta.platform !== 'shopee') {
+          const st = ctx.ml.get(ref) || { pedidos: new Map(), cancelados: new Set(), ultimo: null }
+          const desde = st.ultimo ? new Date(st.ultimo - MARGEM_PEDIDOS_MS) : desdeJanela
+          const inicio = agora().getTime()
+          for (const s of STATUS_PEDIDOS_ML) for (const p of await ml.buscarPedidos(conta, s, desde)) st.pedidos.set(p.id, p)
+          for (const s of STATUS_ML_CANCELADO) for (const p of await ml.buscarPedidos(conta, s, desde)) { st.cancelados.add(p.id); st.pedidos.delete(p.id) }
+          st.ultimo = inicio; ctx.ml.set(ref, st)
+        } else {
+          const st = ctx.sh.get(ref) || { sns: new Set(), ultimo: null }
+          const desde = st.ultimo ? new Date(st.ultimo - MARGEM_PEDIDOS_MS) : desdeJanela
+          const inicio = agora().getTime()
+          for (const sn of await shopee.buscarPedidos(conta, desde, inicio)) st.sns.add(sn)
+          st.ultimo = inicio; ctx.sh.set(ref, st)
+        }
+      } catch (e) { ctx.erroConta.set(ref, `não foi possível confirmar os pedidos de ${conta.nickname}: ${e.message}`) }
+      await dormir()
+    }
+    // quais pedidos ainda não estão no TMP10 (reconsulta os que faltavam)
+    const ids = []
+    for (const st of ctx.ml.values()) for (const id of st.pedidos.keys()) if (!ctx.importados.has(id)) ids.push(id)
+    for (const st of ctx.sh.values()) for (const sn of st.sns) if (!ctx.importados.has(sn)) ids.push(sn)
+    for (const lote of pedacos([...new Set(ids)], 200)) {
+      const ex = await q(sb.from('ml_orders').select('ml_order_id').eq('empresa_id', ctx.empresaId).in('ml_order_id', lote), 'pedidos importados')
+      for (const x of (ex || [])) { ctx.importados.add(String(x.ml_order_id)); ctx.naoImportados.delete(String(x.ml_order_id)) }
+    }
+    // pedidos Shopee que faltam: detalhe (itens/status) para saber quais SKUs afetam
+    for (const conta of contas.filter((c) => c.platform === 'shopee')) {
+      const st = ctx.sh.get(refDe(conta)); if (!st) continue
+      const faltam = [...st.sns].filter((sn) => !ctx.importados.has(sn) && !ctx.naoImportados.has(sn))
+      try {
+        for (const lote of pedacos(faltam, 50)) { for (const d of await shopee.detalharPedidos(conta, lote)) { ctx.naoImportados.set(d.sn, { ...d, conta: conta.nickname, plataforma: 'shopee' }); ctx.statusSh.set(d.sn, d.status) } await dormir() }
+      } catch (e) { ctx.erroConta.set(refDe(conta), `não foi possível detalhar os pedidos de ${conta.nickname}: ${e.message}`) }
+    }
+    for (const [ref, st] of ctx.ml) {
+      const nome = (contas.find((c) => refDe(c) === ref) || {}).nickname || ref
+      for (const p of st.pedidos.values()) if (!ctx.importados.has(p.id)) ctx.naoImportados.set(p.id, { ...p, conta: nome, plataforma: 'mercadolivre' })
+    }
+    // pedidos do TMP10 (30 dias): foto renovada a cada 2 min (o estoque esperado cobre o resto)
+    if (!ctx.pedidosTmp || agora().getTime() - ctx.pedidosTmpEm > 120000) {
+      ctx.pedidosTmp = await lerTodos(() => sb.from('ml_orders').select('ml_order_id, platform, items, is_fulfillment, status, account_nickname, created_at_ml')
+        .eq('empresa_id', ctx.empresaId).gte('created_at_ml', desdeJanela.toISOString()), 'pedidos recentes')
+      ctx.pedidosTmpEm = agora().getTime()
+    }
+    if (ctx.corte === undefined) {
+      const primeira = await q(sb.from('estoque_movimentos').select('criado_em').eq('empresa_id', ctx.empresaId).in('origem', ['venda_mercadolivre', 'venda_shopee']).order('criado_em', { ascending: true }).limit(1), 'primeira venda')
+      ctx.corte = primeira && primeira[0] ? new Date(primeira[0].criado_em) : null
+    }
+  }
+
+  // ── Avaliação de um LOTE de SKUs (simulação e execução) ──────────────────────────────────────────────────────────
+  // 1) banco  2) leitura AO VIVO dos anúncios (ML e Shopee)  3) DEPOIS, pedidos (contexto incremental)
+  async function avaliar(empresaId, skus, refsOrigem, ctx = novoContexto(empresaId)) {
+    const origem = new Set(refsOrigem)
     const res = new Map()
-    const bloquear = (sku, motivo, extra = {}) => { const r = res.get(sku); if (r && r.situacao !== 'bloqueado') { r.situacao = 'bloqueado'; r.motivo = motivo; Object.assign(r, extra) } }
-    for (const sku of skus) res.set(sku, { sku, situacao: 'pendente', motivo: null, anuncios: [], avisos: [], pedidos: [] })
+    const bloquear = (sku, motivo) => { const r = res.get(sku); if (r && r.situacao !== 'bloqueado') { r.situacao = 'bloqueado'; r.motivo = motivo } }
+    for (const sku of skus) res.set(sku, { sku, situacao: 'pendente', motivo: null, anuncios: [], avisos: [AVISO_FIXO], pedidos: [] })
 
-    // 1) banco
+    const contas = await todasContas(empresaId)
     const prods = await lerTodos(() => sb.from('products').select('id, sku, name, estoque_atual').eq('empresa_id', empresaId).in('sku', skus), 'produtos')
-    const links = await lerTodos(() => sb.from('product_ml_links').select('sku, account_nickname, ml_item_id, ml_user_id, sincronizar, ml_variation_id').eq('empresa_id', empresaId).in('sku', skus), 'vínculos ML')
-    const linksSh = await lerTodos(() => sb.from('product_shopee_links').select('sku, shop_id, item_id').eq('empresa_id', empresaId).in('sku', skus), 'vínculos Shopee')
-    const ids = [...new Set(links.map((l) => String(l.ml_item_id)).filter(Boolean))]
-    const outros = ids.length ? await lerTodos(() => sb.from('product_ml_links').select('sku, ml_item_id').eq('empresa_id', empresaId).in('ml_item_id', ids), 'vínculos do anúncio') : []
-    const skusDoAnuncio = new Map()
-    for (const o of outros) { const k = String(o.ml_item_id); if (!skusDoAnuncio.has(k)) skusDoAnuncio.set(k, new Set()); skusDoAnuncio.get(k).add(o.sku) }
-    const contas = await contasML(empresaId)
-    const full = await anunciosFull(empresaId, ids)
+    const linksML = await lerTodos(() => sb.from('product_ml_links').select('sku, account_nickname, ml_item_id, ml_user_id, sincronizar, ml_variation_id').eq('empresa_id', empresaId).in('sku', skus), 'vínculos ML')
+    const linksSh = await lerTodos(() => sb.from('product_shopee_links').select('sku, shop_id, item_id, model_id, sincronizar').eq('empresa_id', empresaId).in('sku', skus), 'vínculos Shopee')
+    const idsML = [...new Set(linksML.map((l) => String(l.ml_item_id)).filter(Boolean))]
+    const outrosML = idsML.length ? await lerTodos(() => sb.from('product_ml_links').select('sku, ml_item_id').eq('empresa_id', empresaId).in('ml_item_id', idsML), 'vínculos do anúncio ML') : []
+    const itensSh = [...new Set(linksSh.map((l) => String(l.item_id)))]
+    const outrosSh = itensSh.length ? await lerTodos(() => sb.from('product_shopee_links').select('sku, shop_id, item_id, model_id').eq('empresa_id', empresaId).in('item_id', itensSh), 'vínculos do item Shopee') : []
+    const skusDoML = new Map(); for (const o of outrosML) { const k = String(o.ml_item_id); if (!skusDoML.has(k)) skusDoML.set(k, new Set()); skusDoML.get(k).add(o.sku) }
+    const full = await anunciosFull(empresaId, [...idsML, ...itensSh])
+    const nome = (a) => `${ROTULO_PLAT[a.plataforma]} ${a.conta} ${a.anuncio_id}${a.variacao_id ? '/' + a.variacao_id : ''}`
 
     for (const sku of skus) {
       const r = res.get(sku)
@@ -96,376 +164,496 @@ function criarAjusteMassa({ sb, ml, q, rpc, movimentar, lerConfig, decidirEnvio,
       if (ps.length !== 1) { bloquear(sku, ps.length ? 'mais de um produto com este SKU no cadastro' : 'produto não cadastrado no TMP10'); continue }
       r.produto_id = ps[0].id; r.nome = ps[0].name; r.tmp10 = ps[0].estoque_atual
       if (r.tmp10 === null || r.tmp10 === undefined) { bloquear(sku, 'produto sem estoque oficial definido no TMP10'); continue }
-      const meus = links.filter((l) => l.sku === sku && l.ml_item_id)
-      r.anuncios = meus.map((l) => { const c = contaDoLink(contas, l); return { conta_ref: l.ml_user_id ? String(l.ml_user_id) : `nick:${l.account_nickname}`, conta: c ? c.nickname : l.account_nickname, anuncio_id: String(l.ml_item_id), full: full.has(String(l.ml_item_id)), _link: l, _conta: c } })
-      if (!meus.some((l) => { const c = contaDoLink(contas, l); return c && refsOrigem.has(contaRefDe(c)) })) { bloquear(sku, `sem anúncio vinculado na(s) conta(s) selecionada(s): ${nomesOrigem}`); continue }
-      if (linksSh.some((l) => l.sku === sku)) { bloquear(sku, 'SKU também tem anúncio na Shopee — nesta versão o ajuste em massa só trata SKUs vendidos apenas no Mercado Livre'); continue }
-      const semConta = r.anuncios.find((a) => !a._conta); if (semConta) { bloquear(sku, `conta ${semConta.conta} do anúncio ${semConta.anuncio_id} não está conectada/ativa — não dá para conferir`); continue }
-      const comVar = r.anuncios.find((a) => a._link.ml_variation_id); if (comVar) { bloquear(sku, `vínculo com variação no anúncio ${comVar.anuncio_id} — fora desta versão`); continue }
-      const naoSinc = r.anuncios.find((a) => a._link.sincronizar === false); if (naoSinc) { bloquear(sku, `vínculo do anúncio ${naoSinc.anuncio_id} marcado para não sincronizar`); continue }
-      const amb = r.anuncios.find((a) => (skusDoAnuncio.get(a.anuncio_id) || new Set()).size > 1)
-      if (amb) { bloquear(sku, `anúncio ${amb.anuncio_id} está ligado a mais de um SKU (${[...skusDoAnuncio.get(amb.anuncio_id)].join(', ')}) — vínculo ambíguo`); continue }
+      for (const l of linksML.filter((x) => x.sku === sku && x.ml_item_id)) {
+        const c = contaDoLink(contas, l)
+        r.anuncios.push({ plataforma: 'mercadolivre', conta_ref: c ? refDe(c) : null, conta: c ? c.nickname : l.account_nickname, anuncio_id: String(l.ml_item_id), variacao_id: '',
+          full: full.has(String(l.ml_item_id)), _l: l, _c: c })
+      }
+      for (const l of linksSh.filter((x) => x.sku === sku)) {
+        const c = lojaDoLink(contas, l)
+        r.anuncios.push({ plataforma: 'shopee', conta_ref: c ? refDe(c) : null, conta: c ? c.nickname : `loja ${l.shop_id}`, anuncio_id: String(l.item_id), variacao_id: l.model_id ? String(l.model_id) : '',
+          full: full.has(String(l.item_id)), _l: l, _c: c })
+      }
+      if (!r.anuncios.some((a) => a.conta_ref && origem.has(a.conta_ref))) { bloquear(sku, 'sem anúncio vinculado nas contas/lojas selecionadas'); continue }
+      const semConta = r.anuncios.find((a) => !a._c); if (semConta) { bloquear(sku, `conta/loja do anúncio ${nome(semConta)} não está conectada/ativa nesta empresa — não dá para conferir`); continue }
+      const varML = r.anuncios.find((a) => a.plataforma === 'mercadolivre' && a._l.ml_variation_id); if (varML) { bloquear(sku, `vínculo com variação no anúncio ${nome(varML)} — fora desta versão`); continue }
+      const naoSinc = r.anuncios.find((a) => a._l.sincronizar === false); if (naoSinc) { bloquear(sku, `vínculo do anúncio ${nome(naoSinc)} marcado para não sincronizar`); continue }
+      const ambML = r.anuncios.find((a) => a.plataforma === 'mercadolivre' && (skusDoML.get(a.anuncio_id) || new Set()).size > 1)
+      if (ambML) { bloquear(sku, `anúncio ${nome(ambML)} está ligado a mais de um SKU (${[...skusDoML.get(ambML.anuncio_id)].join(', ')}) — vínculo ambíguo`); continue }
+      let ambSh = null
+      for (const a of r.anuncios.filter((x) => x.plataforma === 'shopee')) {
+        const doItem = outrosSh.filter((o) => String(o.item_id) === a.anuncio_id && String(o.shop_id) === String(a._l.shop_id))
+        const mesmo = doItem.filter((o) => String(o.model_id || '') === a.variacao_id)
+        if (new Set(mesmo.map((o) => o.sku)).size > 1) { ambSh = `item/variação ${nome(a)} está ligado a mais de um SKU (${[...new Set(mesmo.map((o) => o.sku))].join(', ')}) — vínculo ambíguo`; break }
+        if (doItem.filter((o) => o.sku === sku).length > 1) { ambSh = `o SKU está ligado a mais de uma variação do item Shopee ${a.anuncio_id} — cores/tamanhos misturados`; break }
+        if (!a.variacao_id && doItem.some((o) => o.sku !== sku)) { ambSh = `item Shopee ${a.anuncio_id} vinculado sem variação, mas o mesmo item também está ligado a outro(s) SKU(s) — vínculo ambíguo`; break }
+      }
+      if (ambSh) { bloquear(sku, ambSh); continue }
     }
 
-    // 2) leitura AO VIVO (por conta, até 20 por chamada) — só dos SKUs ainda pendentes
-    const porConta = new Map()
-    for (const r of res.values()) if (r.situacao === 'pendente') for (const a of r.anuncios) {
-      if (!porConta.has(a._conta.id)) porConta.set(a._conta.id, { conta: a._conta, ids: new Set() })
-      porConta.get(a._conta.id).ids.add(a.anuncio_id)
-    }
-    const leitura = new Map()   // `${contaId}:${anuncio}` → leitura
-    for (const { conta, ids: idsConta } of porConta.values()) {
-      for (const lote of pedacos([...idsConta], 20)) {
-        let mapa = null, erro = null
-        try { mapa = await ml.lerAnuncios(conta, lote) } catch (e) { erro = e.message }
-        for (const id of lote) leitura.set(`${conta.id}:${id}`, mapa ? (mapa.get(id) || { erro: 'anúncio não devolvido pelo ML' }) : { erro })
-        await dormir()
-      }
-    }
+    // 2) leitura AO VIVO
+    const ativos = [...res.values()].filter((r) => r.situacao === 'pendente')
     const lidoEm = agora().toISOString()
-    for (const r of res.values()) {
-      if (r.situacao !== 'pendente') continue
+    const porContaML = new Map(), itensSemModelo = new Map(), itensComModelo = new Map()
+    for (const r of ativos) for (const a of r.anuncios) {
+      if (a.plataforma === 'mercadolivre') { if (!porContaML.has(a._c.id)) porContaML.set(a._c.id, { conta: a._c, ids: new Set() }); porContaML.get(a._c.id).ids.add(a.anuncio_id) }
+      else if (a.variacao_id) { const k = `${a._c.id}:${a.anuncio_id}`; if (!itensComModelo.has(k)) itensComModelo.set(k, { conta: a._c, item: a.anuncio_id }) }
+      else { if (!itensSemModelo.has(a._c.id)) itensSemModelo.set(a._c.id, { conta: a._c, ids: new Set() }); itensSemModelo.get(a._c.id).ids.add(a.anuncio_id) }
+    }
+    const leitura = new Map()
+    for (const { conta, ids } of porContaML.values()) for (const lote of pedacos([...ids], 20)) {
+      let mapa = null, erro = null
+      try { mapa = await ml.lerAnuncios(conta, lote) } catch (e) { erro = e.message }
+      for (const id of lote) leitura.set(`ml:${conta.id}:${id}`, mapa ? (mapa.get(id) || { erro: 'anúncio não devolvido pelo ML' }) : { erro })
+      await dormir()
+    }
+    for (const { conta, ids } of itensSemModelo.values()) for (const lote of pedacos([...ids], 20)) {
+      let mapa = null, erro = null
+      try { mapa = await shopee.lerItens(conta, lote) } catch (e) { erro = e.message }
+      for (const id of lote) leitura.set(`sh:${conta.id}:${id}:`, mapa ? (mapa.get(id) || { erro: 'item não devolvido pela Shopee' }) : { erro })
+      await dormir()
+    }
+    const modelos = new Map()
+    for (const [k, { conta, item }] of itensComModelo) {
+      try { modelos.set(k, await shopee.lerModelos(conta, item)) } catch (e) { modelos.set(k, { erro: e.message }) }
+      await dormir()
+    }
+    for (const r of ativos) {
       for (const a of r.anuncios) {
-        const l = leitura.get(`${a._conta.id}:${a.anuncio_id}`) || { erro: 'sem leitura' }
-        Object.assign(a, { quantidade: l.erro ? null : l.quantidade, erro: l.erro || null, titulo: l.titulo ?? null, sku_declarado: l.sku_declarado ?? null, variacoes: l.variacoes || 0, lido_em: lidoEm })
+        let l
+        if (a.plataforma === 'mercadolivre') l = leitura.get(`ml:${a._c.id}:${a.anuncio_id}`) || { erro: 'sem leitura' }
+        else if (!a.variacao_id) l = leitura.get(`sh:${a._c.id}:${a.anuncio_id}:`) || { erro: 'sem leitura' }
+        else { const m = modelos.get(`${a._c.id}:${a.anuncio_id}`); l = !m ? { erro: 'sem leitura' } : m.erro ? { erro: m.erro } : (m.get(a.variacao_id) || { erro: 'variação não devolvida pela Shopee' }) }
+        a.lido_em = lidoEm
+        if (l.erro || l.quantidade === null || l.quantidade === undefined) { a.erro = l.erro || 'sem quantidade'; a.quantidade = null; continue }
+        a.quantidade = l.quantidade
+        if (a.plataforma === 'mercadolivre') { a.titulo = l.titulo ?? null; a.variacoes = l.variacoes || 0; a.sku_declarado = l.sku_declarado || a.anuncio_id }
+        else {
+          const b = l.bruto || {}; const si = b.stock_info_v2 || {}
+          a.tem_variacao = !!l.tem_variacao; a.reserva = l.reservada ?? null
+          a.estoque_vendedor = somaEstoque(si.seller_stock); a.estoque_shopee = somaEstoque(si.shopee_stock)
+          a.sku_declarado = a.variacao_id ? String(b.model_sku || `${a.anuncio_id}-${a.variacao_id}`).trim() : String(b.item_sku || a.anuncio_id).trim()
+          if (a.estoque_shopee > 0) a.full = true   // estoque no armazém da Shopee: não é estoque do vendedor
+        }
       }
-      const comErro = r.anuncios.find((a) => a.erro || a.quantidade === null); if (comErro) { bloquear(r.sku, `falha ao ler o anúncio ${comErro.anuncio_id}: ${comErro.erro || 'sem quantidade'}`); continue }
-      const comVar = r.anuncios.find((a) => a.variacoes > 0); if (comVar) { bloquear(r.sku, `anúncio ${comVar.anuncio_id} tem ${comVar.variacoes} variação(ões) no ML — o número é a soma das variações`); continue }
-      const skuErrado = r.anuncios.find((a) => (a.sku_declarado || a.anuncio_id) !== r.sku)
-      if (skuErrado) { bloquear(r.sku, `anúncio ${skuErrado.anuncio_id} declara o SKU "${skuErrado.sku_declarado || '(nenhum: usa o código do anúncio)'}", diferente do vínculo "${r.sku}"`); continue }
+      const comErro = r.anuncios.find((a) => a.erro); if (comErro) { bloquear(r.sku, `falha ao ler ${nome(comErro)}: ${comErro.erro}`); continue }
+      const varML = r.anuncios.find((a) => a.plataforma === 'mercadolivre' && a.variacoes > 0); if (varML) { bloquear(r.sku, `anúncio ${nome(varML)} tem ${varML.variacoes} variação(ões) no ML — o número é a soma das variações`); continue }
+      const semModelo = r.anuncios.find((a) => a.plataforma === 'shopee' && !a.variacao_id && a.tem_variacao); if (semModelo) { bloquear(r.sku, `item Shopee ${semModelo.anuncio_id} tem variações, mas o vínculo está sem model_id — não dá para saber a variação`); continue }
+      const skuErrado = r.anuncios.find((a) => a.sku_declarado !== r.sku)
+      if (skuErrado) { bloquear(r.sku, `${nome(skuErrado)} declara o SKU "${skuErrado.sku_declarado}", diferente do vínculo "${r.sku}"`); continue }
+      const reserva = r.anuncios.find((a) => a.plataforma === 'shopee' && a.reserva !== null && a.reserva > 0)
+      if (reserva) { bloquear(r.sku, `${nome(reserva)} tem ${reserva.reserva} unidade(s) reservada(s) para promoção — o número não representa o estoque físico e a Shopee não aceitaria menos que a reserva`); continue }
+      const semVend = r.anuncios.find((a) => a.plataforma === 'shopee' && !a.full && a.estoque_vendedor === null); if (semVend) { bloquear(r.sku, `a Shopee não informou o estoque do vendedor de ${nome(semVend)} — não dá para conferir`); continue }
+      const vendDif = r.anuncios.find((a) => a.plataforma === 'shopee' && !a.full && a.estoque_vendedor !== a.quantidade)
+      if (vendDif) { bloquear(r.sku, `${nome(vendDif)}: estoque do vendedor ${vendDif.estoque_vendedor} diferente do disponível ${vendDif.quantidade} — números da Shopee não batem`); continue }
       const comparaveis = r.anuncios.filter((a) => !a.full)
-      const daOrigem = comparaveis.filter((a) => refsOrigem.has(contaRefDe(a._conta)))
-      if (!daOrigem.length) { bloquear(r.sku, 'nas contas selecionadas o anúncio é Full (estoque no armazém do ML) — não serve de origem'); continue }
-      r.contas_origem = [...new Set(daOrigem.map((a) => a.conta))]
+      const daOrigem = comparaveis.filter((a) => origem.has(a.conta_ref))
+      if (!daOrigem.length) { bloquear(r.sku, 'nas contas/lojas selecionadas o anúncio é Full/FBS (estoque no armazém da plataforma) — não serve de origem'); continue }
       const numeros = [...new Set(comparaveis.map((a) => a.quantidade))]
-      if (numeros.length > 1) { bloquear(r.sku, 'Anúncios discordam: ' + comparaveis.map((a) => `${a.conta} ${a.anuncio_id} = ${a.quantidade}`).join(' · ')); continue }
-      r.numero_lido = numeros[0]; r.anuncio_origem = daOrigem[0].anuncio_id
+      if (numeros.length > 1) { bloquear(r.sku, 'Anúncios discordam: ' + comparaveis.map((a) => `${nome(a)} = ${a.quantidade}`).join(' · ')); continue }
+      r.numero_lido = numeros[0]; r.anuncio_origem = `${daOrigem[0].plataforma}:${daOrigem[0].anuncio_id}${daOrigem[0].variacao_id ? '/' + daOrigem[0].variacao_id : ''}`
+      r.contas_origem = [...new Set(daOrigem.map((a) => `${ROTULO_PLAT[a.plataforma]} ${a.conta}`))]
       if (!Number.isInteger(r.numero_lido) || r.numero_lido < 0) { bloquear(r.sku, `número inválido no anúncio (${r.numero_lido})`); continue }
       if (r.numero_lido > limiteQuantidade) { bloquear(r.sku, `número do anúncio (${r.numero_lido}) acima do limite provisório de ${limiteQuantidade} — revisão manual (pode ser número de preenchimento, não estoque físico)`); continue }
-      if (r.numero_lido === Math.max(0, Number(r.tmp10)) && Number(r.tmp10) >= 0) { r.situacao = 'igual'; r.motivo = 'o TMP10 já tem este número'; continue }
+      if (Number(r.tmp10) >= 0 && r.numero_lido === Number(r.tmp10)) { r.situacao = 'igual'; r.motivo = 'o TMP10 já tem este número'; continue }
       r.situacao = 'apto'; r.novo = r.numero_lido
     }
-    progresso('leitura')
 
-    // 3) pedidos — só para os aptos
+    // 3) pedidos — DEPOIS da leitura, só para os aptos
     const aptos = [...res.values()].filter((r) => r.situacao === 'apto')
-    if (aptos.length) await verificarPedidos(empresaId, aptos, bloquear)
-    for (const r of res.values()) {
-      r.avisos.push(AVISO_FIXO)
-      for (const a of r.anuncios) { delete a._link; delete a._conta }
+    if (aptos.length) {
+      const refsEnv = new Set(aptos.flatMap((r) => r.anuncios.map((a) => a.conta_ref)))
+      const contasEnv = contas.filter((c) => refsEnv.has(refDe(c)))
+      await atualizarPedidos(ctx, contasEnv)
+      verificarPedidos(ctx, aptos, bloquear)
     }
+    for (const r of res.values()) for (const a of r.anuncios) { delete a._l; delete a._c }
     return res
   }
 
-  async function verificarPedidos(empresaId, aptos, bloquear) {
-    const desde = new Date(agora().getTime() - JANELA_DIAS * 86400000)
-    const contas = await contasML(empresaId)
-    const anunciosDe = new Map(aptos.map((r) => [r.sku, new Set(r.anuncios.map((a) => a.anuncio_id))]))
-    const afeta = (r, item) => item && ((item.sku && item.sku === r.sku) || (item.anuncio && anunciosDe.get(r.sku).has(String(item.anuncio))))
-    // contas envolvidas = contas dos anúncios dos aptos
-    const refs = new Set(aptos.flatMap((r) => r.anuncios.map((a) => a.conta_ref)))
-    const contasEnv = contas.filter((c) => refs.has(contaRefDe(c)) || refs.has(`nick:${c.nickname}`))
-
-    // A) pedidos no ML ainda não importados (mesma busca do syncMLOrders + status confirmed)
-    for (const conta of contasEnv) {
-      let pedidos = []
-      try {
-        for (const st of STATUS_PEDIDOS_ML) pedidos.push(...await ml.buscarPedidos(conta, st, desde))
-      } catch (e) {
-        for (const r of aptos) if (r.anuncios.some((a) => a.conta_ref === contaRefDe(conta) || a.conta_ref === `nick:${conta.nickname}`)) bloquear(r.sku, `não foi possível confirmar os pedidos da conta ${conta.nickname}: ${e.message}`)
-        continue
-      }
-      const idsPed = [...new Set(pedidos.map((p) => p.id))]
-      const existentes = new Set()
-      for (const lote of pedacos(idsPed, 200)) {
-        const ex = await q(sb.from('ml_orders').select('ml_order_id').eq('empresa_id', empresaId).in('ml_order_id', lote), 'pedidos importados')
-        for (const x of (ex || [])) existentes.add(String(x.ml_order_id))
-      }
-      for (const p of pedidos) {
-        if (existentes.has(p.id)) continue
-        for (const r of aptos) {
-          const itens = p.itens.filter((it) => afeta(r, it))
-          if (itens.length) {
-            const un = itens.reduce((t, it) => t + (it.qtd || 1), 0)
-            r.pedidos.push({ verificacao: 'A', canal: 'mercadolivre', conta: conta.nickname, pedido: p.id, status: p.status, unidades: un, criado: p.criado })
-            bloquear(r.sku, `pedido ML ${p.id} (${p.status}, ${un} un., conta ${conta.nickname}) ainda não importado no TMP10`)
-          }
-        }
-      }
-    }
-
-    // B) pedidos importados (30 dias): sem baixa, ou registrados com outro SKU no mesmo anúncio · e vendas na Shopee
-    const pedidosTmp = await lerTodos(() => sb.from('ml_orders').select('ml_order_id, platform, items, is_fulfillment, status, account_nickname, created_at_ml').eq('empresa_id', empresaId).gte('created_at_ml', desde.toISOString()), 'pedidos recentes')
-    const primeira = await q(sb.from('estoque_movimentos').select('criado_em').eq('empresa_id', empresaId).in('origem', ['venda_mercadolivre', 'venda_shopee']).order('criado_em', { ascending: true }).limit(1), 'primeira venda')
-    const corte = primeira && primeira[0] ? new Date(primeira[0].criado_em) : null
-    const precisa = []   // { r, pedido, sku, plat }
-    for (const o of pedidosTmp) {
-      if (o.is_fulfillment === true || o.status === 'cancelado') continue
-      const itens = Array.isArray(o.items) ? o.items : []
-      const plat = o.platform === 'shopee' ? 'shopee' : 'mercadolivre'
-      for (const r of aptos) {
-        for (const it of itens) {
-          const itSku = it && it.sku ? String(it.sku).trim() : null
-          const itAnuncio = it && it.ml_item_id !== undefined && it.ml_item_id !== null ? String(it.ml_item_id) : null
-          if (plat === 'shopee' && itSku === r.sku) {
-            r.pedidos.push({ verificacao: 'B', canal: 'shopee', pedido: o.ml_order_id, sku: itSku })
-            bloquear(r.sku, `SKU vendido na Shopee (pedido ${o.ml_order_id}) — nesta versão o ajuste em massa só trata SKUs vendidos apenas no Mercado Livre`)
-          } else if (plat === 'mercadolivre' && itAnuncio && anunciosDe.get(r.sku).has(itAnuncio) && itSku && itSku !== r.sku) {
-            r.pedidos.push({ verificacao: 'B', canal: 'mercadolivre', pedido: o.ml_order_id, sku: itSku })
-            bloquear(r.sku, `venda do anúncio ${itAnuncio} registrada com outro SKU ("${itSku}") — pedido ${o.ml_order_id}: vínculo ou cadastro inconsistente`)
-          } else if (plat === 'mercadolivre' && itSku === r.sku && (!corte || new Date(o.created_at_ml) >= corte)) {
-            precisa.push({ r, pedido: String(o.ml_order_id), ref: `venda:mercadolivre:${o.ml_order_id}:${r.sku}` })
-          }
-        }
-      }
-    }
-    const refs2 = [...new Set(precisa.map((x) => x.ref))]
-    const movs = new Map()
-    for (const lote of pedacos(refs2, 200)) {
-      const ms = await q(sb.from('estoque_movimentos').select('referencia, aplicado, observacao').eq('empresa_id', empresaId).in('referencia', lote), 'movimentos de venda')
-      for (const m of (ms || [])) movs.set(m.referencia, m)
-    }
-    for (const x of precisa) {
-      const m = movs.get(x.ref)
-      if (!m) { x.r.pedidos.push({ verificacao: 'B', pedido: x.pedido, sem_baixa: true }); bloquear(x.r.sku, `pedido ML ${x.pedido} importado mas SEM baixa registrada no TMP10`) }
-      else if (!m.aplicado) x.r.avisos.push(`pedido ${x.pedido}: venda registrada sem baixa (${m.observacao || 'não aplicada'})`)
-    }
-
-    // C) cancelamento no ML ainda não processado no TMP10 (GET /orders/{id}, mesmo endpoint do webhook)
+  function verificarPedidos(ctx, aptos, bloquear) {
+    const cancSh = new Set(statusCanceladoShopee())
     for (const r of aptos) {
-      if (r.situacao !== 'apto') continue
-      const abertos = pedidosTmp.filter((o) => o.platform !== 'shopee' && o.is_fulfillment !== true && !['cancelado', 'finalizado', 'full_ml'].includes(o.status)
-        && (Array.isArray(o.items) ? o.items : []).some((it) => (it && String(it.sku || '').trim() === r.sku) || (it && it.ml_item_id && anunciosDe.get(r.sku).has(String(it.ml_item_id)))))
-      if (abertos.length > MAX_PEDIDOS_CANCELAMENTO_POR_SKU) { bloquear(r.sku, `${abertos.length} pedidos recentes em aberto para conferir cancelamento (máximo ${MAX_PEDIDOS_CANCELAMENTO_POR_SKU}) — revisão manual`); continue }
-      for (const o of abertos) {
-        const conta = contas.find((c) => c.nickname === o.account_nickname)
-        if (!conta) { bloquear(r.sku, `conta ${o.account_nickname || '?'} do pedido ${o.ml_order_id} não conectada — não dá para conferir cancelamento`); break }
-        let st
-        try { st = await ml.lerPedido(conta, o.ml_order_id) } catch (e) { bloquear(r.sku, `não foi possível conferir o pedido ${o.ml_order_id}: ${e.message}`); break }
-        if (STATUS_ML_CANCELADO.includes(st.status)) {
-          r.pedidos.push({ verificacao: 'C', canal: 'mercadolivre', pedido: o.ml_order_id, status: st.status })
-          bloquear(r.sku, `pedido ML ${o.ml_order_id} está "${st.status}" no ML e ainda aberto no TMP10 (cancelamento não processado)`)
+      const idsML = new Set(r.anuncios.filter((a) => a.plataforma === 'mercadolivre').map((a) => a.anuncio_id))
+      const shSemModelo = new Set(r.anuncios.filter((a) => a.plataforma === 'shopee' && !a.variacao_id).map((a) => a.anuncio_id))
+      const shComModelo = new Set(r.anuncios.filter((a) => a.plataforma === 'shopee' && a.variacao_id).map((a) => a.anuncio_id))
+      // (D) falha de consulta numa conta/loja do SKU
+      const falha = r.anuncios.map((a) => ctx.erroConta.get(a.conta_ref)).find(Boolean)
+      if (falha) { bloquear(r.sku, falha); continue }
+      // afeta o SKU? pelo SKU do item, ou pelo anúncio (Shopee com variação: só pelo SKU — o item tem outras variações)
+      const afetaML = (sku, anuncio) => (sku && sku === r.sku) || (anuncio && idsML.has(String(anuncio)))
+      const afetaSh = (sku, item) => (sku && sku === r.sku) || (item && shSemModelo.has(String(item))) || (item && shComModelo.has(String(item)) && (!sku || sku === String(item)))
+      // (A) não importados
+      for (const p of ctx.naoImportados.values()) {
+        if (p.plataforma === 'shopee' && p.fbs) continue
+        const its = p.plataforma === 'shopee' ? p.itens.filter((it) => afetaSh(it.sku, it.item_id)) : p.itens.filter((it) => afetaML(it.sku, it.anuncio))
+        if (its.length) {
+          const un = its.reduce((t, it) => t + (it.qtd || 1), 0)
+          r.pedidos.push({ verificacao: 'A', canal: p.plataforma, conta: p.conta, pedido: p.id || p.sn, status: p.status, unidades: un })
+          bloquear(r.sku, `pedido ${ROTULO_PLAT[p.plataforma]} ${p.id || p.sn} (${p.status || 'status ?'}, ${un} un., ${p.conta}) ainda não importado no TMP10`)
           break
         }
-        await dormir()
+      }
+      if (r.situacao !== 'apto') continue
+      // (B) e (C) com os pedidos do TMP10
+      for (const o of ctx.pedidosTmp || []) {
+        if (o.is_fulfillment === true || o.status === 'cancelado') continue
+        const plat = o.platform === 'shopee' ? 'shopee' : 'mercadolivre'
+        const its = (Array.isArray(o.items) ? o.items : []).map((it) => ({ sku: it && it.sku ? String(it.sku).trim() : null, anuncio: it && it.ml_item_id !== undefined && it.ml_item_id !== null ? String(it.ml_item_id) : null }))
+        const doSku = its.filter((it) => (plat === 'shopee' ? afetaSh(it.sku, it.anuncio) : afetaML(it.sku, it.anuncio)))
+        if (!doSku.length) continue
+        const outro = doSku.find((it) => it.sku && it.sku !== r.sku && (plat === 'mercadolivre' ? idsML.has(it.anuncio) : shSemModelo.has(it.anuncio)))
+        if (outro) { r.pedidos.push({ verificacao: 'B', canal: plat, pedido: o.ml_order_id, sku: outro.sku }); bloquear(r.sku, `venda do anúncio ${outro.anuncio} registrada com outro SKU ("${outro.sku}") — pedido ${o.ml_order_id}: vínculo ou cadastro inconsistente`); break }
+        if (plat === 'mercadolivre') {
+          if (!['finalizado', 'full_ml'].includes(o.status) && [...ctx.ml.values()].some((st) => st.cancelados.has(String(o.ml_order_id)))) {
+            r.pedidos.push({ verificacao: 'C', canal: plat, pedido: o.ml_order_id }); bloquear(r.sku, `pedido ML ${o.ml_order_id} está cancelado/invalidado no ML e ainda aberto no TMP10 (cancelamento não processado)`); break
+          }
+        } else {
+          const st = ctx.statusSh.get(String(o.ml_order_id))
+          if (st && cancSh.has(st)) { r.pedidos.push({ verificacao: 'C', canal: plat, pedido: o.ml_order_id, status: st }); bloquear(r.sku, `pedido Shopee ${o.ml_order_id} está "${st}" na Shopee e ainda aberto no TMP10 (cancelamento não processado)`); break }
+          if (st === undefined) r._shPendentesStatus = (r._shPendentesStatus || []).concat([{ sn: String(o.ml_order_id), conta: o.account_nickname }])
+        }
+        if (doSku.some((it) => it.sku === r.sku) && (!ctx.corte || new Date(o.created_at_ml) >= ctx.corte)) r._refsVenda = (r._refsVenda || []).concat([`venda:${plat}:${o.ml_order_id}:${r.sku}`])
       }
     }
-    for (const r of aptos) if (r.situacao === 'apto') r.pedidos_conferidos_em = agora().toISOString()
   }
 
-  // Anúncios que receberiam o novo número pela fila (todos os vínculos do SKU), com a decisão de AGORA
-  async function previaFila(empresaId, r, cfg) {
+  // completa (C) status Shopee dos pedidos abertos e (B) movimentos de venda — partes que precisam de consulta
+  async function completarPedidos(empresaId, ctx, res) {
+    const aptos = [...res.values()].filter((r) => r.situacao === 'apto')
+    const contas = await todasContas(empresaId)
+    const cancSh = new Set(statusCanceladoShopee())
+    const bloq = (r, motivo) => { if (r.situacao === 'apto') { r.situacao = 'bloqueado'; r.motivo = motivo } }
+    const porLoja = new Map()
+    for (const r of aptos) for (const x of (r._shPendentesStatus || [])) {
+      const conta = contas.find((c) => c.platform === 'shopee' && c.nickname === x.conta)
+      if (!conta) { bloq(r, `loja ${x.conta || '?'} do pedido ${x.sn} não conectada — não dá para conferir cancelamento`); continue }
+      if (!porLoja.has(conta.id)) porLoja.set(conta.id, { conta, sns: new Set() }); porLoja.get(conta.id).sns.add(x.sn)
+    }
+    for (const { conta, sns } of porLoja.values()) {
+      try { for (const lote of pedacos([...sns].filter((s) => !ctx.statusSh.has(s)), 50)) { for (const d of await shopee.detalharPedidos(conta, lote)) ctx.statusSh.set(d.sn, d.status); await dormir() } }
+      catch (e) { for (const r of aptos) if ((r._shPendentesStatus || []).some((x) => sns.has(x.sn))) bloq(r, `não foi possível conferir pedidos da loja ${conta.nickname}: ${e.message}`) }
+    }
+    for (const r of aptos) {
+      const canc = (r._shPendentesStatus || []).find((x) => cancSh.has(ctx.statusSh.get(x.sn)))
+      if (canc) { bloq(r, `pedido Shopee ${canc.sn} está "${ctx.statusSh.get(canc.sn)}" na Shopee e ainda aberto no TMP10 (cancelamento não processado)`); r.pedidos.push({ verificacao: 'C', canal: 'shopee', pedido: canc.sn }) }
+    }
+    const refs = [...new Set(aptos.filter((r) => r.situacao === 'apto').flatMap((r) => r._refsVenda || []))]
+    const movs = new Map()
+    for (const lote of pedacos(refs, 200)) for (const m of (await q(sb.from('estoque_movimentos').select('referencia, aplicado, observacao').eq('empresa_id', empresaId).in('referencia', lote), 'movimentos de venda')) || []) movs.set(m.referencia, m)
+    for (const r of aptos) {
+      if (r.situacao === 'apto') {
+        for (const ref of (r._refsVenda || [])) {
+          const m = movs.get(ref); const ped = ref.split(':')[2]
+          if (!m) { bloq(r, `pedido ${ped} importado mas SEM baixa registrada no TMP10`); r.pedidos.push({ verificacao: 'B', pedido: ped, sem_baixa: true }); break }
+          if (!m.aplicado) r.avisos.push(`pedido ${ped}: venda registrada sem baixa (${m.observacao || 'não aplicada'})`)
+        }
+      }
+      if (r.situacao === 'apto') r.pedidos_conferidos_em = agora().toISOString()
+      delete r._refsVenda; delete r._shPendentesStatus
+    }
+  }
+
+  async function avaliarCompleto(empresaId, skus, refsOrigem, ctx = novoContexto(empresaId)) {
+    const res = await avaliar(empresaId, skus, refsOrigem, ctx)
+    await completarPedidos(empresaId, ctx, res)
+    return res
+  }
+
+  function previaFila(r, cfg) {
     const d = decidirEnvio(cfg, r.sku)
-    return r.anuncios.map((a) => ({ canal: 'mercadolivre', conta: a.conta, anuncio_id: a.anuncio_id, atual: a.quantidade, novo: r.novo,
-      envio: a.full ? 'bloqueado (Full)' : (d.real ? 'real' : 'simulado'), motivo: a.full ? 'Full: estoque fica com o ML' : d.motivo }))
+    return r.anuncios.map((a) => ({ canal: a.plataforma, conta: a.conta, anuncio_id: a.anuncio_id + (a.variacao_id ? '/' + a.variacao_id : ''), atual: a.quantidade, novo: r.novo,
+      envio: a.full ? 'bloqueado (Full/FBS)' : (d.real ? 'real' : 'simulado'), motivo: a.full ? 'estoque fica com a plataforma' : d.motivo }))
   }
-
-  async function registrarEventos(linhas) {
-    for (const lote of pedacos(linhas, 200)) await q(sb.from('estoque_ajuste_massa_eventos').insert(lote), 'auditoria do ajuste em massa')
+  async function registrarEventos(linhas) { for (const lote of pedacos(linhas, 200)) await q(sb.from('estoque_ajuste_massa_eventos').insert(lote), 'auditoria do ajuste em massa') }
+  async function eventosDe(id, modo) {
+    return lerTodos(() => sb.from('estoque_ajuste_massa_eventos').select('id, sku, modo, tentativa, resultado, motivo, numero_lido, estoque_anterior, estoque_novo, anuncio_id, produto_id, movimento_id, detalhe, criado_em')
+      .eq('execucao_id', id).eq('modo', modo).order('id', { ascending: true }), 'eventos')
   }
-  const resumoDe = (itens) => ({ analisados: itens.length, aptos: itens.filter((i) => i.situacao === 'apto').length,
-    iguais: itens.filter((i) => i.situacao === 'igual').length, bloqueados: itens.filter((i) => i.situacao === 'bloqueado').length })
+  const ultimoPorSku = (evs) => { const m = new Map(); for (const e of evs) m.set(e.sku, e); return m }
 
-  // ── SIMULAÇÃO ───────────────────────────────────────────────────────────────────────────────────────────────────────
-  const refsDe = (contaRef, contasRef) => [...new Set((Array.isArray(contasRef) ? contasRef : String(contasRef || contaRef || '').split(','))
-    .map((x) => String(x).trim()).filter(Boolean))]
-  async function validarEntrada(empresaId, contaRef, skus, contasRef) {
+  // ── SIMULAÇÃO (segundo plano, em lotes; retomável) ──────────────────────────────────────────────────────────────
+  async function validarContas(empresaId, contaRef, contasRef) {
     const refs = refsDe(contaRef, contasRef)
-    if (!refs.length) throw erroHttp('Selecione ao menos uma conta do Mercado Livre.', 400)
-    const lista = [...new Set((Array.isArray(skus) ? skus : []).map((s) => String(s).trim()).filter(Boolean))]
-    if (!lista.length) throw erroHttp('Selecione ao menos um SKU.', 400)
-    if (lista.length > LIMITE_SKUS) throw erroHttp(`No máximo ${LIMITE_SKUS} SKUs por vez.`, 400)
-    const todas = await contasML(empresaId)
-    const contas = refs.map((r) => todas.find((c) => contaRefDe(c) === r))
-    if (contas.some((c) => !c)) throw erroHttp('Conta do Mercado Livre não encontrada nesta empresa.', 400)
-    return { lista, contas }
+    if (!refs.length) throw erroHttp('Selecione ao menos uma conta do Mercado Livre ou loja da Shopee.', 400)
+    const todas = await todasContas(empresaId)
+    const contas = refs.map((r) => todas.find((c) => refDe(c) === r))
+    if (contas.some((c) => !c)) throw erroHttp('Conta/loja não encontrada nesta empresa.', 400)
+    return contas
   }
-
-  async function simular({ empresaId, usuarioId, contaRef, contasRef, skus, id = crypto.randomUUID() }) {
-    const { lista, contas: contasSel } = await validarEntrada(empresaId, contaRef, skus, contasRef)
-    const refSel = contasSel.map(contaRefDe).join(','), nomeSel = contasSel.map((c) => c.nickname).join(', ')
-    const job = { tipo: 'simulacao', fase: 'lendo anúncios', processados: 0, total: lista.length, iniciado_em: agora().toISOString(), empresa_id: empresaId }
-    jobs.set(id, job)
-    try {
-      const res = await avaliar(empresaId, lista, contasSel)
-      const cfg = await lerConfig(empresaId)
-      const itens = []
-      for (const sku of lista) {
-        const r = res.get(sku)
-        itens.push({ sku, nome: r.nome || null, produto_id: r.produto_id || null, situacao: r.situacao, motivo: r.motivo, tmp10_antes: r.tmp10 ?? null,
-          numero_lido: r.numero_lido ?? null, novo: r.situacao === 'apto' ? r.novo : null, anuncio_origem: r.anuncio_origem || null,
-          diferenca: r.situacao === 'apto' ? r.novo - Number(r.tmp10) : null, contas_origem: r.contas_origem || [],
-          anuncios: r.anuncios, pedidos: r.pedidos, avisos: [...new Set(r.avisos)], pedidos_conferidos_em: r.pedidos_conferidos_em || null,
-          fila: r.situacao === 'apto' ? await previaFila(empresaId, r, cfg) : [] })
-      }
-      const resumo = { ...resumoDe(itens), modo: cfg.modo, aviso: AVISO_FIXO, limite_quantidade: limiteQuantidade,
-        contas: contasSel.map((c) => ({ conta_ref: contaRefDe(c), nome: c.nickname })) }
-      const expira = new Date(agora().getTime() + VALIDADE_MINUTOS * 60000)
-      await q(sb.from('estoque_ajuste_massa_execucoes').insert({ id, empresa_id: empresaId, usuario_id: usuarioId || null, plataforma: 'mercadolivre',
-        conta_ref: refSel, conta_nome: nomeSel, limite_quantidade: limiteQuantidade, itens, resumo, expira_em: expira.toISOString() }), 'registrar simulação')
-      await registrarEventos(itens.map((i) => ({ execucao_id: id, empresa_id: empresaId, usuario_id: usuarioId || null, modo: 'simulacao', tentativa: 1, sku: i.sku,
-        produto_id: i.produto_id, plataforma: 'mercadolivre', conta_ref: refSel, anuncio_id: i.anuncio_origem, numero_lido: i.numero_lido,
-        estoque_anterior: i.tmp10_antes, estoque_novo: i.novo, resultado: i.situacao === 'apto' ? 'simulado' : i.situacao === 'igual' ? 'igual' : 'bloqueado',
-        motivo: i.motivo, detalhe: { anuncios: i.anuncios, pedidos: i.pedidos, avisos: i.avisos, pedidos_conferidos_em: i.pedidos_conferidos_em } })))
-      Object.assign(job, { fase: 'concluida', processados: lista.length, terminado_em: agora().toISOString() })
-      log(`📋 [ESTOQUE] ajuste em massa: simulação ${id} — ${JSON.stringify(resumo)}`)
-      return { execucao_id: id, resumo, itens, expira_em: expira.toISOString() }
-    } catch (e) {
-      Object.assign(job, { fase: 'erro', erro: e.message, terminado_em: agora().toISOString() })
-      throw e
+  function filtrar(lista, filtro, busca) {
+    const qb = String(busca || '').trim().toLowerCase()
+    return lista.filter((i) => (!qb || i.sku.toLowerCase().includes(qb) || String(i.nome || '').toLowerCase().includes(qb) || i.anuncios.some((a) => String(a.anuncio_id).toLowerCase().includes(qb)))
+      && (!filtro || filtro === 'todos' || (filtro === 'divergencia' ? i.com_divergencia : !i.com_divergencia)))
+  }
+  async function resolverSkus({ empresaId, refs, skus, todos }) {
+    if (todos && typeof todos === 'object') {   // "SELECIONAR TODOS" resolvido no SERVIDOR (mesmo filtro e pesquisa da tela)
+      const l = await itens({ empresaId, contasRef: refs })
+      const ex = new Set((Array.isArray(todos.excluir) ? todos.excluir : []).map(String))
+      return filtrar(l.itens, todos.filtro, todos.busca).filter((i) => i.selecionavel && !ex.has(i.sku)).map((i) => i.sku)
     }
-  }
-  function iniciarSimulacao(args) {   // para a rota: valida já, roda em segundo plano
-    const id = crypto.randomUUID()
-    return validarEntrada(args.empresaId, args.contaRef, args.skus, args.contasRef).then(() => {
-      simular({ ...args, id }).catch((e) => log(`❌ [ESTOQUE] ajuste em massa: simulação ${id}: ${e.message}`))
-      return { execucao_id: id }
-    })
+    return [...new Set((Array.isArray(skus) ? skus : []).map((s) => String(s).trim()).filter(Boolean))]
   }
 
-  // ── EXECUÇÃO / RETOMADA ─────────────────────────────────────────────────────────────────────────────────────────────
+  async function prepararSimulacao({ empresaId, usuarioId, contaRef, contasRef, skus, todos, id = crypto.randomUUID() }) {
+    const contas = await validarContas(empresaId, contaRef, contasRef)
+    const refs = contas.map(refDe)
+    const lista = await resolverSkus({ empresaId, refs, skus, todos })
+    if (!lista.length) throw erroHttp('Selecione ao menos um produto.', 400)
+    if (simulandoEmpresa.has(empresaId)) throw erroHttp('Já existe uma simulação em andamento nesta empresa — aguarde ou acompanhe o progresso.', 409)
+    const cfg = await lerConfig(empresaId)
+    const plats = [...new Set(contas.map((c) => (c.platform === 'shopee' ? 'shopee' : 'mercadolivre')))]
+    const cab = { id, empresa_id: empresaId, usuario_id: usuarioId || null, plataforma: plats.length > 1 ? 'multi' : plats[0], conta_ref: refs.join(','),
+      conta_nome: contas.map((c) => c.nickname).join(', '), limite_quantidade: limiteQuantidade, itens: lista,
+      resumo: { total: lista.length, contas: contas.map((c) => ({ ref: refDe(c), nome: c.nickname, plataforma: c.platform === 'shopee' ? 'shopee' : 'mercadolivre' })), modo_na_simulacao: cfg.modo,
+        aviso: AVISO_FIXO, limite_quantidade: limiteQuantidade, lote: LOTE_SIMULACAO, selecao: todos ? 'todos (resolvido no servidor)' : 'lista' },
+      expira_em: new Date(agora().getTime() + VALIDADE_MAXIMA_HORAS * 3600000).toISOString() }
+    await q(sb.from('estoque_ajuste_massa_execucoes').insert(cab), 'registrar simulação')
+    return cab
+  }
+
+  async function rodarSimulacao(cab, { usuarioId } = {}) {
+    const empresaId = cab.empresa_id
+    if (simulandoEmpresa.has(empresaId)) throw erroHttp('Já existe uma simulação em andamento nesta empresa.', 409)
+    simulandoEmpresa.add(empresaId)
+    const job = { tipo: 'simulacao', fase: 'simulando', total: cab.itens.length, processados: 0, simulado: 0, igual: 0, bloqueado: 0, falha: 0, iniciado_em: agora().toISOString(), empresa_id: empresaId }
+    jobs.set(cab.id, job)
+    try {
+      const ja = ultimoPorSku(await eventosDe(cab.id, 'simulacao'))
+      const pendentes = cab.itens.filter((s) => !ja.has(s) || ja.get(s).resultado === 'falha')
+      for (const e of ja.values()) if (e.resultado !== 'falha') { job[e.resultado]++; job.processados++ }
+      const refs = cab.conta_ref.split(',')
+      const ctx = novoContexto(empresaId)
+      const tentativa = 1 + (ja.size ? Math.max(...[...ja.values()].map((e) => e.tentativa || 1)) : 0)
+      const cfg = await lerConfig(empresaId)
+      for (const lote of pedacos(pendentes, LOTE_SIMULACAO)) {
+        let linhas
+        try {
+          const res = await avaliarCompleto(empresaId, lote, refs, ctx)
+          linhas = lote.map((sku) => {
+            const r = res.get(sku)
+            const resultado = r.situacao === 'apto' ? 'simulado' : r.situacao === 'igual' ? 'igual' : 'bloqueado'
+            return { execucao_id: cab.id, empresa_id: empresaId, usuario_id: usuarioId || cab.usuario_id || null, modo: 'simulacao', tentativa, sku, produto_id: r.produto_id || null,
+              plataforma: r.anuncio_origem ? r.anuncio_origem.split(':')[0] : null, conta_ref: cab.conta_ref, anuncio_id: r.anuncio_origem || null, numero_lido: r.numero_lido ?? null,
+              estoque_anterior: r.tmp10 ?? null, estoque_novo: r.situacao === 'apto' ? r.novo : null, resultado, motivo: r.motivo,
+              detalhe: { nome: r.nome || null, anuncios: r.anuncios, contas_origem: r.contas_origem || [], pedidos: r.pedidos, avisos: [...new Set(r.avisos)],
+                pedidos_conferidos_em: r.pedidos_conferidos_em || null, diferenca: r.situacao === 'apto' ? r.novo - Number(r.tmp10) : null, fila: r.situacao === 'apto' ? previaFila(r, cfg) : [] } }
+          })
+        } catch (e) {   // falha do lote: registra e segue; "Retomar" refaz só estes
+          log(`⚠️ [ESTOQUE] ajuste em massa ${cab.id}: lote falhou (${e.message})`)
+          linhas = lote.map((sku) => ({ execucao_id: cab.id, empresa_id: empresaId, usuario_id: usuarioId || cab.usuario_id || null, modo: 'simulacao', tentativa, sku, resultado: 'falha', motivo: `falha ao simular: ${e.message}` }))
+        }
+        await registrarEventos(linhas)
+        for (const l of linhas) job[l.resultado]++
+        job.processados += lote.length
+      }
+      job.fase = 'concluida'
+      log(`📋 [ESTOQUE] ajuste em massa: simulação ${cab.id} — ${JSON.stringify({ total: job.total, elegiveis: job.simulado, iguais: job.igual, bloqueados: job.bloqueado, falhas: job.falha })}`)
+      return job
+    } catch (e) { Object.assign(job, { fase: 'erro', erro: e.message }); throw e }
+    finally { job.terminado_em = agora().toISOString(); simulandoEmpresa.delete(empresaId) }
+  }
+
+  async function simular(args) {   // uso direto/testes: simula e devolve o resultado completo
+    const cab = await prepararSimulacao(args)
+    await rodarSimulacao(cab, args)
+    const st = await status(args.empresaId, cab.id)
+    const pag = await itensDaExecucao(args.empresaId, cab.id, { porPagina: 100000 })
+    return { execucao_id: cab.id, resumo: st.simulacao, itens: pag.itens, expira_em: st.expira_em }
+  }
+  async function iniciarSimulacao(args) {
+    const cab = await prepararSimulacao(args)
+    rodarSimulacao(cab, args).catch((e) => log(`❌ [ESTOQUE] ajuste em massa: simulação ${cab.id}: ${e.message}`))
+    return { execucao_id: cab.id, total: cab.itens.length }
+  }
+  async function retomarSimulacao({ empresaId, usuarioId, execucaoId, aguardar = false }) {
+    const cab = await carregarExecucao(empresaId, execucaoId)
+    if (simulandoEmpresa.has(empresaId)) throw erroHttp('Já existe uma simulação em andamento nesta empresa.', 409)
+    const p = rodarSimulacao(cab, { usuarioId })
+    if (aguardar) { await p; return { execucao_id: cab.id } }
+    p.catch((e) => log(`❌ [ESTOQUE] ajuste em massa: retomada da simulação ${cab.id}: ${e.message}`))
+    return { execucao_id: cab.id }
+  }
+
+  // ── EXECUÇÃO / RETOMADA (lotes; trava por empresa; idempotente) ────────────────────────────────────────────────────
   async function carregarExecucao(empresaId, id) {
     if (!ehUuid(id)) throw erroHttp('Informe a simulação (execucao_id).', 400)
     const ex = await q(sb.from('estoque_ajuste_massa_execucoes').select('*').eq('id', id).eq('empresa_id', empresaId).maybeSingle(), 'simulação')
     if (!ex) throw erroHttp('Simulação não encontrada.', 404)
+    if (!Array.isArray(ex.itens) || ex.itens.some((x) => typeof x !== 'string')) throw erroHttp('Simulação em formato antigo — simule de novo.', 409)
     return ex
   }
   const referenciaDe = (id, sku) => `massa:${id}:${sku}`
-  async function movimentosDaExecucao(empresaId, id, skus) {
-    const m = new Map()
-    for (const lote of pedacos(skus.map((s) => referenciaDe(id, s)), 200)) {
-      const ms = await q(sb.from('estoque_movimentos').select('id, referencia, aplicado, estoque_anterior, estoque_novo, criado_em').eq('empresa_id', empresaId).in('referencia', lote), 'movimentos da execução')
-      for (const x of (ms || [])) m.set(x.referencia, x)
-    }
-    return m
+  async function movimentosDaExecucao(empresaId, id) {
+    const ms = await lerTodos(() => sb.from('estoque_movimentos').select('id, referencia, aplicado, estoque_anterior, estoque_novo, criado_em').eq('empresa_id', empresaId).like('referencia', `massa:${id}:%`), 'movimentos da execução')
+    return new Map(ms.map((m) => [m.referencia, m]))
   }
-
-  // valida e TRAVA (no banco) antes de qualquer alteração; erro aqui não altera nada
   async function preparar({ empresaId, execucaoId }) {
     const ex = await carregarExecucao(empresaId, execucaoId)
-    if (new Date(ex.expira_em) < agora()) throw erroHttp('A simulação venceu (60 minutos). Simule de novo.', 409)
+    const job = jobs.get(ex.id)
+    if (job && job.tipo === 'simulacao' && job.fase === 'simulando') throw erroHttp('A simulação ainda está rodando.', 409)
+    const sim = ultimoPorSku(await eventosDe(ex.id, 'simulacao'))
+    const faltam = ex.itens.filter((s) => !sim.has(s)).length
+    if (faltam) throw erroHttp(`A simulação não terminou (${faltam} de ${ex.itens.length} produtos sem resultado) — retome a simulação antes de confirmar.`, 409)
+    const fim = Math.max(...[...sim.values()].map((e) => new Date(e.criado_em).getTime()))
+    if (new Date(ex.expira_em) < agora() || fim + VALIDADE_MINUTOS * 60000 < agora().getTime()) throw erroHttp('A simulação venceu (60 minutos depois de terminar). Simule de novo.', 409)
     if (executandoEmpresa.has(empresaId)) throw erroHttp('Já existe um ajuste em massa em andamento nesta empresa.', 409)
     if (!(await rpc('estoque_ajuste_massa_travar', { p_empresa: empresaId, p_execucao: ex.id, p_dono: dono, p_segundos: TRAVA_SEGUNDOS }))) throw erroHttp('Já existe um ajuste em massa em andamento nesta empresa.', 409)
     executandoEmpresa.add(empresaId)
-    return ex
+    return { ex, sim }
   }
-  async function executar(args) { return rodar(await preparar(args), args) }
-  async function iniciarExecucao(args) {   // para a rota: valida e trava já; executa em segundo plano
-    const ex = await preparar(args)
-    rodar(ex, args).catch((e) => log(`❌ [ESTOQUE] ajuste em massa ${ex.id}: ${e.message}`))
-    return { execucao_id: ex.id }
+  async function executar(args) { const p = await preparar(args); return rodar(p, args) }
+  async function iniciarExecucao(args) {
+    const p = await preparar(args)
+    rodar(p, args).catch((e) => log(`❌ [ESTOQUE] ajuste em massa ${p.ex.id}: ${e.message}`))
+    return { execucao_id: p.ex.id }
   }
 
-  async function rodar(ex, { empresaId, usuarioId }) {
-    const aptos = (ex.itens || []).filter((i) => i.situacao === 'apto')
-    const job = { tipo: 'execucao', fase: 'executando', processados: 0, total: aptos.length, iniciado_em: agora().toISOString(), empresa_id: empresaId }
+  async function rodar({ ex, sim }, { empresaId, usuarioId }) {
+    const aptos = [...sim.values()].filter((e) => e.resultado === 'simulado').map((e) => ({ sku: e.sku, produto_id: e.produto_id, tmp10_antes: e.estoque_anterior, novo: e.estoque_novo,
+      numero_lido: e.numero_lido, anuncio_origem: e.anuncio_id, contas_origem: (e.detalhe && e.detalhe.contas_origem) || [] }))
+    const job = { tipo: 'execucao', fase: 'executando', total: aptos.length, processados: 0, aplicado: 0, ja_aplicado: 0, bloqueado: 0, igual: 0, falha: 0, iniciado_em: agora().toISOString(), empresa_id: empresaId }
     jobs.set(ex.id, job)
-    const refsEx = String(ex.conta_ref || '').split(',').filter(Boolean)
-    const todasContas = await contasML(empresaId)
-    const contasEx = refsEx.map((r) => todasContas.find((c) => contaRefDe(c) === r))
-    const contaOrigem = contasEx.every(Boolean) && contasEx.length ? contasEx : null
     const resultado = []
     try {
-      const anteriores = await q(sb.from('estoque_ajuste_massa_eventos').select('sku, resultado, tentativa').eq('execucao_id', ex.id).eq('modo', 'execucao'), 'eventos anteriores')
-      const tentativa = 1 + Math.max(0, ...((anteriores || []).map((e) => e.tentativa)))
-      const jaEvento = new Set((anteriores || []).filter((e) => ['aplicado', 'ja_aplicado'].includes(e.resultado)).map((e) => e.sku))
-      const movs = await movimentosDaExecucao(empresaId, ex.id, aptos.map((i) => i.sku))
-      const evento = (i, resultadoItem, motivo, extra = {}) => ({ execucao_id: ex.id, empresa_id: empresaId, usuario_id: usuarioId || null, modo: 'execucao', tentativa,
-        sku: i.sku, produto_id: i.produto_id, plataforma: 'mercadolivre', conta_ref: ex.conta_ref, anuncio_id: i.anuncio_origem, numero_lido: extra.numero_lido ?? null,
-        estoque_anterior: extra.anterior ?? i.tmp10_antes, estoque_novo: extra.novo ?? i.novo, resultado: resultadoItem, motivo, detalhe: extra.detalhe || null, movimento_id: extra.movimento_id || null })
-      // já aplicados (movimento existe): não reaplica; se faltou o evento (interrupção), registra ja_aplicado
+      const anteriores = await eventosDe(ex.id, 'execucao')
+      const tentativa = 1 + (anteriores.length ? Math.max(...anteriores.map((e) => e.tentativa || 1)) : 0)
+      const jaEvento = new Set(anteriores.filter((e) => ['aplicado', 'ja_aplicado'].includes(e.resultado)).map((e) => e.sku))
+      const movs = await movimentosDaExecucao(empresaId, ex.id)
+      const evento = (i, res, motivo, extra = {}) => ({ execucao_id: ex.id, empresa_id: empresaId, usuario_id: usuarioId || null, modo: 'execucao', tentativa,
+        sku: i.sku, produto_id: i.produto_id, plataforma: i.anuncio_origem ? i.anuncio_origem.split(':')[0] : null, conta_ref: ex.conta_ref, anuncio_id: i.anuncio_origem, numero_lido: extra.numero_lido ?? null,
+        estoque_anterior: extra.anterior ?? i.tmp10_antes, estoque_novo: extra.novo ?? i.novo, resultado: res, motivo, detalhe: extra.detalhe || null, movimento_id: extra.movimento_id || null })
       const pendentes = []
+      const evIniciais = []
       for (const i of aptos) {
         const m = movs.get(referenciaDe(ex.id, i.sku))
-        if (m && m.aplicado) {
-          if (!jaEvento.has(i.sku)) { const ev = evento(i, 'ja_aplicado', 'movimento já existia (retomada após interrupção)', { movimento_id: m.id, anterior: m.estoque_anterior, novo: m.estoque_novo }); await registrarEventos([ev]); resultado.push(ev) }
-          job.processados++
-        } else pendentes.push(i)
+        if (m && m.aplicado) { if (!jaEvento.has(i.sku)) { evIniciais.push(evento(i, 'ja_aplicado', 'movimento já existia (retomada após interrupção)', { movimento_id: m.id, anterior: m.estoque_anterior, novo: m.estoque_novo })); job.ja_aplicado++ } job.processados++ }
+        else pendentes.push(i)
       }
-      if (!contaOrigem) {
-        const evs = pendentes.map((i) => evento(i, 'bloqueado', 'uma das contas da simulação não está mais conectada nesta empresa — simule de novo'))
-        await registrarEventos(evs); resultado.push(...evs); job.processados += pendentes.length
+      if (evIniciais.length) { await registrarEventos(evIniciais); resultado.push(...evIniciais) }
+      const todas = await todasContas(empresaId)
+      const refs = ex.conta_ref.split(',')
+      if (refs.some((r) => !todas.find((c) => refDe(c) === r))) {
+        const evs = pendentes.map((i) => evento(i, 'bloqueado', 'uma das contas/lojas da simulação não está mais conectada nesta empresa — simule de novo'))
+        await registrarEventos(evs); resultado.push(...evs); job.processados += pendentes.length; job.bloqueado += pendentes.length
       } else {
-        for (const lote of pedacos(pendentes, 20)) {
+        const ctx = novoContexto(empresaId)
+        for (const lote of pedacos(pendentes, LOTE_EXECUCAO)) {
+          const evs = []
           let aval
-          try { aval = await avaliar(empresaId, lote.map((i) => i.sku), contaOrigem) } catch (e) {
-            const evs = lote.map((i) => evento(i, 'falha', `falha ao revalidar: ${e.message}`)); await registrarEventos(evs); resultado.push(...evs); job.processados += lote.length; continue
+          try { aval = await avaliarCompleto(empresaId, lote.map((i) => i.sku), refs, ctx) } catch (e) {
+            for (const i of lote) evs.push(evento(i, 'falha', `falha ao revalidar: ${e.message}`))
           }
-          for (const i of lote) {
+          if (aval) for (const i of lote) {
             const r = aval.get(i.sku)
             let ev
             try {
               if (r.situacao !== 'apto') ev = evento(i, r.situacao === 'igual' ? 'igual' : 'bloqueado', `revalidação: ${r.motivo}`, { numero_lido: r.numero_lido ?? null, detalhe: { anuncios: r.anuncios, pedidos: r.pedidos } })
-              else if (r.numero_lido !== i.novo) ev = evento(i, 'bloqueado', `o número do anúncio mudou de ${i.novo} para ${r.numero_lido} desde a simulação — simule de novo`, { numero_lido: r.numero_lido })
+              else if (r.numero_lido !== i.novo) ev = evento(i, 'bloqueado', `o número dos anúncios mudou de ${i.novo} para ${r.numero_lido} desde a simulação — simule de novo`, { numero_lido: r.numero_lido })
               else {
                 const mov = await movimentar({ empresaId, sku: i.sku, tipo: 'definir', quantidade: i.novo, origem: 'ajuste_massa',
-                  motivo: `Ajuste em massa: número do Mercado Livre (conta ${(i.contas_origem && i.contas_origem.length ? i.contas_origem.join(', ') : ex.conta_nome)}, anúncio ${i.anuncio_origem}) — execução ${ex.id}`,
+                  motivo: `Ajuste em massa: número dos marketplaces (${(i.contas_origem && i.contas_origem.length ? i.contas_origem.join(', ') : ex.conta_nome)}, anúncio ${i.anuncio_origem}) — execução ${ex.id}`,
                   referencia: referenciaDe(ex.id, i.sku), usuarioId, processo: 'erp', esperado: i.tmp10_antes })
                 if (mov && mov.aplicado && mov.duplicado) ev = evento(i, 'ja_aplicado', 'movimento já existia', { movimento_id: mov.movimento_id, anterior: mov.anterior, novo: mov.novo, numero_lido: r.numero_lido })
                 else if (mov && mov.aplicado) {
                   ev = evento(i, 'aplicado', null, { movimento_id: mov.movimento_id, anterior: mov.anterior, novo: mov.novo, numero_lido: r.numero_lido })
-                  try {   // o anúncio agora mostra o mesmo número do TMP10: as divergências abertas dos anúncios do SKU se resolvem
+                  try {
                     await q(sb.from('estoque_divergencias').update({ resolvido: true, resolucao: 'ajuste_massa', resolvido_em: agora().toISOString(), resolvido_por: usuarioId || null })
-                      .eq('empresa_id', empresaId).eq('sku', i.sku).eq('plataforma', 'mercadolivre').not('chave', 'is', null).not('resolvido', 'is', true), 'resolver divergências')
+                      .eq('empresa_id', empresaId).eq('sku', i.sku).not('chave', 'is', null).not('resolvido', 'is', true), 'resolver divergências')
                   } catch (e) { log(`[ESTOQUE] ajuste em massa: não resolveu divergências de ${i.sku}: ${e.message}`) }
                 } else if (mov && mov.erro === 'estoque_mudou') ev = evento(i, 'bloqueado', `o estoque do TMP10 mudou para ${mov.anterior} desde a simulação — simule de novo`, { anterior: mov.anterior, novo: null })
                 else ev = evento(i, 'falha', `não aplicado: ${(mov && mov.erro) || 'erro'}`)
               }
             } catch (e) { ev = evento(i, 'falha', e.message) }
-            await registrarEventos([ev]); resultado.push(ev); job.processados++
+            evs.push(ev)
           }
+          await registrarEventos(evs); resultado.push(...evs)
+          for (const e of evs) job[e.resultado]++
+          job.processados += lote.length
           if (!(await rpc('estoque_ajuste_massa_renovar', { p_empresa: empresaId, p_execucao: ex.id, p_dono: dono, p_segundos: TRAVA_SEGUNDOS }))) {
             log(`⚠️ [ESTOQUE] ajuste em massa ${ex.id}: trava perdida — interrompido; use "Retomar pendentes"`); job.erro = 'trava perdida — retome os pendentes'; break
           }
         }
       }
       job.fase = 'concluida'
-      log(`✅ [ESTOQUE] ajuste em massa ${ex.id}: ${resultado.length} item(ns) processados`)
+      log(`✅ [ESTOQUE] ajuste em massa ${ex.id}: ${job.aplicado} aplicado(s), ${job.bloqueado} bloqueado(s), ${job.falha} falha(s)`)
       return { execucao_id: ex.id, tentativa, resultados: resultado }
-    } catch (e) {
-      Object.assign(job, { fase: 'erro', erro: e.message })
-      throw e
-    } finally {
+    } catch (e) { Object.assign(job, { fase: 'erro', erro: e.message }); throw e }
+    finally {
       job.terminado_em = agora().toISOString()
       executandoEmpresa.delete(empresaId)
       try { await rpc('estoque_ajuste_massa_liberar', { p_empresa: empresaId, p_execucao: ex.id, p_dono: dono }) } catch (e) { log(`[ESTOQUE] ajuste em massa: trava não liberada (${e.message}) — expira em ${TRAVA_SEGUNDOS}s`) }
     }
   }
-  // ── Situação de uma simulação/execução: aplicado (movimento existe) / bloqueado / falha / pendente ──────────────────────
+
+  // ── Situação: contagens (banco = fonte da verdade) + andamento em memória ─────────────────────────────────────────
+  async function situacaoPorSku(empresaId, ex) {
+    return { sim: ultimoPorSku(await eventosDe(ex.id, 'simulacao')), exe: ultimoPorSku(await eventosDe(ex.id, 'execucao')), movs: await movimentosDaExecucao(empresaId, ex.id) }
+  }
+  function situacaoExecucao(sku, simEv, exeEv, movs, id) {
+    if (!simEv || simEv.resultado !== 'simulado') return null
+    const m = movs.get(referenciaDe(id, sku))
+    if (m && m.aplicado) return { situacao: 'aplicado', anterior: m.estoque_anterior, novo: m.estoque_novo, em: m.criado_em }
+    if (exeEv && exeEv.resultado === 'bloqueado') return { situacao: 'bloqueado', motivo: exeEv.motivo }
+    if (exeEv && exeEv.resultado === 'igual') return { situacao: 'igual', motivo: exeEv.motivo }
+    if (exeEv && exeEv.resultado === 'falha') return { situacao: 'pendente', motivo: `falhou: ${exeEv.motivo}` }
+    return { situacao: 'pendente', motivo: null }
+  }
   async function status(empresaId, id) {
     if (!ehUuid(id)) throw erroHttp('Informe a simulação.', 400)
+    const ex = await q(sb.from('estoque_ajuste_massa_execucoes').select('id, empresa_id, conta_ref, conta_nome, plataforma, itens, resumo, criado_em, expira_em').eq('id', id).eq('empresa_id', empresaId).maybeSingle(), 'simulação')
+    if (!ex) throw erroHttp('Simulação não encontrada.', 404)
     const job = jobs.get(id)
-    const ex = await q(sb.from('estoque_ajuste_massa_execucoes').select('*').eq('id', id).eq('empresa_id', empresaId).maybeSingle(), 'simulação')
-    if (!ex) {
-      if (job && job.empresa_id === empresaId) return { execucao_id: id, andamento: { ...job, empresa_id: undefined } }
-      throw erroHttp('Simulação não encontrada.', 404)
+    // foto do andamento ANTES de ler os eventos: se o lote final gravar entre a leitura e a resposta, ainda aparece
+    // "em andamento" (a próxima consulta mostra "concluída") — nunca "interrompida" por engano
+    const rodando = !!(job && job.tipo === 'simulacao' && job.fase === 'simulando')
+    const execRodando = !!(job && job.tipo === 'execucao' && job.fase === 'executando')
+    const { sim, exe, movs } = await situacaoPorSku(empresaId, ex)
+    const total = (ex.itens || []).length
+    const c = { simulado: 0, igual: 0, bloqueado: 0, falha: 0 }
+    for (const e of sim.values()) c[e.resultado]++
+    const fim = sim.size ? Math.max(...[...sim.values()].map((e) => new Date(e.criado_em).getTime())) : null
+    const estado = rodando ? 'em_andamento' : (sim.size < total || c.falha > 0) ? 'interrompida' : 'concluida'
+    const vencida = new Date(ex.expira_em) < agora() || (estado === 'concluida' && fim + VALIDADE_MINUTOS * 60000 < agora().getTime())
+    const e = { aplicados: 0, bloqueados: 0, iguais: 0, pendentes: 0 }
+    for (const [sku, ev] of sim) {
+      const s = situacaoExecucao(sku, ev, exe.get(sku), movs, id)
+      if (!s) continue
+      if (s.situacao === 'aplicado') e.aplicados++; else if (s.situacao === 'bloqueado') e.bloqueados++; else if (s.situacao === 'igual') e.iguais++; else e.pendentes++
     }
-    const eventos = await q(sb.from('estoque_ajuste_massa_eventos').select('sku, modo, tentativa, resultado, motivo, numero_lido, estoque_anterior, estoque_novo, movimento_id, criado_em').eq('execucao_id', id).order('id', { ascending: true }), 'eventos')
-    const movs = await movimentosDaExecucao(empresaId, id, (ex.itens || []).map((i) => i.sku))
-    const itens = (ex.itens || []).map((i) => {
-      const evs = (eventos || []).filter((e) => e.sku === i.sku && e.modo === 'execucao')
-      const ult = evs[evs.length - 1]
-      const m = movs.get(referenciaDe(id, i.sku))
-      const execucao = i.situacao !== 'apto' ? null
-        : m && m.aplicado ? { situacao: 'aplicado', anterior: m.estoque_anterior, novo: m.estoque_novo, em: m.criado_em }
-        : ult && ult.resultado === 'bloqueado' ? { situacao: 'bloqueado', motivo: ult.motivo }
-        : ult && ult.resultado === 'igual' ? { situacao: 'igual', motivo: ult.motivo }
-        : ult && ult.resultado === 'falha' ? { situacao: 'pendente', motivo: `falhou: ${ult.motivo}` }
-        : { situacao: 'pendente', motivo: null }
-      return { ...i, execucao }
-    })
-    const exec = itens.filter((i) => i.execucao)
-    return { execucao_id: id, conta_ref: ex.conta_ref, conta_nome: ex.conta_nome, criado_em: ex.criado_em, expira_em: ex.expira_em, vencida: new Date(ex.expira_em) < agora(),
-      resumo: ex.resumo, itens, andamento: job ? { ...job, empresa_id: undefined } : null,
-      execucao_resumo: { aplicados: exec.filter((i) => i.execucao.situacao === 'aplicado').length, bloqueados: exec.filter((i) => i.execucao.situacao === 'bloqueado').length,
-        iguais: exec.filter((i) => i.execucao.situacao === 'igual').length, pendentes: exec.filter((i) => i.execucao.situacao === 'pendente').length } }
+    return { execucao_id: id, contas: (ex.resumo && ex.resumo.contas) || [], conta_nome: ex.conta_nome, plataforma: ex.plataforma, criado_em: ex.criado_em,
+      expira_em: fim ? new Date(Math.min(new Date(ex.expira_em).getTime(), fim + VALIDADE_MINUTOS * 60000)).toISOString() : ex.expira_em, vencida,
+      simulacao: { estado, total, processados: sim.size, faltam: total - sim.size, elegiveis: c.simulado, iguais: c.igual, bloqueados: c.bloqueado, falhas: c.falha,
+        modo: ex.resumo && ex.resumo.modo_na_simulacao, aviso: AVISO_FIXO, limite_quantidade: ex.resumo && ex.resumo.limite_quantidade, contas: (ex.resumo && ex.resumo.contas) || [] },
+      execucao: (exe.size > 0 || movs.size > 0 || execRodando) ? { estado: execRodando ? 'em_andamento' : 'concluida', ...e, total: c.simulado } : null,
+      andamento: job ? { ...job, empresa_id: undefined } : null }
   }
 
-  // ── Lista para a tela (só banco; NÃO é usada para decidir nada) ────────────────────────────────────────────────────────
+  // Relatório paginado (por SKU): resultado da simulação + situação da execução
+  async function itensDaExecucao(empresaId, id, { pagina = 1, porPagina = 100, situacao = 'todos' } = {}) {
+    if (!ehUuid(id)) throw erroHttp('Informe a simulação.', 400)
+    const ex = await q(sb.from('estoque_ajuste_massa_execucoes').select('id, itens').eq('id', id).eq('empresa_id', empresaId).maybeSingle(), 'simulação')
+    if (!ex) throw erroHttp('Simulação não encontrada.', 404)
+    const { sim, exe, movs } = await situacaoPorSku(empresaId, ex)
+    const MAPA = { simulado: 'apto', igual: 'igual', bloqueado: 'bloqueado', falha: 'falha' }
+    let lista = (ex.itens || []).map((sku) => {
+      const ev = sim.get(sku)
+      if (!ev) return { sku, situacao: 'nao_processado', motivo: 'ainda não simulado', anuncios: [] }
+      const d = ev.detalhe || {}
+      return { sku, nome: d.nome || null, situacao: MAPA[ev.resultado], motivo: ev.motivo, tmp10_antes: ev.estoque_anterior, numero_lido: ev.numero_lido, novo: ev.estoque_novo,
+        diferenca: d.diferenca ?? null, contas_origem: d.contas_origem || [], anuncio_origem: ev.anuncio_id, anuncios: d.anuncios || [], pedidos: d.pedidos || [], avisos: d.avisos || [],
+        fila: d.fila || [], execucao: situacaoExecucao(sku, ev, exe.get(sku), movs, id) }
+    })
+    if (situacao && situacao !== 'todos') lista = lista.filter((i) => i.situacao === situacao || (i.execucao && i.execucao.situacao === situacao))
+    const pp = Math.max(1, Math.min(Number(porPagina) || 100, 100000)); const pg = Math.max(1, Number(pagina) || 1)
+    return { total: lista.length, pagina: pg, por_pagina: pp, paginas: Math.max(1, Math.ceil(lista.length / pp)), itens: lista.slice((pg - 1) * pp, pg * pp) }
+  }
+
+  // ── Lista para a tela (só banco; NÃO decide nada) — UMA linha por SKU, com todos os anúncios das duas plataformas ──
   async function itens({ empresaId, contaRef, contasRef }) {
-    const contas = await contasML(empresaId)
-    const resposta = { contas: contas.map((c) => ({ conta_ref: contaRefDe(c), nome: c.nickname })), contas_selecionadas: [], itens: [], limite_skus: LIMITE_SKUS, limite_quantidade: limiteQuantidade }
-    // vendas sem baixa (30 dias): anúncios que vendem sem produto no TMP10 — resolver vínculos ANTES de importar números
+    const contas = await todasContas(empresaId)
+    const resposta = { contas: contas.map((c) => ({ conta_ref: refDe(c), nome: c.nickname, plataforma: c.platform === 'shopee' ? 'shopee' : 'mercadolivre' })),
+      contas_selecionadas: [], itens: [], limite_quantidade: limiteQuantidade }
     const desde = new Date(agora().getTime() - JANELA_DIAS * 86400000).toISOString()
     const semBaixa = await q(sb.from('estoque_movimentos').select('sku, referencia, criado_em').eq('empresa_id', empresaId).in('origem', ['venda_mercadolivre', 'venda_shopee'])
       .eq('aplicado', false).gte('criado_em', desde).order('criado_em', { ascending: false }).limit(500), 'vendas sem baixa')
@@ -473,31 +661,29 @@ function criarAjusteMassa({ sb, ml, q, rpc, movimentar, lerConfig, decidirEnvio,
     for (const m of (semBaixa || [])) { const x = porSku.get(m.sku) || { sku: m.sku, pedidos: 0, ultima: m.criado_em, canal: String(m.referencia || '').split(':')[1] || null }; x.pedidos++; porSku.set(m.sku, x) }
     resposta.vendas_sem_baixa = [...porSku.values()]
     const refs = new Set(refsDe(contaRef, contasRef))
-    const sel = contas.filter((c) => refs.has(contaRefDe(c)))
-    resposta.contas_selecionadas = sel.map((c) => ({ conta_ref: contaRefDe(c), nome: c.nickname }))
-    if (!sel.length) return resposta
-    const links = await lerTodos(() => sb.from('product_ml_links').select('sku, ml_item_id, ml_user_id, account_nickname, quantity').eq('empresa_id', empresaId), 'vínculos ML')
-    const contaDe = (l) => contaDoLink(contas, l)
-    const doSel = links.filter((l) => { const c = l.ml_item_id ? contaDe(l) : null; return c && refs.has(contaRefDe(c)) })
-    const skus = [...new Set(doSel.map((l) => l.sku))]
+    const sel = contas.filter((c) => refs.has(refDe(c)))
+    resposta.contas_selecionadas = sel.map((c) => ({ conta_ref: refDe(c), nome: c.nickname }))
+    if (!sel.length) { resposta.total = 0; resposta.selecionaveis = 0; return resposta }
+    const linksML = await lerTodos(() => sb.from('product_ml_links').select('sku, ml_item_id, ml_user_id, account_nickname').eq('empresa_id', empresaId), 'vínculos ML')
+    const linksSh = await lerTodos(() => sb.from('product_shopee_links').select('sku, shop_id, item_id, model_id').eq('empresa_id', empresaId), 'vínculos Shopee')
+    const anuncios = new Map()
+    const add = (sku, a) => { if (!anuncios.has(sku)) anuncios.set(sku, []); anuncios.get(sku).push(a) }
+    for (const l of linksML) if (l.ml_item_id) { const c = contaDoLink(contas, l); add(l.sku, { plataforma: 'mercadolivre', anuncio_id: String(l.ml_item_id), conta: c ? c.nickname : l.account_nickname, conta_ref: c ? refDe(c) : null }) }
+    for (const l of linksSh) { const c = lojaDoLink(contas, l); add(l.sku, { plataforma: 'shopee', anuncio_id: String(l.item_id) + (l.model_id ? '/' + l.model_id : ''), conta: c ? c.nickname : `loja ${l.shop_id}`, conta_ref: c ? refDe(c) : null }) }
+    const skus = [...anuncios.keys()].filter((sku) => anuncios.get(sku).some((a) => a.conta_ref && refs.has(a.conta_ref))).sort()
     const prods = new Map()
     for (const lote of pedacos(skus, 300)) for (const p of (await q(sb.from('products').select('sku, name, estoque_atual').eq('empresa_id', empresaId).in('sku', lote), 'produtos')) || []) prods.set(p.sku, prods.has(p.sku) ? { ...p, duplicado: true } : p)
-    const div = await lerTodos(() => sb.from('estoque_divergencias').select('sku, anuncio_id, estoque_ml, atualizado_em').eq('empresa_id', empresaId).eq('plataforma', 'mercadolivre').not('chave', 'is', null).not('resolvido', 'is', true), 'divergências')
-    const divPor = new Map(div.map((d) => [`${d.sku}|${d.anuncio_id}`, d]))
-    const linksPor = new Map()
-    for (const l of links) if (l.ml_item_id) { if (!linksPor.has(l.sku)) linksPor.set(l.sku, []); linksPor.get(l.sku).push(l) }
-    // UMA linha por SKU (não por anúncio), com TODOS os anúncios e contas — nada é somado
-    resposta.itens = skus.sort().map((sku) => {
+    const div = await lerTodos(() => sb.from('estoque_divergencias').select('sku, plataforma, anuncio_id, variacao_id, estoque_ml, atualizado_em').eq('empresa_id', empresaId).not('chave', 'is', null).not('resolvido', 'is', true), 'divergências')
+    const divPor = new Map(div.map((d) => [`${d.sku}|${d.anuncio_id}${d.variacao_id ? '/' + d.variacao_id : ''}`, d]))
+    resposta.itens = skus.map((sku) => {
       const p = prods.get(sku)
-      const anuncios = (linksPor.get(sku) || []).map((l) => {
-        const d = divPor.get(`${sku}|${String(l.ml_item_id)}`); const c = contaDe(l)
-        return { anuncio_id: String(l.ml_item_id), conta: c ? c.nickname : l.account_nickname, conta_ref: c ? contaRefDe(c) : null, na_selecao: !!(c && refs.has(contaRefDe(c))),
-          ultima_leitura: d ? d.estoque_ml : null, lida_em: d ? d.atualizado_em : null }
-      })
+      const as = anuncios.get(sku).map((a) => { const d = divPor.get(`${sku}|${a.anuncio_id}`); return { ...a, na_selecao: !!(a.conta_ref && refs.has(a.conta_ref)), ultima_leitura: d ? d.estoque_ml : null, lida_em: d ? d.atualizado_em : null } })
       const motivo_lista = !p ? 'produto não cadastrado no TMP10' : p.duplicado ? 'SKU duplicado no cadastro' : (p.estoque_atual === null || p.estoque_atual === undefined) ? 'produto sem estoque oficial' : null
-      return { sku, nome: p ? p.name : null, tmp10: p ? p.estoque_atual : null, anuncios, contas: [...new Set(anuncios.filter((a) => a.na_selecao).map((a) => a.conta))],
-        com_divergencia: anuncios.some((a) => a.ultima_leitura !== null), selecionavel: !motivo_lista, motivo_lista }
+      return { sku, nome: p ? p.name : null, tmp10: p ? p.estoque_atual : null, anuncios: as, contas: [...new Set(as.filter((a) => a.na_selecao).map((a) => a.conta))],
+        com_divergencia: as.some((a) => a.ultima_leitura !== null), selecionavel: !motivo_lista, motivo_lista }
     })
+    resposta.total = resposta.itens.length
+    resposta.selecionaveis = resposta.itens.filter((i) => i.selecionavel).length
     return resposta
   }
 
@@ -545,8 +731,7 @@ function criarAjusteMassa({ sb, ml, q, rpc, movimentar, lerConfig, decidirEnvio,
     }
     return { consultado_em: agora().toISOString(), skus: saida, observacao: 'Somente leitura. Nenhuma quantidade foi somada, gravada ou enviada.' }
   }
-
-  return { simular, iniciarSimulacao, executar, iniciarExecucao, status, itens, diagnosticoML, avaliar }
+  return { simular, iniciarSimulacao, retomarSimulacao, executar, iniciarExecucao, status, itensDaExecucao, itens, diagnosticoML, avaliar: avaliarCompleto, filtrar }
 }
 
-module.exports = { criarAjusteMassa, LIMITE_SKUS, LIMITE_QUANTIDADE_PADRAO, AVISO_FIXO }
+module.exports = { criarAjusteMassa, LIMITE_QUANTIDADE_PADRAO, LOTE_SIMULACAO, LOTE_EXECUCAO, AVISO_FIXO }

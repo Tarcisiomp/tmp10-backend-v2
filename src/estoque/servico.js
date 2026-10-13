@@ -748,8 +748,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     return { ok: true, envio_agora: envioAgora }
   }
 
-  // Ajuste em massa Marketplace → TMP10 (1ª versão: Mercado Livre) — módulo separado, usa o MESMO caminho oficial
-  const ajusteMassa = criarAjusteMassa({ sb, ml, q, rpc, movimentar, lerConfig, decidirEnvio, log, dormir: () => dormir(esperaEntreEnviosMs),
+  // Ajuste em massa Marketplaces (ML e Shopee) → TMP10 — módulo separado, usa o MESMO caminho oficial (só LÊ as plataformas)
+  const ajusteMassa = criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decidirEnvio, log, dormir: () => dormir(esperaEntreEnviosMs),
     limiteQuantidade: limiteAjusteMassa })
 
   return { ajusteMassa, diagnosticoShopee, tentarShopeeUmaVez, movimentar, registrarVenda, registrarCancelamento, ajustar, enfileirarSku, processarMovimentosPendentes, processarFila, processarItem,
