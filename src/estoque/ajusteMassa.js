@@ -34,7 +34,7 @@ const ehUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 const erroHttp = (msg, status) => Object.assign(new Error(msg), { status })
 const ROTULO_PLAT = { mercadolivre: 'ML', shopee: 'Shopee' }
 
-function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decidirEnvio, log = console.log, limiteQuantidade = LIMITE_QUANTIDADE_PADRAO,
+function criarAjusteMassa({ sb, ml, shopee, grupos, q, rpc, movimentar, lerConfig, decidirEnvio, log = console.log, limiteQuantidade = LIMITE_QUANTIDADE_PADRAO,
   agora = () => new Date(), dormir = () => Promise.resolve(), statusCanceladoShopee = () => (process.env.SHOPEE_STATUS_CANCELADO || 'CANCELLED').split(',').map((x) => x.trim()).filter(Boolean) }) {
   const dono = `tmp10-${process.pid}-${crypto.randomBytes(4).toString('hex')}`
   const jobs = new Map()            // execucao_id → andamento (memória; o banco é a fonte da verdade)
@@ -81,7 +81,7 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
   // gravação é barrado pelo "estoque esperado" do estoque_movimentar.
   function novoContexto(empresaId) {
     return { empresaId, ml: new Map(), sh: new Map(), importados: new Set(), naoImportados: new Map(), statusSh: new Map(), erroConta: new Map(),
-      pedidosTmp: null, pedidosTmpEm: 0, corte: undefined }
+      pedidosTmp: null, pedidosTmpEm: 0, corte: undefined, grupos: null }
   }
   async function atualizarPedidos(ctx, contas) {
     const desdeJanela = new Date(agora().getTime() - JANELA_DIAS * 86400000)
@@ -147,9 +147,14 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
     for (const sku of skus) res.set(sku, { sku, situacao: 'pendente', motivo: null, anuncios: [], avisos: [AVISO_FIXO], pedidos: [] })
 
     const contas = await todasContas(empresaId)
+    // agrupamento (migração 26): o produto principal reúne os anúncios agrupados nele; o SKU agrupado em outro fica fora
+    const g = ctx.grupos || (ctx.grupos = await grupos.carregar(empresaId))
+    const consulta = [...new Set(skus.flatMap((sku) => [...g.originais(sku)]))]
     const prods = await lerTodos(() => sb.from('products').select('id, sku, name, estoque_atual').eq('empresa_id', empresaId).in('sku', skus), 'produtos')
-    const linksML = await lerTodos(() => sb.from('product_ml_links').select('sku, account_nickname, ml_item_id, ml_user_id, sincronizar, ml_variation_id').eq('empresa_id', empresaId).in('sku', skus), 'vínculos ML')
-    const linksSh = await lerTodos(() => sb.from('product_shopee_links').select('sku, shop_id, item_id, model_id, sincronizar').eq('empresa_id', empresaId).in('sku', skus), 'vínculos Shopee')
+    const linksML = await lerTodos(() => sb.from('product_ml_links').select('sku, account_nickname, ml_item_id, ml_user_id, sincronizar, ml_variation_id').eq('empresa_id', empresaId).in('sku', consulta), 'vínculos ML')
+    const linksSh = await lerTodos(() => sb.from('product_shopee_links').select('sku, shop_id, item_id, model_id, sincronizar').eq('empresa_id', empresaId).in('sku', consulta), 'vínculos Shopee')
+    const efML = (l) => g.skuEfetivo('mercadolivre', String(l.ml_item_id), '', l.sku)
+    const efSh = (l) => g.skuEfetivo('shopee', String(l.item_id), l.model_id ? String(l.model_id) : '', l.sku)
     const idsML = [...new Set(linksML.map((l) => String(l.ml_item_id)).filter(Boolean))]
     const outrosML = idsML.length ? await lerTodos(() => sb.from('product_ml_links').select('sku, ml_item_id').eq('empresa_id', empresaId).in('ml_item_id', idsML), 'vínculos do anúncio ML') : []
     const itensSh = [...new Set(linksSh.map((l) => String(l.item_id)))]
@@ -160,18 +165,21 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
 
     for (const sku of skus) {
       const r = res.get(sku)
+      const principal = g.principalDe(sku)
+      if (principal) { bloquear(sku, `SKU agrupado no produto principal ${principal} — o estoque oficial é o do principal; ajuste pelo ${principal}`); continue }
+      r._originais = g.originais(sku); r.agrupados = g.membros(sku).length
       const ps = prods.filter((p) => p.sku === sku)
       if (ps.length !== 1) { bloquear(sku, ps.length ? 'mais de um produto com este SKU no cadastro' : 'produto não cadastrado no TMP10'); continue }
       r.produto_id = ps[0].id; r.nome = ps[0].name; r.tmp10 = ps[0].estoque_atual
       if (r.tmp10 === null || r.tmp10 === undefined) { bloquear(sku, 'produto sem estoque oficial definido no TMP10'); continue }
-      for (const l of linksML.filter((x) => x.sku === sku && x.ml_item_id)) {
+      for (const l of linksML.filter((x) => x.ml_item_id && efML(x) === sku)) {
         const c = contaDoLink(contas, l)
-        r.anuncios.push({ plataforma: 'mercadolivre', conta_ref: c ? refDe(c) : null, conta: c ? c.nickname : l.account_nickname, anuncio_id: String(l.ml_item_id), variacao_id: '',
+        r.anuncios.push({ plataforma: 'mercadolivre', conta_ref: c ? refDe(c) : null, conta: c ? c.nickname : l.account_nickname, anuncio_id: String(l.ml_item_id), variacao_id: '', sku_original: l.sku,
           full: full.has(String(l.ml_item_id)), _l: l, _c: c })
       }
-      for (const l of linksSh.filter((x) => x.sku === sku)) {
+      for (const l of linksSh.filter((x) => efSh(x) === sku)) {
         const c = lojaDoLink(contas, l)
-        r.anuncios.push({ plataforma: 'shopee', conta_ref: c ? refDe(c) : null, conta: c ? c.nickname : `loja ${l.shop_id}`, anuncio_id: String(l.item_id), variacao_id: l.model_id ? String(l.model_id) : '',
+        r.anuncios.push({ plataforma: 'shopee', conta_ref: c ? refDe(c) : null, conta: c ? c.nickname : `loja ${l.shop_id}`, anuncio_id: String(l.item_id), variacao_id: l.model_id ? String(l.model_id) : '', sku_original: l.sku,
           full: full.has(String(l.item_id)), _l: l, _c: c })
       }
       if (!r.anuncios.some((a) => a.conta_ref && origem.has(a.conta_ref))) { bloquear(sku, 'sem anúncio vinculado nas contas/lojas selecionadas'); continue }
@@ -185,8 +193,8 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
         const doItem = outrosSh.filter((o) => String(o.item_id) === a.anuncio_id && String(o.shop_id) === String(a._l.shop_id))
         const mesmo = doItem.filter((o) => String(o.model_id || '') === a.variacao_id)
         if (new Set(mesmo.map((o) => o.sku)).size > 1) { ambSh = `item/variação ${nome(a)} está ligado a mais de um SKU (${[...new Set(mesmo.map((o) => o.sku))].join(', ')}) — vínculo ambíguo`; break }
-        if (doItem.filter((o) => o.sku === sku).length > 1) { ambSh = `o SKU está ligado a mais de uma variação do item Shopee ${a.anuncio_id} — cores/tamanhos misturados`; break }
-        if (!a.variacao_id && doItem.some((o) => o.sku !== sku)) { ambSh = `item Shopee ${a.anuncio_id} vinculado sem variação, mas o mesmo item também está ligado a outro(s) SKU(s) — vínculo ambíguo`; break }
+        if (doItem.filter((o) => o.sku === a.sku_original).length > 1) { ambSh = `o SKU está ligado a mais de uma variação do item Shopee ${a.anuncio_id} — cores/tamanhos misturados`; break }
+        if (!a.variacao_id && doItem.some((o) => o.sku !== a.sku_original)) { ambSh = `item Shopee ${a.anuncio_id} vinculado sem variação, mas o mesmo item também está ligado a outro(s) SKU(s) — vínculo ambíguo`; break }
       }
       if (ambSh) { bloquear(sku, ambSh); continue }
     }
@@ -239,8 +247,8 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
       const comErro = r.anuncios.find((a) => a.erro); if (comErro) { bloquear(r.sku, `falha ao ler ${nome(comErro)}: ${comErro.erro}`); continue }
       const varML = r.anuncios.find((a) => a.plataforma === 'mercadolivre' && a.variacoes > 0); if (varML) { bloquear(r.sku, `anúncio ${nome(varML)} tem ${varML.variacoes} variação(ões) no ML — o número é a soma das variações`); continue }
       const semModelo = r.anuncios.find((a) => a.plataforma === 'shopee' && !a.variacao_id && a.tem_variacao); if (semModelo) { bloquear(r.sku, `item Shopee ${semModelo.anuncio_id} tem variações, mas o vínculo está sem model_id — não dá para saber a variação`); continue }
-      const skuErrado = r.anuncios.find((a) => a.sku_declarado !== r.sku)
-      if (skuErrado) { bloquear(r.sku, `${nome(skuErrado)} declara o SKU "${skuErrado.sku_declarado}", diferente do vínculo "${r.sku}"`); continue }
+      const skuErrado = r.anuncios.find((a) => a.sku_declarado !== a.sku_original)   // SKU original do vínculo (agrupado ou não)
+      if (skuErrado) { bloquear(r.sku, `${nome(skuErrado)} declara o SKU "${skuErrado.sku_declarado}", diferente do vínculo "${skuErrado.sku_original}"`); continue }
       const reserva = r.anuncios.find((a) => a.plataforma === 'shopee' && a.reserva !== null && a.reserva > 0)
       if (reserva) { bloquear(r.sku, `${nome(reserva)} tem ${reserva.reserva} unidade(s) reservada(s) para promoção — o número não representa o estoque físico e a Shopee não aceitaria menos que a reserva`); continue }
       const semVend = r.anuncios.find((a) => a.plataforma === 'shopee' && !a.full && a.estoque_vendedor === null); if (semVend) { bloquear(r.sku, `a Shopee não informou o estoque do vendedor de ${nome(semVend)} — não dá para conferir`); continue }
@@ -267,7 +275,7 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
       await atualizarPedidos(ctx, contasEnv)
       verificarPedidos(ctx, aptos, bloquear)
     }
-    for (const r of res.values()) for (const a of r.anuncios) { delete a._l; delete a._c }
+    for (const r of res.values()) { delete r._originais; for (const a of r.anuncios) { delete a._l; delete a._c } }
     return res
   }
 
@@ -281,8 +289,9 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
       const falha = r.anuncios.map((a) => ctx.erroConta.get(a.conta_ref)).find(Boolean)
       if (falha) { bloquear(r.sku, falha); continue }
       // afeta o SKU? pelo SKU do item, ou pelo anúncio (Shopee com variação: só pelo SKU — o item tem outras variações)
-      const afetaML = (sku, anuncio) => (sku && sku === r.sku) || (anuncio && idsML.has(String(anuncio)))
-      const afetaSh = (sku, item) => (sku && sku === r.sku) || (item && shSemModelo.has(String(item))) || (item && shComModelo.has(String(item)) && (!sku || sku === String(item)))
+      const orig = r._originais || new Set([r.sku])   // o próprio SKU + os SKUs originais agrupados nele
+      const afetaML = (sku, anuncio) => (sku && orig.has(sku)) || (anuncio && idsML.has(String(anuncio)))
+      const afetaSh = (sku, item) => (sku && orig.has(sku)) || (item && shSemModelo.has(String(item))) || (item && shComModelo.has(String(item)) && (!sku || sku === String(item)))
       // (A) não importados
       for (const p of ctx.naoImportados.values()) {
         if (p.plataforma === 'shopee' && p.fbs) continue
@@ -302,7 +311,7 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
         const its = (Array.isArray(o.items) ? o.items : []).map((it) => ({ sku: it && it.sku ? String(it.sku).trim() : null, anuncio: it && it.ml_item_id !== undefined && it.ml_item_id !== null ? String(it.ml_item_id) : null }))
         const doSku = its.filter((it) => (plat === 'shopee' ? afetaSh(it.sku, it.anuncio) : afetaML(it.sku, it.anuncio)))
         if (!doSku.length) continue
-        const outro = doSku.find((it) => it.sku && it.sku !== r.sku && (plat === 'mercadolivre' ? idsML.has(it.anuncio) : shSemModelo.has(it.anuncio)))
+        const outro = doSku.find((it) => it.sku && !orig.has(it.sku) && (plat === 'mercadolivre' ? idsML.has(it.anuncio) : shSemModelo.has(it.anuncio)))
         if (outro) { r.pedidos.push({ verificacao: 'B', canal: plat, pedido: o.ml_order_id, sku: outro.sku }); bloquear(r.sku, `venda do anúncio ${outro.anuncio} registrada com outro SKU ("${outro.sku}") — pedido ${o.ml_order_id}: vínculo ou cadastro inconsistente`); break }
         if (plat === 'mercadolivre') {
           if (!['finalizado', 'full_ml'].includes(o.status) && [...ctx.ml.values()].some((st) => st.cancelados.has(String(o.ml_order_id)))) {
@@ -313,7 +322,9 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
           if (st && cancSh.has(st)) { r.pedidos.push({ verificacao: 'C', canal: plat, pedido: o.ml_order_id, status: st }); bloquear(r.sku, `pedido Shopee ${o.ml_order_id} está "${st}" na Shopee e ainda aberto no TMP10 (cancelamento não processado)`); break }
           if (st === undefined) r._shPendentesStatus = (r._shPendentesStatus || []).concat([{ sn: String(o.ml_order_id), conta: o.account_nickname }])
         }
-        if (doSku.some((it) => it.sku === r.sku) && (!ctx.corte || new Date(o.created_at_ml) >= ctx.corte)) r._refsVenda = (r._refsVenda || []).concat([`venda:${plat}:${o.ml_order_id}:${r.sku}`])
+        if (!ctx.corte || new Date(o.created_at_ml) >= ctx.corte) {
+          for (const s of new Set(doSku.filter((it) => it.sku && orig.has(it.sku)).map((it) => it.sku))) r._refsVenda = (r._refsVenda || []).concat([`venda:${plat}:${o.ml_order_id}:${s}`])
+        }
       }
     }
   }
@@ -350,7 +361,7 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
         }
       }
       if (r.situacao === 'apto') r.pedidos_conferidos_em = agora().toISOString()
-      delete r._refsVenda; delete r._shPendentesStatus
+      delete r._refsVenda; delete r._shPendentesStatus; delete r._originais
     }
   }
 
@@ -361,9 +372,9 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
   }
 
   function previaFila(r, cfg) {
-    const d = decidirEnvio(cfg, r.sku)
-    return r.anuncios.map((a) => ({ canal: a.plataforma, conta: a.conta, anuncio_id: a.anuncio_id + (a.variacao_id ? '/' + a.variacao_id : ''), atual: a.quantidade, novo: r.novo,
-      envio: a.full ? 'bloqueado (Full/FBS)' : (d.real ? 'real' : 'simulado'), motivo: a.full ? 'estoque fica com a plataforma' : d.motivo }))
+    return r.anuncios.map((a) => { const d = decidirEnvio(cfg, r.sku, { agrupado: !!(a.sku_original && a.sku_original !== r.sku) })
+      return { canal: a.plataforma, conta: a.conta, anuncio_id: a.anuncio_id + (a.variacao_id ? '/' + a.variacao_id : ''), atual: a.quantidade, novo: r.novo,
+        envio: a.full ? 'bloqueado (Full/FBS)' : (d.real ? 'real' : 'simulado'), motivo: a.full ? 'estoque fica com a plataforma' : d.motivo } })
   }
   async function registrarEventos(linhas) { for (const lote of pedacos(linhas, 200)) await q(sb.from('estoque_ajuste_massa_eventos').insert(lote), 'auditoria do ajuste em massa') }
   async function eventosDe(id, modo) {
@@ -383,7 +394,7 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
   }
   function filtrar(lista, filtro, busca) {
     const qb = String(busca || '').trim().toLowerCase()
-    return lista.filter((i) => (!qb || i.sku.toLowerCase().includes(qb) || String(i.nome || '').toLowerCase().includes(qb) || i.anuncios.some((a) => String(a.anuncio_id).toLowerCase().includes(qb)))
+    return lista.filter((i) => (!qb || i.sku.toLowerCase().includes(qb) || String(i.nome || '').toLowerCase().includes(qb) || i.anuncios.some((a) => String(a.anuncio_id).toLowerCase().includes(qb) || String(a.sku_original || '').toLowerCase().includes(qb)))
       && (!filtro || filtro === 'todos' || (filtro === 'divergencia' ? i.com_divergencia : !i.com_divergencia)))
   }
   async function resolverSkus({ empresaId, refs, skus, todos }) {
@@ -667,9 +678,10 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
     const linksML = await lerTodos(() => sb.from('product_ml_links').select('sku, ml_item_id, ml_user_id, account_nickname').eq('empresa_id', empresaId), 'vínculos ML')
     const linksSh = await lerTodos(() => sb.from('product_shopee_links').select('sku, shop_id, item_id, model_id').eq('empresa_id', empresaId), 'vínculos Shopee')
     const anuncios = new Map()
+    const g = await grupos.carregar(empresaId)   // anúncio agrupado aparece na linha do PRODUTO PRINCIPAL (com o SKU original)
     const add = (sku, a) => { if (!anuncios.has(sku)) anuncios.set(sku, []); anuncios.get(sku).push(a) }
-    for (const l of linksML) if (l.ml_item_id) { const c = contaDoLink(contas, l); add(l.sku, { plataforma: 'mercadolivre', anuncio_id: String(l.ml_item_id), conta: c ? c.nickname : l.account_nickname, conta_ref: c ? refDe(c) : null }) }
-    for (const l of linksSh) { const c = lojaDoLink(contas, l); add(l.sku, { plataforma: 'shopee', anuncio_id: String(l.item_id) + (l.model_id ? '/' + l.model_id : ''), conta: c ? c.nickname : `loja ${l.shop_id}`, conta_ref: c ? refDe(c) : null }) }
+    for (const l of linksML) if (l.ml_item_id) { const c = contaDoLink(contas, l); add(g.skuEfetivo('mercadolivre', String(l.ml_item_id), '', l.sku), { plataforma: 'mercadolivre', anuncio_id: String(l.ml_item_id), conta: c ? c.nickname : l.account_nickname, conta_ref: c ? refDe(c) : null, sku_original: l.sku }) }
+    for (const l of linksSh) { const c = lojaDoLink(contas, l); add(g.skuEfetivo('shopee', String(l.item_id), l.model_id ? String(l.model_id) : '', l.sku), { plataforma: 'shopee', anuncio_id: String(l.item_id) + (l.model_id ? '/' + l.model_id : ''), conta: c ? c.nickname : `loja ${l.shop_id}`, conta_ref: c ? refDe(c) : null, sku_original: l.sku }) }
     const skus = [...anuncios.keys()].filter((sku) => anuncios.get(sku).some((a) => a.conta_ref && refs.has(a.conta_ref))).sort()
     const prods = new Map()
     for (const lote of pedacos(skus, 300)) for (const p of (await q(sb.from('products').select('sku, name, estoque_atual').eq('empresa_id', empresaId).in('sku', lote), 'produtos')) || []) prods.set(p.sku, prods.has(p.sku) ? { ...p, duplicado: true } : p)
@@ -679,7 +691,7 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
       const p = prods.get(sku)
       const as = anuncios.get(sku).map((a) => { const d = divPor.get(`${sku}|${a.anuncio_id}`); return { ...a, na_selecao: !!(a.conta_ref && refs.has(a.conta_ref)), ultima_leitura: d ? d.estoque_ml : null, lida_em: d ? d.atualizado_em : null } })
       const motivo_lista = !p ? 'produto não cadastrado no TMP10' : p.duplicado ? 'SKU duplicado no cadastro' : (p.estoque_atual === null || p.estoque_atual === undefined) ? 'produto sem estoque oficial' : null
-      return { sku, nome: p ? p.name : null, tmp10: p ? p.estoque_atual : null, anuncios: as, contas: [...new Set(as.filter((a) => a.na_selecao).map((a) => a.conta))],
+      return { sku, nome: p ? p.name : null, tmp10: p ? p.estoque_atual : null, anuncios: as, contas: [...new Set(as.filter((a) => a.na_selecao).map((a) => a.conta))], agrupados: g.membros(sku).length,
         com_divergencia: as.some((a) => a.ultima_leitura !== null), selecionavel: !motivo_lista, motivo_lista }
     })
     resposta.total = resposta.itens.length
@@ -731,7 +743,15 @@ function criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decid
     }
     return { consultado_em: agora().toISOString(), skus: saida, observacao: 'Somente leitura. Nenhuma quantidade foi somada, gravada ou enviada.' }
   }
-  return { simular, iniciarSimulacao, retomarSimulacao, executar, iniciarExecucao, status, itensDaExecucao, itens, diagnosticoML, avaliar: avaliarCompleto, filtrar }
+  // Pedidos ainda NÃO importados das contas/lojas indicadas (refs 'ml:<id>' / 'sh:<shop>') — SÓ LEITURA. Usado pelo agrupamento.
+  async function pedidosPendentes(empresaId, refs) {
+    const set = new Set(refs)
+    const contas = (await todasContas(empresaId)).filter((c) => set.has(refDe(c)))
+    const ctx = novoContexto(empresaId)
+    await atualizarPedidos(ctx, contas)
+    return { naoImportados: [...ctx.naoImportados.values()], erroConta: Object.fromEntries(ctx.erroConta) }
+  }
+  return { simular, iniciarSimulacao, retomarSimulacao, executar, iniciarExecucao, status, itensDaExecucao, itens, diagnosticoML, avaliar: avaliarCompleto, filtrar, pedidosPendentes }
 }
 
 module.exports = { criarAjusteMassa, LIMITE_QUANTIDADE_PADRAO, LOTE_SIMULACAO, LOTE_EXECUCAO, AVISO_FIXO }

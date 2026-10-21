@@ -110,7 +110,9 @@ function criarMercadoLivre({ axios, getToken, refreshToken, timeout = 8000 }) {
           // título e SKU declarado no anúncio: MESMOS campos que a importação de produtos do server.js já usa
           // (title; atributo SELLER_SKU → seller_custom_field). Só leitura/diagnóstico.
           titulo: corpo.title ?? null,
-          sku_declarado: skuDeclaradoML(corpo)
+          sku_declarado: skuDeclaradoML(corpo),
+          // imagem do anúncio (campos do recurso /items: secure_thumbnail / thumbnail) — só para exibir na tela de agrupamento
+          imagem: corpo.secure_thumbnail || corpo.thumbnail || null
         })
       }
       // anúncio que o ML não devolveu para esta conta (de outra conta, apagado, sem permissão)
@@ -231,7 +233,14 @@ function criarShopee({ axios, host, partnerId, assinar, getToken, refreshToken, 
   async function lerModelos(conta, itemId) {
     const data = await chamar(conta, 'get', '/api/v2/product/get_model_list', { params: { item_id: Number(itemId) } }, `Shopee get_model_list ${itemId} (${conta.nickname})`)
     const mapa = new Map()
-    for (const m of ((data && data.response && data.response.model) || [])) mapa.set(String(m.model_id), { quantidade: estoqueDe(m), reservada: reservaDe(m), bruto: m })
+    // nome/imagem da variação: tier_variation[i].option_list[tier_index[i]] (campos da doc) — só para exibir
+    const tiers = (data && data.response && Array.isArray(data.response.tier_variation)) ? data.response.tier_variation : []
+    for (const m of ((data && data.response && data.response.model) || [])) {
+      const ops = Array.isArray(m.tier_index) ? m.tier_index.map((ix, i) => (tiers[i] && Array.isArray(tiers[i].option_list) ? tiers[i].option_list[ix] : null)) : []
+      const nome = ops.filter((o) => o && o.option).map((o) => o.option).join(' / ') || null
+      const comImagem = ops.find((o) => o && o.image && o.image.image_url)
+      mapa.set(String(m.model_id), { quantidade: estoqueDe(m), reservada: reservaDe(m), bruto: m, nome, imagem: comImagem ? comImagem.image.image_url : null })
+    }
     return mapa
   }
 

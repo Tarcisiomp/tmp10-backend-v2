@@ -24,7 +24,7 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
     } catch (e) {
       const status = e.status || 500
       if (status >= 500) log(`[ESTOQUE] erro em ${req.method} ${req.path} (empresa ${req.empresaId}): ${e.message}`)
-      res.status(status).json({ ok: false, error: status >= 500 ? 'Não foi possível concluir agora. Tente de novo em instantes.' : e.message, ...(e.atual !== undefined ? { atual: e.atual } : {}) })
+      res.status(status).json({ ok: false, error: status >= 500 ? 'Não foi possível concluir agora. Tente de novo em instantes.' : e.message, ...(e.atual !== undefined ? { atual: e.atual } : {}), ...(e.previa ? { previa: e.previa } : {}) })
     }
   }
   const corpo = (req) => req.body || {}
@@ -68,6 +68,21 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
   router.get('/api/estoque/ajuste-massa/execucoes/:id', ...admin, responder(async (req) => ({ execucao: await estoque.ajusteMassa.status(req.empresaId, req.params.id) })))
   router.get('/api/estoque/ajuste-massa/execucoes/:id/itens', ...admin, responder(async (req) => estoque.ajusteMassa.itensDaExecucao(req.empresaId, req.params.id, {
     pagina: Number(req.query.pagina) || 1, porPagina: Math.min(Number(req.query.por_pagina) || 100, 500), situacao: String(req.query.situacao || 'todos') })))
+  // 🔗 Agrupar anúncios por produto principal (só admin; empresa SEMPRE da sessão; decisão manual com prévia + confirmação)
+  const listaStr = (v, max) => (Array.isArray(v) ? v.map(String).slice(0, max) : [])
+  router.get('/api/estoque/agrupamento/produtos', ...admin, responder(async (req) => estoque.agrupamento.produtos({ empresaId: req.empresaId, busca: String(req.query.busca || '').slice(0, 120) })))
+  router.get('/api/estoque/agrupamento/anuncios', ...admin, responder(async (req) => estoque.agrupamento.anuncios({ empresaId: req.empresaId,
+    plataforma: ['mercadolivre', 'shopee'].includes(req.query.plataforma) ? req.query.plataforma : '', conta: String(req.query.conta || '').slice(0, 80), busca: String(req.query.busca || '').slice(0, 120),
+    principal: String(req.query.principal || '').slice(0, 120), pagina: Number(req.query.pagina) || 1, porPagina: Number(req.query.por_pagina) || 100 })))
+  router.post('/api/estoque/agrupamento/ao-vivo', ...admin, responder(async (req) => estoque.agrupamento.aoVivo({ empresaId: req.empresaId, chaves: listaStr(corpo(req).chaves, 51) })))
+  router.get('/api/estoque/agrupamento/grupos', ...admin, responder(async (req) => estoque.agrupamento.listarGrupos({ empresaId: req.empresaId })))
+  router.get('/api/estoque/agrupamento/grupo', ...admin, responder(async (req) => estoque.agrupamento.detalheGrupo({ empresaId: req.empresaId, produtoSku: String(req.query.sku || '') })))
+  router.post('/api/estoque/agrupamento/previa', ...admin, responder(async (req) => ({ previa: await estoque.agrupamento.previa({ empresaId: req.empresaId,
+    produtoSku: String(corpo(req).produto_sku || ''), adicionar: listaStr(corpo(req).adicionar, 501), remover: Array.isArray(corpo(req).remover) ? corpo(req).remover.slice(0, 501) : [] }) })))
+  router.post('/api/estoque/agrupamento/confirmar', ...admin, responder(async (req) => estoque.agrupamento.confirmar({ empresaId: req.empresaId, usuarioId: req.usuario.id,
+    produtoSku: String(corpo(req).produto_sku || ''), adicionar: listaStr(corpo(req).adicionar, 501), remover: Array.isArray(corpo(req).remover) ? corpo(req).remover.slice(0, 501) : [],
+    conferido: corpo(req).conferido === true, assinatura: String(corpo(req).assinatura || ''), operacaoId: String(corpo(req).operacao_id || '') })))
+
   // Diagnóstico ML (SÓ LEITURA): quantidade atual de cada anúncio vinculado — GET /api/estoque/diagnostico-ml?skus=A,B
   router.get('/api/estoque/diagnostico-ml', ...admin, responder(async (req) => ({ diagnostico: await estoque.ajusteMassa.diagnosticoML({ empresaId: req.empresaId, skus: String(req.query.skus || '') }) })))
 

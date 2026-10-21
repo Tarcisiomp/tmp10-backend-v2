@@ -39,6 +39,8 @@ const mensagemReserva = (reserva, alvo, quando) => `RESERVA DA SHOPEE: a Shopee 
   `${quando}. O TMP10 NÃO aumenta o número. A Shopee continua com o estoque antigo — risco de vender sem ter: reduza a reserva ou tire a variação da promoção ` +
   `(Central do Vendedor → Marketing) e depois use "Tentar 1 vez". Veja "Diagnóstico Shopee".`
 const { criarAjusteMassa } = require('./ajusteMassa')
+const { criarGrupos } = require('./grupos')
+const { criarAgrupamento } = require('./agrupamento')
 const inteiro = (v) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Math.trunc(Number(v)))
 
 function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitado = () => false, permitirSandbox = false,
@@ -51,6 +53,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     return r ? r.data : null
   }
   async function rpc(nome, args) { return q(sb.rpc(nome, args), `rpc ${nome}`) }
+  const grupos = criarGrupos({ sb, log })   // agrupamento manual de anúncios (migração 26)
+  const erroAgrupado = (sku, principal) => Object.assign(new Error(`O SKU ${sku} está agrupado no produto principal ${principal}: o estoque oficial é o do principal. Ajuste pelo produto ${principal}.`), { status: 409, principal })
 
   // ── Movimentação oficial ─────────────────────────────────────────────────────────────────────────────
   async function movimentar({ empresaId, sku, tipo, quantidade, origem, motivo = null, referencia = null, usuarioId = null, processo = null, esperado = null }) {
@@ -69,20 +73,32 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
   }
 
   // Venda nova (ML ou Shopee): baixa cada SKU uma única vez por pedido
+  // Venda nova (ML ou Shopee): baixa cada SKU uma única vez por pedido. Anúncio AGRUPADO → baixa o produto PRINCIPAL
+  // (a referência continua venda:{plataforma}:{pedido}:{SKU original} — reprocessar/webhook repetido nunca duplica).
+  // Se o pedido não bate com o agrupamento, NÃO baixa estoque de produto nenhum: grava uma PENDÊNCIA para análise manual.
   async function registrarVenda({ empresaId, plataforma, pedidoId, itens, processo = 'sincronizacao-pedidos' }) {
     if (!empresaId) { log(`⚠️ [ESTOQUE] venda ${plataforma} ${pedidoId} sem empresa — estoque NÃO baixado`); return [] }
-    const porSku = new Map()
+    const g = await grupos.carregar(empresaId)
+    const porSku = new Map()   // SKU original → { alvo, qtd, pendencia }
     for (const it of (itens || [])) {
       const sku = it && it.sku ? String(it.sku).trim() : ''
       if (!sku) continue
-      porSku.set(sku, (porSku.get(sku) || 0) + (inteiro(it.qty) > 0 ? inteiro(it.qty) : 1))
+      const qtd = inteiro(it.qty) > 0 ? inteiro(it.qty) : 1
+      const r = g.resolverVenda(plataforma, it)
+      const atual = porSku.get(sku)
+      if (!atual) { porSku.set(sku, { alvo: r.sku || null, qtd, pendencia: r.pendencia || null }); continue }
+      atual.qtd += qtd
+      if (!atual.pendencia && (r.pendencia || (r.sku || null) !== atual.alvo)) atual.pendencia = r.pendencia || `o SKU "${sku}" aparece no mesmo pedido em anúncios de produtos principais diferentes`
     }
     const resultados = []
-    for (const [sku, qtd] of porSku) {
+    for (const [sku, { alvo, qtd, pendencia }] of porSku) {
+      const referencia = `venda:${plataforma}:${pedidoId}:${sku}`
       try {
-        resultados.push({ sku, ...(await movimentar({
-          empresaId, sku, tipo: 'saida', quantidade: qtd, origem: `venda_${plataforma}`,
-          motivo: `Venda ${ROTULO[plataforma] || plataforma} ${pedidoId}`, referencia: `venda:${plataforma}:${pedidoId}:${sku}`, processo
+        if (pendencia) { resultados.push({ sku, ...(await registrarPendenciaVenda({ empresaId, plataforma, pedidoId, sku, qtd, motivo: pendencia, referencia, processo })) }); continue }
+        resultados.push({ sku, ...(alvo !== sku ? { principal: alvo } : {}), ...(await movimentar({
+          empresaId, sku: alvo, tipo: 'saida', quantidade: qtd, origem: `venda_${plataforma}`,
+          motivo: alvo !== sku ? `Venda ${ROTULO[plataforma] || plataforma} ${pedidoId} (anúncio agrupado — SKU original ${sku})` : `Venda ${ROTULO[plataforma] || plataforma} ${pedidoId}`,
+          referencia, processo
         })) })
       } catch (e) {
         log(`❌ [ESTOQUE] falha ao baixar ${sku} da venda ${plataforma} ${pedidoId}: ${e.message}`)
@@ -92,6 +108,18 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     return resultados
   }
 
+  // Pendência de venda (não baixa nada): movimento NÃO aplicado com a MESMA referência da venda — reprocessar não duplica
+  // e a venda nunca é baixada de outro produto por engano. Aparece em "vendas sem baixa" para análise manual.
+  async function registrarPendenciaVenda({ empresaId, plataforma, pedidoId, sku, qtd, motivo, referencia, processo }) {
+    const r = await sb.from('estoque_movimentos').insert({ empresa_id: empresaId, sku, tipo: 'registro', quantidade: 0, origem: `venda_${plataforma}`,
+      motivo: `Venda ${ROTULO[plataforma] || plataforma} ${pedidoId} (${qtd} un.) — PENDENTE: ${motivo}`.slice(0, 500), referencia, aplicado: false,
+      observacao: 'pendencia_agrupamento', processo })
+    if (r.error && r.error.code === '23505') return { ok: false, aplicado: false, duplicado: true, pendencia: true, erro: 'pendencia_agrupamento' }
+    if (r.error) throw new Error(`pendência da venda: ${r.error.message}`)
+    log(`⚠️ [ESTOQUE] venda ${plataforma} ${pedidoId}: SKU ${sku} (${qtd} un.) NÃO baixado — ${motivo}. Pendência registrada para análise manual.`)
+    return { ok: false, aplicado: false, duplicado: false, pendencia: true, erro: 'pendencia_agrupamento', motivo }
+  }
+
   // Cancelamento: devolve SOMENTE o que a venda baixou pelo fluxo oficial (venda Full, ou anterior ao estoque central, não)
   async function registrarCancelamento({ empresaId, plataforma, pedidoId, processo = 'cancelamento' }) {
     if (!empresaId) return []
@@ -99,13 +127,15 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     const skus = [...new Set(((pedido && pedido.items) || []).map((i) => (i && i.sku ? String(i.sku).trim() : '')).filter(Boolean))]
     const resultados = []
     for (const sku of skus) {
-      const venda = await q(sb.from('estoque_movimentos').select('quantidade, aplicado').eq('empresa_id', empresaId).eq('referencia', `venda:${plataforma}:${pedidoId}:${sku}`).maybeSingle(), 'movimento da venda')
+      const venda = await q(sb.from('estoque_movimentos').select('sku, quantidade, aplicado').eq('empresa_id', empresaId).eq('referencia', `venda:${plataforma}:${pedidoId}:${sku}`).maybeSingle(), 'movimento da venda')
       if (!venda || !venda.aplicado || !(venda.quantidade < 0)) { resultados.push({ sku, devolvido: false, motivo: 'venda não baixou estoque pelo fluxo oficial' }); continue }
+      // devolve ao produto que a venda REALMENTE baixou (o principal, se o anúncio estava agrupado — mesmo que o grupo
+      // tenha sido desfeito depois); a referência continua a do SKU original (idempotente)
       const r = await movimentar({
-        empresaId, sku, tipo: 'entrada', quantidade: -venda.quantidade, origem: `cancelamento_${plataforma}`,
+        empresaId, sku: venda.sku || sku, tipo: 'entrada', quantidade: -venda.quantidade, origem: `cancelamento_${plataforma}`,
         motivo: `Cancelamento ${ROTULO[plataforma] || plataforma} ${pedidoId}`, referencia: `cancelamento:${plataforma}:${pedidoId}:${sku}`, processo
       })
-      resultados.push({ sku, devolvido: !!(r && r.aplicado && !r.duplicado), duplicado: !!(r && r.duplicado), novo: r && r.novo })
+      resultados.push({ sku, ...(venda.sku && venda.sku !== sku ? { principal: venda.sku } : {}), devolvido: !!(r && r.aplicado && !r.duplicado), duplicado: !!(r && r.duplicado), novo: r && r.novo })
     }
     return resultados
   }
@@ -117,6 +147,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     if (!sku || String(sku).length > 120) throw Object.assign(new Error('SKU inválido.'), { status: 400 })
     const esperado = estoqueEsperado === null || estoqueEsperado === undefined || estoqueEsperado === '' ? null : inteiro(estoqueEsperado)
     const op = /^[A-Za-z0-9_-]{8,64}$/.test(String(idOperacao || '')) ? String(idOperacao) : crypto.randomUUID()
+    const principal = (await grupos.carregar(empresaId)).principalDe(String(sku))
+    if (principal) throw erroAgrupado(sku, principal)   // saldo do SKU agrupado fica CONGELADO
     const r = await movimentar({
       empresaId, sku: String(sku), tipo: 'definir', quantidade: novo, origem: 'ajuste_manual',
       motivo: String(motivo || 'Ajuste manual no TMP10').slice(0, 200), referencia: `ajuste:${op}`, usuarioId, processo: 'erp', esperado
@@ -128,25 +160,38 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
   }
 
   // ── Fila ───────────────────────────────────────────────────────────────────────────────────────────────
-  async function enfileirarSku(empresaId, sku, motivo, movimentoId = null) {
+  // Anúncios que recebem o número do SKU: os vínculos dele que NÃO foram agrupados em outro produto + os anúncios
+  // agrupados NELE (se for principal). O SKU original agrupado em outro principal não envia nada (saldo congelado).
+  async function destinosDoSku(empresaId, sku, g) {
     const linksML = await q(sb.from('product_ml_links').select('account_nickname, ml_item_id, ml_user_id').eq('empresa_id', empresaId).eq('sku', sku), 'vínculos ML')
     const linksSh = await q(sb.from('product_shopee_links').select('shop_id, item_id, model_id').eq('empresa_id', empresaId).eq('sku', sku), 'vínculos Shopee')
-    let n = 0
+    const porChave = new Map()
     for (const l of (linksML || [])) {
-      if (!l.ml_item_id) continue
-      await rpc('estoque_fila_enfileirar', { p_empresa: empresaId, p_sku: sku, p_destino: 'mercadolivre',
-        p_conta_ref: l.ml_user_id ? String(l.ml_user_id) : `nick:${l.account_nickname}`, p_anuncio: String(l.ml_item_id), p_variacao: '',
-        p_motivo: motivo ? String(motivo).slice(0, 200) : null, p_movimento: movimentoId })
-      n++
+      if (!l.ml_item_id || g.skuEfetivo('mercadolivre', String(l.ml_item_id), '', sku) !== sku) continue
+      const d = { destino: 'mercadolivre', conta_ref: l.ml_user_id ? String(l.ml_user_id) : `nick:${l.account_nickname}`, anuncio_id: String(l.ml_item_id), variacao_id: '' }
+      porChave.set(`${d.destino}:${d.conta_ref}:${d.anuncio_id}:`, d)
     }
     for (const l of (linksSh || [])) {
       if (!l.item_id || !l.shop_id) continue
-      await rpc('estoque_fila_enfileirar', { p_empresa: empresaId, p_sku: sku, p_destino: 'shopee',
-        p_conta_ref: String(l.shop_id), p_anuncio: String(l.item_id), p_variacao: l.model_id ? String(l.model_id) : '',
-        p_motivo: motivo ? String(motivo).slice(0, 200) : null, p_movimento: movimentoId })
-      n++
+      const variacao_id = l.model_id ? String(l.model_id) : ''
+      if (g.skuEfetivo('shopee', String(l.item_id), variacao_id, sku) !== sku) continue
+      const d = { destino: 'shopee', conta_ref: String(l.shop_id), anuncio_id: String(l.item_id), variacao_id }
+      porChave.set(`shopee:${d.conta_ref}:${d.anuncio_id}:${variacao_id}`, d)
     }
-    return n // 0 = produto sem anúncio vinculado: estoque só no TMP10, sem erro
+    for (const m of g.membros(sku)) {
+      const d = { destino: m.plataforma, conta_ref: m.conta_ref, anuncio_id: m.anuncio_id, variacao_id: m.variacao_id || '' }
+      porChave.set(`${d.destino}:${d.conta_ref}:${d.anuncio_id}:${d.variacao_id}`, d)
+    }
+    return [...porChave.values()]
+  }
+  async function enfileirarSku(empresaId, sku, motivo, movimentoId = null) {
+    const g = await grupos.carregar(empresaId)
+    const destinos = await destinosDoSku(empresaId, sku, g)
+    for (const d of destinos) {
+      await rpc('estoque_fila_enfileirar', { p_empresa: empresaId, p_sku: sku, p_destino: d.destino, p_conta_ref: d.conta_ref, p_anuncio: d.anuncio_id, p_variacao: d.variacao_id,
+        p_motivo: motivo ? String(motivo).slice(0, 200) : null, p_movimento: movimentoId })
+    }
+    return destinos.length // 0 = produto sem anúncio vinculado (ou SKU agrupado em outro principal): estoque só no TMP10, sem erro
   }
 
   // Movimentos registrados pelo gatilho (alteração direta / cadastro) → fila
@@ -181,9 +226,12 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
 
   // Decisão de envio de UM SKU com a configuração ATUAL (a mesma usada no processamento da fila e mostrada na tela):
   // real só com ESTOQUE_ENVIO_HABILITADO=1 E (empresa 'ativo' OU 'piloto' com o SKU na lista, comparação exata).
-  function decidirEnvio(cfg, sku) {
+  // { agrupado: true } = anúncio que pertence ao SKU por AGRUPAMENTO (vínculo com outro SKU original): em PILOTO ele
+  // NUNCA herda a autorização do principal — só os anúncios com o próprio SKU do piloto recebem envio real.
+  function decidirEnvio(cfg, sku, { agrupado = false } = {}) {
     if (!envioHabilitado()) return { real: false, motivo: 'envio desligado no servidor (ESTOQUE_ENVIO_HABILITADO≠1)' }
     if (cfg.modo === 'ativo') return { real: true, motivo: 'modo ativo' }
+    if (cfg.modo === 'piloto' && agrupado) return { real: false, motivo: 'anúncio agrupado — em PILOTO só o anúncio com o próprio SKU do piloto recebe envio real' }
     if (cfg.modo === 'piloto') return (cfg.skus_piloto || []).includes(sku) ? { real: true, motivo: 'SKU no piloto' } : { real: false, motivo: 'SKU fora do piloto' }
     return { real: false, motivo: `modo da empresa: ${cfg.modo}` }
   }
@@ -204,9 +252,12 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
       const contas = ((await q(consulta, 'conta ML')) || []).filter((c) => !ehShopee(c) && c.active === true)
       if (contas.length !== 1) return { bloqueio: contas.length ? 'mais de uma conta do Mercado Livre com este identificador nesta empresa' : 'conta do Mercado Livre deste anúncio não está conectada/ativa nesta empresa' }
       const conta = contas[0]
-      const links = await q(sb.from('product_ml_links').select('account_nickname, ml_item_id, ml_user_id, sincronizar, ml_variation_id').eq('empresa_id', item.empresa_id).eq('sku', item.sku).eq('ml_item_id', item.anuncio_id), 'vínculo ML')
-      const link = (links || []).find((l) => l.account_nickname === conta.nickname)
-      if (!link) return { bloqueio: 'vínculo SKU ↔ anúncio não existe mais (ou é de outra conta)' }
+      const g = await grupos.carregar(item.empresa_id)
+      const links = await q(sb.from('product_ml_links').select('sku, account_nickname, ml_item_id, ml_user_id, sincronizar, ml_variation_id').eq('empresa_id', item.empresa_id).eq('ml_item_id', item.anuncio_id), 'vínculo ML')
+      const daConta = (links || []).filter((l) => l.account_nickname === conta.nickname)
+      // o anúncio tem de representar ESTE produto hoje (vínculo direto ou agrupamento) — item antigo da fila não envia
+      const link = daConta.find((l) => g.skuEfetivo('mercadolivre', item.anuncio_id, '', l.sku) === item.sku)
+      if (!link) return { bloqueio: daConta.length ? `o anúncio agora pertence ao produto ${g.skuEfetivo('mercadolivre', item.anuncio_id, '', daConta[0].sku)} (agrupamento/vínculo mudou) — este item da fila não envia` : 'vínculo SKU ↔ anúncio não existe mais (ou é de outra conta)' }
       if (link.ml_user_id && String(link.ml_user_id) !== String(conta.ml_user_id)) return { bloqueio: 'vínculo aponta para outra conta do Mercado Livre' }
       if (link.sincronizar === false) return { bloqueio: 'sincronização desligada neste anúncio' }
       if (link.ml_variation_id) return { bloqueio: 'anúncio com variação no ML — PRECISA CONFIRMAR o envio por variação' }
@@ -215,9 +266,11 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     const contas = ((await q(sb.from('ml_accounts').select('id, nickname, ml_user_id, platform, active, empresa_id, access_token, refresh_token, expires_at')
       .eq('empresa_id', item.empresa_id).eq('platform', 'shopee').eq('ml_user_id', item.conta_ref), 'conta Shopee')) || []).filter((c) => c.active === true)
     if (contas.length !== 1) return { bloqueio: contas.length ? 'mais de uma loja Shopee com este shop_id nesta empresa' : 'loja Shopee deste anúncio não está conectada/ativa nesta empresa' }
-    const links = await q(sb.from('product_shopee_links').select('shop_id, item_id, model_id, sincronizar').eq('empresa_id', item.empresa_id).eq('sku', item.sku).eq('shop_id', item.conta_ref), 'vínculo Shopee')
-    const link = (links || []).find((l) => String(l.item_id) === item.anuncio_id && (l.model_id ? String(l.model_id) : '') === item.variacao_id)
-    if (!link) return { bloqueio: 'vínculo SKU ↔ item/variação da Shopee não existe mais' }
+    const g = await grupos.carregar(item.empresa_id)
+    const links = await q(sb.from('product_shopee_links').select('sku, shop_id, item_id, model_id, sincronizar').eq('empresa_id', item.empresa_id).eq('shop_id', item.conta_ref).eq('item_id', item.anuncio_id), 'vínculo Shopee')
+    const doDestino = (links || []).filter((l) => (l.model_id ? String(l.model_id) : '') === item.variacao_id)
+    const link = doDestino.find((l) => g.skuEfetivo('shopee', item.anuncio_id, item.variacao_id, l.sku) === item.sku)
+    if (!link) return { bloqueio: doDestino.length ? `o item/variação agora pertence ao produto ${g.skuEfetivo('shopee', item.anuncio_id, item.variacao_id, doDestino[0].sku)} (agrupamento/vínculo mudou) — este item da fila não envia` : 'vínculo SKU ↔ item/variação da Shopee não existe mais' }
     if (link.sincronizar === false) return { bloqueio: 'sincronização desligada neste anúncio' }
     return { conta: contas[0], link }
   }
@@ -251,7 +304,7 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     if (item.destino === 'shopee' && shopee.ehSandbox() && !permitirSandbox) return concluir('bloqueado', { alvo, erro: 'SHOPEE_HOST aponta para o ambiente de TESTE (sandbox) — envio bloqueado' })
     // 4) modo de envio
     const cfg = await lerConfig(item.empresa_id)
-    const decisao = decidirEnvio(cfg, item.sku)
+    const decisao = decidirEnvio(cfg, item.sku, { agrupado: !!(destino.link && destino.link.sku && destino.link.sku !== item.sku) })
     if (!decisao.real) return concluir('simulado', { alvo, erro: `SIMULAÇÃO — enviaria ${alvo}. Não enviado: ${decisao.motivo}` })
     // 5) proteção contra loop: envios demais no mesmo anúncio em pouco tempo
     const desde = new Date(Date.now() - LIMITE_LOOP.minutos * 60000).toISOString()
@@ -353,12 +406,17 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     const abertas = await q(sb.from('estoque_divergencias').select('id, chave').eq('empresa_id', empresaId).not('chave', 'is', null).not('resolvido', 'is', true), 'divergências abertas')
     const chavesAbertas = new Set((abertas || []).map((d) => d.chave))
     const linhas = []
+    const g = await grupos.carregar(empresaId)
+    // anúncio agrupado é conferido contra o estoque do PRINCIPAL (sku_original guarda o SKU do vínculo)
+    const efetivo = (base) => { const sku = g.skuEfetivo(base.destino, base.anuncio_id, base.variacao_id, base.sku); return sku === base.sku ? base : { ...base, sku, sku_original: base.sku } }
+    const filtra = (base) => !filtroSku || filtroSku.has(base.sku) || filtroSku.has(efetivo(base).sku)
 
-    const avaliar = async (base, leitura) => {
+    const avaliar = async (base0, leitura) => {
+      const base = efetivo(base0)
       const p = produtos.get(base.sku)
       const chave = `${base.destino}:${base.conta_ref}:${base.anuncio_id}:${base.variacao_id}`
       const f = filaPor.get(chave)
-      const envioAgora = decidirEnvio(cfgAgora, base.sku)
+      const envioAgora = decidirEnvio(cfgAgora, base.sku, { agrupado: !!base.sku_original })
       const linha = { ...base, chave, nome: p ? p.name : null, tmp10: p ? p.estoque_atual : null, plataforma_qtd: leitura && !leitura.erro ? leitura.quantidade : null,
         fila_status: f ? f.status : null, fila_erro: f ? f.ultimo_erro : null, fila_atualizado_em: f ? f.atualizado_em : null,
         // decisão com a configuração de AGORA (o texto da fila é do último processamento e pode ser de antes do piloto)
@@ -387,7 +445,7 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
 
     if (plataformas.includes('mercadolivre')) {
       const links = await q(sb.from('product_ml_links').select('sku, account_nickname, ml_item_id, ml_user_id, sincronizar').eq('empresa_id', empresaId), 'vínculos ML')
-      const doFiltro = (links || []).filter((l) => l.ml_item_id && (!filtroSku || filtroSku.has(l.sku)))
+      const doFiltro = (links || []).filter((l) => l.ml_item_id && filtra({ sku: l.sku, destino: 'mercadolivre', anuncio_id: String(l.ml_item_id), variacao_id: '' }))
       const porConta = new Map()
       for (const l of doFiltro) {
         const conta = (contas || []).find((c) => !ehShopee(c) && c.active === true && (l.ml_user_id ? String(c.ml_user_id) === String(l.ml_user_id) : c.nickname === l.account_nickname))
@@ -409,7 +467,7 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     }
     if (plataformas.includes('shopee')) {
       const links = await q(sb.from('product_shopee_links').select('sku, shop_id, item_id, model_id, sincronizar').eq('empresa_id', empresaId), 'vínculos Shopee')
-      const doFiltro = (links || []).filter((l) => l.item_id && (!filtroSku || filtroSku.has(l.sku)))
+      const doFiltro = (links || []).filter((l) => l.item_id && filtra({ sku: l.sku, destino: 'shopee', anuncio_id: String(l.item_id), variacao_id: l.model_id ? String(l.model_id) : '' }))
       const porLoja = new Map()
       for (const l of doFiltro) {
         const conta = (contas || []).find((c) => ehShopee(c) && c.active === true && String(c.ml_user_id) === String(l.shop_id))
@@ -492,21 +550,24 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
   }
   // Destinos (anúncio/variação) dos SKUs — MESMA regra da fila: ML com ml_item_id; Shopee com item_id e shop_id;
   // o mesmo anúncio ligado a 2 SKUs conta UMA vez (fica com o 1º SKU em ordem alfabética, como no banco).
-  async function destinosDosSkus(empresaId, lista) {
-    const ml = await lerTodos(() => sb.from('product_ml_links').select('sku, account_nickname, ml_item_id, ml_user_id, sincronizar, ml_variation_id').eq('empresa_id', empresaId).in('sku', lista), 'vínculos ML')
-    const sh = await lerTodos(() => sb.from('product_shopee_links').select('sku, shop_id, item_id, model_id, sincronizar').eq('empresa_id', empresaId).in('sku', lista), 'vínculos Shopee')
+  async function destinosDosSkus(empresaId, lista, g) {
+    // agrupamento: o anúncio vai com o produto que ele representa HOJE (principal); SKU agrupado em outro não leva anúncio
+    const consulta = [...new Set(lista.flatMap((sku) => [...g.originais(sku)]))]
+    const ml = await lerTodos(() => sb.from('product_ml_links').select('sku, account_nickname, ml_item_id, ml_user_id, sincronizar, ml_variation_id').eq('empresa_id', empresaId).in('sku', consulta), 'vínculos ML')
+    const sh = await lerTodos(() => sb.from('product_shopee_links').select('sku, shop_id, item_id, model_id, sincronizar').eq('empresa_id', empresaId).in('sku', consulta), 'vínculos Shopee')
+    const pedidos = new Set(lista)
     const porChave = new Map()
-    const add = (d) => { const atual = porChave.get(d.chave); if (!atual || String(d.sku) < String(atual.sku)) porChave.set(d.chave, d) }
+    const add = (d) => { if (!pedidos.has(d.sku)) return; const atual = porChave.get(d.chave); if (!atual || String(d.sku) < String(atual.sku)) porChave.set(d.chave, d) }
     for (const l of ml) {
       if (!l.ml_item_id) continue
       const conta_ref = l.ml_user_id ? String(l.ml_user_id) : `nick:${l.account_nickname}`
-      add({ sku: l.sku, destino: 'mercadolivre', conta_ref, conta_nome: l.account_nickname, anuncio_id: String(l.ml_item_id), variacao_id: '', sincronizar: l.sincronizar, ml_variation_id: l.ml_variation_id,
+      add({ sku_original: l.sku, sku: g.skuEfetivo('mercadolivre', String(l.ml_item_id), '', l.sku), destino: 'mercadolivre', conta_ref, conta_nome: l.account_nickname, anuncio_id: String(l.ml_item_id), variacao_id: '', sincronizar: l.sincronizar, ml_variation_id: l.ml_variation_id,
         chave: `mercadolivre:${conta_ref}:${l.ml_item_id}:` })
     }
     for (const l of sh) {
       if (!l.item_id || !l.shop_id) continue
       const variacao_id = l.model_id ? String(l.model_id) : ''
-      add({ sku: l.sku, destino: 'shopee', conta_ref: String(l.shop_id), anuncio_id: String(l.item_id), variacao_id, sincronizar: l.sincronizar,
+      add({ sku_original: l.sku, sku: g.skuEfetivo('shopee', String(l.item_id), variacao_id, l.sku), destino: 'shopee', conta_ref: String(l.shop_id), anuncio_id: String(l.item_id), variacao_id, sincronizar: l.sincronizar,
         chave: `shopee:${l.shop_id}:${l.item_id}:${variacao_id}` })
     }
     return [...porChave.values()]
@@ -514,8 +575,9 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
 
   // PRÉVIA: só LÊ (banco + resultado da última conferência). Não grava nada, não chama ML/Shopee.
   async function previa({ empresaId, skus }) {
-    const lista = listaDeSkus(skus)
-    const destinos = await destinosDosSkus(empresaId, lista)
+    const g = await grupos.carregar(empresaId)
+    const lista = [...new Set(listaDeSkus(skus).map((sku) => g.principalDe(sku) || sku))]   // SKU agrupado → o principal
+    const destinos = await destinosDosSkus(empresaId, lista, g)
     const produtos = new Map()
     for (const p of await lerTodos(() => sb.from('products').select('sku, estoque_atual').eq('empresa_id', empresaId).in('sku', lista), 'produtos')) {
       produtos.set(p.sku, produtos.has(p.sku) ? { duplicado: true } : p)
@@ -557,7 +619,7 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
         else cat = 'nao_conferido'
       }
       categorias[cat]++
-      if (cat !== 'bloqueado') { if (decidirEnvio(cfgAgora, d.sku).real) envioReal++; else envioSimulado++ }
+      if (cat !== 'bloqueado') { if (decidirEnvio(cfgAgora, d.sku, { agrupado: !!(d.sku_original && d.sku_original !== d.sku) }).real) envioReal++; else envioSimulado++ }
       if (motivo) motivosBloqueio[motivo] = (motivosBloqueio[motivo] || 0) + 1
       if (porSku.has(d.sku)) porSku.get(d.sku).anuncios++
     }
@@ -575,17 +637,24 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
 
   // ENVIO para a fila: uma operação no banco para todos os SKUs (migração 22). Sem a 22, grava um a um como antes.
   async function sincronizar({ empresaId, skus, usuarioId }) {
-    const lista = listaDeSkus(skus)
+    const g = await grupos.carregar(empresaId)
+    const lista = [...new Set(listaDeSkus(skus).map((sku) => g.principalDe(sku) || sku))]   // SKU agrupado → o principal
     const motivo = `Sincronizar agora (usuário ${usuarioId || '-'})`
     let destinos = 0, modo = 'lote'
-    const r = await sb.rpc('estoque_fila_enfileirar_lote', { p_empresa: empresaId, p_skus: lista, p_motivo: motivo })
+    // produtos principais COM anúncios agrupados: a função em lote do banco só conhece os vínculos — vão pelo caminho
+    // anúncio a anúncio, que conhece o agrupamento. Os demais continuam no lote, exatamente como antes.
+    const comGrupo = lista.filter((sku) => g.ehPrincipal(sku))
+    for (const sku of comGrupo) destinos += await enfileirarSku(empresaId, sku, motivo)
+    const resto = lista.filter((sku) => !g.ehPrincipal(sku))
+    if (!resto.length) { agendarProcessamento(); return { skus: lista.length, destinos, modo: 'um_a_um', config: await lerConfig(empresaId), envio_habilitado: envioHabilitado() } }
+    const r = await sb.rpc('estoque_fila_enfileirar_lote', { p_empresa: empresaId, p_skus: resto, p_motivo: motivo })
     if (r && r.error) {
       const faltaFuncao = r.error.code === 'PGRST202' || /estoque_fila_enfileirar_lote/.test(String(r.error.message || '')) && /(does not exist|Could not find)/i.test(String(r.error.message || ''))
       if (!faltaFuncao) throw new Error(`rpc estoque_fila_enfileirar_lote: ${r.error.message}`)
       log('[ESTOQUE] migração 22 ainda não aplicada — fila gravada anúncio por anúncio (mais lento, mesmo resultado)')
       modo = 'um_a_um'
-      for (const sku of lista) destinos += await enfileirarSku(empresaId, sku, motivo)
-    } else destinos = (r && r.data && r.data.destinos) || 0
+      for (const sku of resto) destinos += await enfileirarSku(empresaId, sku, motivo)
+    } else destinos += (r && r.data && r.data.destinos) || 0
     agendarProcessamento()
     return { skus: lista.length, destinos, modo, config: await lerConfig(empresaId), envio_habilitado: envioHabilitado() }
   }
@@ -594,6 +663,10 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     const d = await q(sb.from('estoque_divergencias').select('*').eq('id', id).eq('empresa_id', empresaId).maybeSingle(), 'divergência')
     if (!d || !d.chave) throw Object.assign(new Error('Divergência não encontrada.'), { status: 404 })
     if (d.resolvido === true) throw Object.assign(new Error('Esta divergência já foi resolvida.'), { status: 409 })
+    if (acao !== 'ignorar') {   // divergência antiga de um SKU que depois foi agrupado: não mexe no saldo congelado
+      const principal = (await grupos.carregar(empresaId)).principalDe(d.sku)
+      if (principal) throw Object.assign(new Error(`Esta divergência é de antes do agrupamento: o anúncio agora pertence a ${principal}. Clique em "Conferir de novo" — a nova conferência compara com o estoque de ${principal}.`), { status: 409 })
+    }
     let movimento = null
     if (acao === 'aceitar') {
       // a plataforma vira o número oficial — vira MOVIMENTO (rastreável) e o TMP10 envia para os outros anúncios
@@ -679,7 +752,9 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
   async function diagnosticoShopee(empresaId, sku) {
     sku = String(sku || '').trim()
     if (!sku) throw Object.assign(new Error('informe o SKU'), { status: 400 })
-    const links = (await q(sb.from('product_shopee_links').select('shop_id, item_id, model_id, sincronizar').eq('empresa_id', empresaId).eq('sku', sku), 'vínculos Shopee')) || []
+    const g = await grupos.carregar(empresaId)
+    const links = ((await q(sb.from('product_shopee_links').select('sku, shop_id, item_id, model_id, sincronizar').eq('empresa_id', empresaId).in('sku', [...g.originais(sku)]), 'vínculos Shopee')) || [])
+      .filter((l) => g.skuEfetivo('shopee', String(l.item_id), l.model_id ? String(l.model_id) : '', l.sku) === sku)   // anúncios que representam este produto hoje
     const contas = (await q(sb.from('ml_accounts').select('id, nickname, ml_user_id, platform, active, empresa_id, access_token, refresh_token, expires_at').eq('empresa_id', empresaId).eq('platform', 'shopee'), 'contas Shopee')) || []
     const prod = ((await q(sb.from('products').select('estoque_atual').eq('empresa_id', empresaId).eq('sku', sku), 'produto')) || [])[0]
     const estoqueTmp10 = prod ? prod.estoque_atual : null
@@ -700,7 +775,7 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
           message: o.message ?? (o.resposta && o.resposta.message) ?? null,
           failure_list: o.failure_list || (o.resposta && o.resposta.response && o.resposta.response.failure_list) || [], texto: typeof j === 'string' ? j : null }
       })
-      const linha = { ...base, fila: fila[0] || null, tentativas, envio_agora: decidirEnvio(cfg, sku) }
+      const linha = { ...base, sku_original: l.sku, fila: fila[0] || null, tentativas, envio_agora: decidirEnvio(cfg, sku, { agrupado: l.sku !== sku }) }
       const conta = contas.find((c) => c.active === true && String(c.ml_user_id) === base.shop_id)
       if (!conta) { anuncios.push({ ...linha, erro: 'loja Shopee não conectada/ativa nesta empresa', conclusao: { pode_enviar: false, motivo: 'loja não conectada' } }); continue }
       linha.loja = conta.nickname
@@ -734,13 +809,14 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
   // (piloto/ativo, Full, conta, leitura antes, reserva). Recusa se o item já está na fila ou se houve envio há menos de 1 minuto.
   async function tentarShopeeUmaVez({ empresaId, filaId }) {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(filaId || ''))) throw Object.assign(new Error('Informe o item da fila (fila_id).'), { status: 400 })
-    const f = await q(sb.from('estoque_sync_fila').select('id, sku, destino, status').eq('id', filaId).eq('empresa_id', empresaId).maybeSingle(), 'fila')
+    const f = await q(sb.from('estoque_sync_fila').select('id, sku, destino, status, conta_ref, anuncio_id, variacao_id').eq('id', filaId).eq('empresa_id', empresaId).maybeSingle(), 'fila')
     if (!f || f.destino !== 'shopee') throw Object.assign(new Error('Item da fila da Shopee não encontrado.'), { status: 404 })
     if (['pendente', 'enviando'].includes(f.status)) throw Object.assign(new Error('Este item já está na fila — aguarde o resultado.'), { status: 409 })
     const desde = new Date(Date.now() - 60000).toISOString()
     const recente = await q(sb.from('estoque_sync_log').select('id').eq('fila_id', filaId).not('http_status', 'is', null).gte('criado_em', desde).limit(1), 'tentativa recente')
     if ((recente || []).length) throw Object.assign(new Error('Houve um envio para este anúncio há menos de 1 minuto — aguarde antes de tentar de novo.'), { status: 429 })
-    const envioAgora = decidirEnvio(await lerConfig(empresaId), f.sku)
+    const gTentar = await grupos.carregar(empresaId)
+    const envioAgora = decidirEnvio(await lerConfig(empresaId), f.sku, { agrupado: !!gTentar.doAnuncio('shopee', f.anuncio_id, f.variacao_id || '') })
     await q(sb.from('estoque_sync_fila').update({ status: 'pendente', tentativas: 0, proxima_tentativa: new Date().toISOString(), atualizado_em: new Date().toISOString() })
       .eq('id', filaId).eq('empresa_id', empresaId).not('status', 'in', '(pendente,enviando)'), 'tentar 1 vez')
     log(`🔁 [ESTOQUE] tentativa manual (1 vez) — fila ${filaId}, SKU ${f.sku}: ${envioAgora.real ? 'envio real' : 'simulação'} (${envioAgora.motivo})`)
@@ -749,10 +825,13 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
   }
 
   // Ajuste em massa Marketplaces (ML e Shopee) → TMP10 — módulo separado, usa o MESMO caminho oficial (só LÊ as plataformas)
-  const ajusteMassa = criarAjusteMassa({ sb, ml, shopee, q, rpc, movimentar, lerConfig, decidirEnvio, log, dormir: () => dormir(esperaEntreEnviosMs),
+  const ajusteMassa = criarAjusteMassa({ sb, ml, shopee, grupos, q, rpc, movimentar, lerConfig, decidirEnvio, log, dormir: () => dormir(esperaEntreEnviosMs),
     limiteQuantidade: limiteAjusteMassa })
 
-  return { ajusteMassa, diagnosticoShopee, tentarShopeeUmaVez, movimentar, registrarVenda, registrarCancelamento, ajustar, enfileirarSku, processarMovimentosPendentes, processarFila, processarItem,
+  // Agrupar anúncios por produto principal (decisão manual; só grava o agrupamento — nenhum saldo muda aqui)
+  const agrupamento = criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMassa, log, dormir: () => dormir(esperaEntreEnviosMs) })
+
+  return { grupos, agrupamento, registrarPendenciaVenda, ajusteMassa, diagnosticoShopee, tentarShopeeUmaVez, movimentar, registrarVenda, registrarCancelamento, ajustar, enfileirarSku, processarMovimentosPendentes, processarFila, processarItem,
     conferir, iniciarConferencia, statusConferencia, conferirTodas, previa, sincronizar, resolverDivergencia, salvarConfig, lerConfig, painel,
     movimentosDoSku, liberarPausa, agendarProcessamento }
 }
