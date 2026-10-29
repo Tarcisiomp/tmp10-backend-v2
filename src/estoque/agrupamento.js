@@ -373,7 +373,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
   }
 
   // ── CONFIRMAR AGRUPAMENTO (grava atômico; nada de estoque muda) ──────────────────────────────────────────────────
-  async function confirmar({ empresaId, usuarioId, produtoSku, adicionar = [], remover = [], conferido, assinatura, operacaoId }) {
+  async function confirmar({ empresaId, usuarioId, produtoSku, adicionar = [], remover = [], conferido, assinatura, operacaoId, produtos = [], origem = 'estoque' }) {
     if (conferido !== true) throw erroHttp('Marque "Conferi que todos estes anúncios são exatamente a mesma peça física" antes de confirmar.', 400)
     const pv = await previa({ empresaId, produtoSku, adicionar, remover })
     if (!assinatura || pv.assinatura !== assinatura) throw erroHttp('A seleção ou o agrupamento mudou desde a prévia. Gere a prévia de novo e confira.', 409, { previa: pv })
@@ -382,7 +382,9 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
     const acao = pv.adicionar.length && pv.final.length === pv.adicionar.length ? 'agrupar' : (!pv.final.length ? 'desfazer' : 'editar')
     const op = ehUuid(operacaoId) ? operacaoId : crypto.randomUUID()
     const detalhe = { principal: pv.principal, adicionados: pv.adicionar.map(({ ao_vivo, ...x }) => ({ ...x, titulo: ao_vivo ? ao_vivo.titulo : null, quantidade_lida: ao_vivo ? ao_vivo.quantidade : null })),
-      removidos: pv.remover, alertas_mostrados: pv.alertas.map((a) => a.motivo), quantidade_final: pv.quantidade_final, modo: pv.config.modo }
+      removidos: pv.remover, alertas_mostrados: pv.alertas.map((a) => a.motivo), quantidade_final: pv.quantidade_final, modo: pv.config.modo,
+      // de onde veio a operação e quais PRODUTOS do catálogo o usuário selecionou (tela Produtos → "Agrupar selecionados")
+      origem: origem === 'produtos' ? 'produtos' : 'estoque', produtos_selecionados: [...new Set((Array.isArray(produtos) ? produtos : []).map(String))].slice(0, 200) }
     let r
     try { r = await rpc('estoque_agrupamento_aplicar', { p_empresa: empresaId, p_operacao: op, p_produto: pv.principal.sku, p_usuario: usuarioId || null, p_acao: acao,
       p_adicionar: pv.adicionar.map((a) => ({ plataforma: a.plataforma, conta_ref: a.conta_ref, conta_nome: a.conta_nome, anuncio_id: a.anuncio_id, variacao_id: a.variacao_id, sku_original: a.sku_original })),
@@ -395,7 +397,30 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
     return { ok: true, operacao_id: op, acao, duplicado: !!(r && r.duplicado), adicionados: pv.adicionar.length, removidos: pv.remover.length, grupo: await detalheGrupo({ empresaId, produtoSku: pv.principal.sku }) }
   }
 
-  return { produtos, anuncios, aoVivo, listarGrupos, detalheGrupo, previa, confirmar }
+  // ── Tela PRODUTOS → "Agrupar selecionados": para cada PRODUTO selecionado, os anúncios vinculados a ele (ML e Shopee,
+  // todas as contas/lojas) e a situação de agrupamento. SÓ LÊ o banco (nada é gravado, nada é consultado nas plataformas).
+  // Produto ≠ anúncio: cada produto traz a lista dos SEUS anúncios; o agrupamento continua sendo feito por anúncio.
+  async function produtosAnuncios({ empresaId, skus }) {
+    const lista = [...new Set((Array.isArray(skus) ? skus : []).map((x) => String(x).trim()).filter(Boolean))]
+    if (!lista.length) throw erroHttp('Selecione ao menos um produto.', 400)
+    if (lista.length > 200) throw erroHttp('No máximo 200 produtos por agrupamento.', 400)
+    const g = await grupos.carregar(empresaId)
+    const cat = await catalogo(empresaId, g, await contasDaEmpresa(empresaId))
+    const prods = await produtosMap(empresaId, lista)
+    const porSku = new Map()
+    for (const a of cat.values()) { if (!porSku.has(a.sku_original)) porSku.set(a.sku_original, []); porSku.get(a.sku_original).push(publico(a)) }
+    return {
+      produtos: lista.map((sku) => {
+        const p = prods.get(sku)
+        return { sku, nome: p ? p.name : null, estoque: p ? p.estoque_atual : null, foto: p ? p.photo || null : null, cadastrado: !!p, duplicado: !!(p && p.duplicado),
+          agrupado_em: g.principalDe(sku), anuncios: (porSku.get(sku) || []).sort((a, b) => a.chave.localeCompare(b.chave)),
+          // anúncios de OUTROS SKUs que já estão agrupados neste produto (quando ele já é principal)
+          ja_agrupados: g.membros(sku).map((m) => ({ id: m.id, chave: chaveDe(m), plataforma: m.plataforma, conta_nome: m.conta_nome, anuncio_id: m.anuncio_id, variacao_id: m.variacao_id, sku_original: m.sku_original })) }
+      })
+    }
+  }
+
+  return { produtos, anuncios, aoVivo, listarGrupos, detalheGrupo, previa, confirmar, produtosAnuncios }
 }
 
 module.exports = { criarAgrupamento }
