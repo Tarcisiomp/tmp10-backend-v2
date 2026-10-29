@@ -1,7 +1,18 @@
 // Rotas /api/estoque/* — Estoque Central. Sempre com sessão de ADMINISTRADOR; a empresa vem SEMPRE da sessão
 // (qualquer empresa_id enviado pelo navegador é ignorado). Funcionário e vendedor não alteram estoque por aqui.
 const express = require('express')
-const VERSAO_ESTOQUE = '2026-10-29b-estoque-full'
+const VERSAO_ESTOQUE = '2026-10-30-final'
+// SHA-256 de cada arquivo do módulo de estoque CARREGADO por este processo: /api/estoque/versao devolve a lista para conferir,
+// arquivo por arquivo, que o Railway roda exatamente os arquivos do pacote (o MANIFESTO traz os mesmos hashes).
+const ARQUIVOS_ESTOQUE = (() => {
+  try {
+    const fs = require('fs'); const path = require('path'); const crypto = require('crypto')
+    const h = (arq) => crypto.createHash('sha256').update(fs.readFileSync(arq)).digest('hex')
+    const r = Object.fromEntries(fs.readdirSync(__dirname).filter((f) => f.endsWith('.js')).sort().map((f) => ['src/estoque/' + f, h(path.join(__dirname, f))]))
+    try { r['server.js'] = h(path.join(__dirname, '..', '..', 'server.js')) } catch (e) { /* fora do repositório (testes) */ }
+    return r
+  } catch (e) { return { erro: e.message } }
+})()
 
 function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console.log }) {
   const router = express.Router()
@@ -22,7 +33,7 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
   // Versão do módulo de estoque publicada (SEM login; não expõe dados): serve para conferir, depois do deploy, se o
   // Railway está rodando o código novo — antes de publicar a interface. commit = RAILWAY_GIT_COMMIT_SHA (variável do Railway).
   router.get('/api/estoque/versao', (req, res) => res.json({ ok: true, modulo: 'estoque', versao: VERSAO_ESTOQUE, agrupamento: true,
-    agrupamento_produtos: true, estoque_full_por_anuncio: true, commit: process.env.RAILWAY_GIT_COMMIT_SHA ? String(process.env.RAILWAY_GIT_COMMIT_SHA).slice(0, 7) : null }))
+    agrupamento_produtos: true, estoque_full_por_anuncio: true, diagnostico: true, revisao: true, devolucao_manual: true, arquivos: ARQUIVOS_ESTOQUE, commit: process.env.RAILWAY_GIT_COMMIT_SHA ? String(process.env.RAILWAY_GIT_COMMIT_SHA).slice(0, 7) : null }))
   const responder = (fn) => async (req, res) => {
     try {
       const r = await fn(req, res)
@@ -103,6 +114,26 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
   }))
   router.get('/api/estoque/full/consultar/status', ...admin, responder(async (req) => ({ consulta: estoque.full.statusConsulta(req.empresaId) })))
   router.get('/api/estoque/full/historico', ...admin, responder(async (req) => estoque.full.historico({ empresaId: req.empresaId, contaRef: String(req.query.conta || ''), anuncioId: String(req.query.anuncio || '') })))
+
+  // 🩺 Diagnóstico único (SÓ LEITURA) antes de agrupar: produtos + anúncios ao vivo + Full + reservas + divergências
+  // classificadas + pedidos pendentes + migrações + (com principal) a prévia do agrupamento
+  router.post('/api/estoque/diagnostico', ...admin, responder(async (req) => ({ diagnostico: await estoque.diagnostico.diagnosticar({ empresaId: req.empresaId,
+    skus: listaStr(corpo(req).skus, 201), principal: String(corpo(req).principal || '').slice(0, 120), adicionar: Array.isArray(corpo(req).adicionar) ? listaStr(corpo(req).adicionar, 501) : null }) })))
+  router.get('/api/estoque/diagnostico/migracoes', ...admin, responder(async (req) => ({ migracoes: await estoque.diagnostico.infraestrutura(req.empresaId) })))
+  // Ação EXPLÍCITA: ignorar divergências de anúncios Full (confirma ao vivo que é Full; não mexe em estoque)
+  router.post('/api/estoque/diagnostico/ignorar-divergencias-full', ...admin, responder(async (req) => {
+    if (corpo(req).confirmacao !== 'IGNORAR DIVERGENCIAS FULL') throw Object.assign(new Error('Para confirmar, envie exatamente: IGNORAR DIVERGENCIAS FULL'), { status: 400 })
+    return estoque.diagnostico.ignorarDivergenciasFull({ empresaId: req.empresaId, ids: listaStr(corpo(req).ids, 201), usuarioId: req.usuario.id })
+  }))
+
+  // 📝 Revisão manual auditada (contagem física) e devolução recebida — confirmação explícita obrigatória
+  router.get('/api/estoque/revisao/pendentes', ...admin, responder(async (req) => estoque.revisao.pendentes({ empresaId: req.empresaId })))
+  router.post('/api/estoque/revisao/ajustar', ...admin, responder(async (req) => { const b = corpo(req)
+    return estoque.revisao.revisarSaldo({ empresaId: req.empresaId, sku: b.sku, contagem: b.contagem, estoqueEsperado: b.estoque_esperado, motivo: b.motivo,
+      conferido: b.conferido === true, usuarioId: req.usuario.id, idOperacao: b.id_operacao }) }))
+  router.post('/api/estoque/devolucao', ...admin, responder(async (req) => { const b = corpo(req)
+    return estoque.revisao.registrarDevolucao({ empresaId: req.empresaId, plataforma: String(b.plataforma || ''), pedidoId: b.pedido, sku: b.sku, quantidade: b.quantidade,
+      recebido: b.recebido === true, motivo: b.motivo, usuarioId: req.usuario.id }) }))
 
   // Diagnóstico ML (SÓ LEITURA): quantidade atual de cada anúncio vinculado — GET /api/estoque/diagnostico-ml?skus=A,B
   router.get('/api/estoque/diagnostico-ml', ...admin, responder(async (req) => ({ diagnostico: await estoque.ajusteMassa.diagnosticoML({ empresaId: req.empresaId, skus: String(req.query.skus || '') }) })))

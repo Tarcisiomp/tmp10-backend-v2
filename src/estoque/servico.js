@@ -44,6 +44,8 @@ const { criarAjusteMassa } = require('./ajusteMassa')
 const { criarGrupos } = require('./grupos')
 const { criarAgrupamento } = require('./agrupamento')
 const { criarFull } = require('./full')
+const { criarDiagnostico } = require('./diagnostico')
+const { criarRevisao } = require('./revisao')
 const inteiro = (v) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Math.trunc(Number(v)))
 
 function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitado = () => false, permitirSandbox = false,
@@ -335,6 +337,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
       const lerShopee = () => item.variacao_id ? shopee.lerModelos(destino.conta, item.anuncio_id) : shopee.lerItens(destino.conta, [item.anuncio_id])
       const antesSh = (await lerShopee()).get(item.variacao_id || item.anuncio_id)
       if (!antesSh || antesSh.quantidade === null) return concluir('erro', { alvo, erro: `item${item.variacao_id ? '/variação' : ''} não encontrado na loja Shopee ${destino.conta.nickname} — envio não feito` })
+      // estoque no armazém da Shopee (FBS): o anúncio é atendido pela Shopee — o TMP10 não envia (mesma regra do Full do ML)
+      if (antesSh.fbs > 0) return concluir('bloqueado', { alvo, erro: `item/variação com ${antesSh.fbs} unidade(s) no armazém da Shopee (FBS) — o estoque FBS fica com a Shopee; o TMP10 não envia o estoque normal para ele` })
       if (!item.variacao_id && antesSh.tem_variacao) return concluir('bloqueado', { alvo, erro: 'item com variações na Shopee, mas o vínculo está sem model_id — vincule a variação certa (envio não feito)' })
       // Reserva de PROMOÇÃO (doc da Shopee: estoque enviado tem de ser >= total_reserved_stock). Se a Shopee informou a reserva e o
       // TMP10 tem menos, NÃO envia (seria recusado) e NÃO aumenta o número. Sem a informação, segue e a Shopee decide.
@@ -436,6 +440,10 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
         // anúncio Full: o número do ML é o saldo do armazém do ML — NÃO é comparado com o estoque normal (nem vira divergência)
         linha.situacao = 'full'; linha.inventory_id = leitura.inventory_id
         linha.erro = `anúncio Full (inventory_id ${leitura.inventory_id}): o número do ML é o estoque Full — não é comparado com o estoque normal do TMP10`
+      }
+      else if (base.destino === 'shopee' && leitura.fbs > 0) {
+        // Shopee com estoque no armazém dela (FBS): o número não é comparável com o estoque normal
+        linha.situacao = 'full'; linha.erro = `${leitura.fbs} unidade(s) no armazém da Shopee (FBS) — não é comparado com o estoque normal do TMP10`
       }
       else if (leitura.variacoes > 0) { linha.situacao = 'variacao_ml'; linha.erro = `anúncio com ${leitura.variacoes} variação(ões) no ML — envio bloqueado (PRECISA CONFIRMAR)` }
       else if (f && ['pendente', 'enviando', 'erro_temporario'].includes(f.status)) linha.situacao = 'em_envio'
@@ -850,7 +858,12 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
   // Agrupar anúncios por produto principal (decisão manual; só grava o agrupamento — nenhum saldo muda aqui)
   const agrupamento = criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMassa, full, log, dormir: () => dormir(esperaEntreEnviosMs) })
 
-  return { grupos, agrupamento, full, registrarPendenciaVenda, ajusteMassa, diagnosticoShopee, tentarShopeeUmaVez, movimentar, registrarVenda, registrarCancelamento, ajustar, enfileirarSku, processarMovimentosPendentes, processarFila, processarItem,
+  // Diagnóstico único (só leitura) antes de agrupar — mesmas regras da prévia
+  // Revisão manual auditada (contagem) e devolução recebida — nada automático
+  const revisao = criarRevisao({ sb, q, grupos, movimentar, log })
+  const diagnostico = criarDiagnostico({ sb, ml, grupos, q, lerConfig, envioHabilitado, agrupamento, ajusteMassa, full, log })
+
+  return { grupos, agrupamento, full, diagnostico, revisao, registrarPendenciaVenda, ajusteMassa, diagnosticoShopee, tentarShopeeUmaVez, movimentar, registrarVenda, registrarCancelamento, ajustar, enfileirarSku, processarMovimentosPendentes, processarFila, processarItem,
     conferir, iniciarConferencia, statusConferencia, conferirTodas, previa, sincronizar, resolverDivergencia, salvarConfig, lerConfig, painel,
     movimentosDoSku, liberarPausa, agendarProcessamento }
 }

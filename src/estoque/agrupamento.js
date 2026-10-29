@@ -25,6 +25,7 @@
 //   Full/FBS (o saldo Full fica NO ANÚNCIO: não é somado ao principal nem aos outros anúncios) · reserva de promoção · sincronização desligada · modo ATIVO (o estoque do principal irá aos anúncios na
 //   próxima movimentação). Em PILOTO, anúncio agrupado NUNCA recebe envio real (servico.decidirEnvio).
 const crypto = require('crypto')
+const { classificarDivergencia, codificar, tipoPedido } = require('./regrasDiagnostico')
 const ROT = { mercadolivre: 'ML', shopee: 'Shopee' }
 const erroHttp = (msg, status, extra = {}) => Object.assign(new Error(msg), { status, ...extra })
 const ehUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v || ''))
@@ -330,7 +331,10 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
         }
         else if (f.situacao === 'erro' && f.inventory_id) bloq(`${nome(a)}: anúncio FULL (inventory_id ${f.inventory_id}), mas a consulta do saldo Full falhou (${f.erro}) — sem confirmar o Full, não agrupa. Tente de novo em instantes`, a.chave)
         else if (f.situacao === 'erro') bloq(`${nome(a)}: não foi possível confirmar se o anúncio é Full (${f.erro}) — sem conferir, não agrupa`, a.chave)
-        else if (f.situacao === 'indisponivel') alerta(`${nome(a)}: anúncio com inventory_id ${f.inventory_id || '—'}, mas o ML não informa o saldo Full (${f.erro}). Saldo Full "Indisponível para consulta" — NÃO é tratado como zero; o TMP10 não envia estoque para anúncio com inventory_id`, a.chave)
+        // inventory_id presente, mas o ML não informa o saldo (ex.: 404 — o anúncio pode ter saído do Full mantendo o identificador
+        // antigo). Sem informação confiável da logística/saldo, NÃO agrupa: o anúncio fica fora até o ML confirmar.
+        else if (f.situacao === 'indisponivel' && f.inventory_id) bloq(`${nome(a)}: anúncio com inventory_id ${f.inventory_id}, mas o ML não confirma o saldo Full (${f.erro}). Pode ter saído do Full mantendo o identificador antigo — sem informação confiável da logística, não agrupa. Deixe este anúncio fora ou confirme a logística no Mercado Livre`, a.chave)
+        else if (f.situacao === 'indisponivel') alerta(`${nome(a)}: Full indisponível para consulta (${f.erro}) — NÃO é tratado como zero`, a.chave)
       }
     }
 
@@ -347,20 +351,31 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
       const sem = (await q(sb.from('estoque_movimentos').select('sku, referencia, observacao').eq('empresa_id', empresaId).eq('aplicado', false).in('origem', ['venda_mercadolivre', 'venda_shopee']).in('sku', envolvidos).gte('criado_em', desde).limit(200), 'vendas sem baixa')) || []
       for (const x of envolvidos) { const n = sem.filter((m) => m.sku === x).length; if (n) alerta(`o SKU ${x} tem ${n} venda(s) SEM baixa nos últimos ${JANELA_DIAS} dias (pendências) — confira o estoque do ${sku} depois`) }
       const div = (await q(sb.from('estoque_divergencias').select('id, sku, plataforma, conta_ref, anuncio_id, variacao_id, estoque_tmp10, estoque_ml, ocorrencias, detectado_em, atualizado_em').eq('empresa_id', empresaId).not('chave', 'is', null).not('resolvido', 'is', true).in('sku', envolvidos).limit(200), 'divergências')) || []
-      // anúncios que a API do ML CONFIRMOU agora como Full (inventory_id + saldo Full lido e validado): a "divergência" deles
-      // comparava o número do Full com o estoque normal (conferência antiga) — não é divergência do estoque normal
-      const fullConfirmado = new Set(novos.filter((a) => a.plataforma === 'mercadolivre' && a.full && a.full.situacao === 'atualizado' && a.full.inventory_id).map((a) => `${a.conta_ref}|${a.anuncio_id}`))
+      // classificação ÚNICA (regrasDiagnostico.js — a mesma do diagnóstico completo), com a leitura AO VIVO dos anúncios que entram
+      const porChaveNovo = new Map(novos.map((a) => [`${a.conta_ref}|${a.anuncio_id}|${a.variacao_id || ''}`, a]))
       const desc = (d) => `#${d.id} ${ROT[d.plataforma] || d.plataforma || '?'} ${d.anuncio_id || '?'}${d.variacao_id ? '/' + d.variacao_id : ''}: TMP10 ${d.estoque_tmp10 ?? '—'} × plataforma ${d.estoque_ml ?? '—'}${d.ocorrencias > 1 ? ` (${d.ocorrencias}×)` : ''}, desde ${d.detectado_em ? new Date(d.detectado_em).toISOString().slice(0, 10) : '—'}`
+      const TEXTO = {
+        full: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) antiga(s) em anúncio FULL confirmado pela API (${l.map(desc).join(' · ')}). Ela comparava o saldo Full com o estoque normal — não é divergência do estoque normal e NÃO bloqueia. Nada foi alterado: no painel do Estoque, use "Ignorar" nela (não use "Aceitar")`,
+        obsoleta: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) que o anúncio já resolveu (${l.map((d) => desc(d) + ` → hoje o anúncio mostra ${d._vivo}`).join(' · ')}): o anúncio já mostra o número atual do TMP10 — NÃO bloqueia; "Conferir de novo" fecha`,
+        reserva: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) com reserva de promoção maior que o TMP10 na Shopee (${l.map((d) => desc(d) + ` · reserva ${d._reserva}`).join(' · ')}) — a Shopee recusa o número do TMP10 enquanto a reserva existir`,
+        preenchimento: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) em anúncio com número de preenchimento (999 ou mais) (${l.map((d) => desc(d) + ` → hoje ${d._vivo}`).join(' · ')}) — não é estoque físico`,
+        tmp10_negativo: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) e o estoque normal do TMP10 está negativo (${prods.get(x) ? prods.get(x).estoque_atual : '—'}) (${l.map(desc).join(' · ')})`,
+        sem_leitura: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) sem leitura atual do anúncio (${l.map((d) => desc(d) + (d._det ? ': ' + d._det : '')).join(' · ')}) — sem conferir, não decide`,
+        real: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) NÃO resolvida(s) (TMP10 × plataforma): ${l.map((d) => desc(d) + (d._vivo !== undefined ? ` → hoje ${d._vivo}` : '')).join(' · ')} — resolva no painel do Estoque (aceitar, enviar o número do TMP10 ou ignorar) antes de agrupar`
+      }
       for (const x of envolvidos) {
         const doSku = div.filter((d) => d.sku === x)
         if (!doSku.length) continue
-        const deFull = doSku.filter((d) => d.plataforma === 'mercadolivre' && fullConfirmado.has(`${d.conta_ref}|${d.anuncio_id}`))
-        const reais = doSku.filter((d) => !deFull.includes(d))
-        if (deFull.length) alerta(`o SKU ${x} tem ${deFull.length} divergência(s) antiga(s) em anúncio FULL confirmado pela API (${deFull.map(desc).join(' · ')}). Ela comparava o saldo Full com o estoque normal — não é divergência do estoque normal e NÃO bloqueia. Nada foi alterado: no painel do Estoque, use "Ignorar" nela (não use "Aceitar")`)
-        if (!reais.length) continue
-        // divergência NÃO resolvida nos anúncios que ENTRAM: bloqueia (o número da plataforma ainda não foi decidido)
-        if (originaisNovos.includes(x)) bloq(`o SKU ${x} tem ${reais.length} divergência(s) NÃO resolvida(s) (TMP10 × plataforma): ${reais.map(desc).join(' · ')} — resolva no painel do Estoque (aceitar, enviar o número do TMP10 ou ignorar) antes de agrupar`)
-        else alerta(`o SKU ${x} tem ${reais.length} divergência(s) aberta(s) (${reais.map(desc).join(' · ')}) — depois, use "Conferir de novo"`)
+        if (!originaisNovos.includes(x)) { alerta(`o SKU ${x} tem ${doSku.length} divergência(s) aberta(s) (${doSku.map(desc).join(' · ')}) — depois, use "Conferir de novo"`); continue }
+        const porClasse = {}
+        for (const d of doSku) {
+          const a = porChaveNovo.get(`${d.conta_ref}|${d.anuncio_id}|${d.variacao_id || ''}`)
+          const fullOk = !!(a && d.plataforma === 'mercadolivre' && a.full && a.full.situacao === 'atualizado' && a.full.inventory_id)
+          const vivo = a && a.ao_vivo ? a.ao_vivo : null
+          const c = classificarDivergencia(d, { vivo, tmp10Atual: prods.get(x) ? prods.get(x).estoque_atual : null, fullConfirmado: fullOk })
+          ;(porClasse[c.classe] = porClasse[c.classe] || []).push({ ...d, _vivo: vivo ? vivo.quantidade : undefined, _reserva: vivo ? vivo.reserva : undefined, _det: c.detalhe })
+        }
+        for (const [classe, l] of Object.entries(porClasse)) (['full', 'obsoleta'].includes(classe) ? alerta : bloq)(TEXTO[classe](x, l))
       }
     }
 
@@ -372,17 +387,28 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
       try { pend = await ajusteMassa.pedidosPendentes(empresaId, refs) } catch (e) { pend = { naoImportados: [], erroConta: { geral: e.message } } }
       const afetados = (lista) => {
         const ids = new Set(lista.map((a) => `${a.plataforma}|${a.anuncio_id}`)); const skus = new Set(lista.map((a) => a.sku_original))
-        return pend.naoImportados.filter((pd) => !(pd.plataforma === 'shopee' && pd.fbs) && (pd.itens || []).some((it) => skus.has(it.sku) || ids.has(`${pd.plataforma}|${String(it.anuncio || it.item_id || '')}`)))
+        return pend.naoImportados.filter((pd) => (pd.itens || []).some((it) => skus.has(it.sku) || ids.has(`${pd.plataforma}|${String(it.anuncio || it.item_id || '')}`)))
       }
+      // Tipo de cada pedido pendente. Venda Full/FBS NÃO baixa o estoque normal (regra da importação no server.js), então não
+      // deixa a baixa ambígua: vira AVISO. Regra do ML = a do server.js (detectOrderType/isFulfillment): tag 'meli_fulfillment' ou
+      // logistic_type 'fulfillment' no pedido; senão GET /shipments/{id}. Sem conseguir confirmar → continua BLOQUEANDO.
+      const tipos = new Map()
+      const tipoDe = async (pd) => { const k = `${pd.plataforma}|${pd.id || pd.sn}`; if (!tipos.has(k)) tipos.set(k, await tipoPedido(pd, { contas, ml })); return tipos.get(k) }
+      const nomePd = (x) => `${ROT[x.plataforma]} ${x.id || x.sn}`
+      const separar = async (lista) => { const r = { full: [], comum: [], incerto: [] }; for (const pd of lista.slice(0, 100)) { const t = await tipoDe(pd); (t.full === true ? r.full : t.full === false ? r.comum : r.incerto).push({ ...pd, motivo_tipo: t.motivo }) } if (lista.length > 100) r.incerto.push(...lista.slice(100)); return r }
       const errosConta = Object.values(pend.erroConta || {})
       if (removidos.length) {
-        const pr = afetados(removidos)
-        if (pr.length) bloq(`há ${pr.length} pedido(s) ainda NÃO importado(s) desses anúncios (${pr.slice(0, 5).map((x) => `${ROT[x.plataforma]} ${x.id || x.sn}`).join(', ')}). Desfazer agora faria a baixa cair no produto antigo — aguarde a importação`)
+        const pr = await separar(afetados(removidos))
+        if (pr.comum.length) bloq(`há ${pr.comum.length} pedido(s) ainda NÃO importado(s) desses anúncios (${pr.comum.slice(0, 5).map(nomePd).join(', ')}). Desfazer agora faria a baixa cair no produto antigo — aguarde a importação`)
+        if (pr.incerto.length) bloq(`há ${pr.incerto.length} pedido(s) não importado(s) cujo tipo (Full ou comum) não foi possível confirmar (${pr.incerto.slice(0, 5).map((x) => nomePd(x) + (x.motivo_tipo ? ': ' + x.motivo_tipo : '')).join(' · ')}) — aguarde a importação`)
+        if (pr.full.length) alerta(`${pr.full.length} pedido(s) Full/FBS ainda não importado(s) (${pr.full.slice(0, 5).map(nomePd).join(', ')}): venda Full/FBS não baixa o estoque normal — não impede`)
         if (errosConta.length) bloq(`não foi possível confirmar os pedidos (${errosConta.join(' · ')}) — sem essa conferência não dá para desfazer com segurança`)
       }
       if (novos.length) {
-        const pn = afetados(novos)
-        if (pn.length) bloq(`há ${pn.length} pedido(s) ainda NÃO importado(s) desses anúncios (${pn.slice(0, 5).map((x) => `${ROT[x.plataforma]} ${x.id || x.sn}`).join(', ')}) — aguarde a importação dos pedidos antes de agrupar (a baixa ficaria ambígua)`)
+        const pn = await separar(afetados(novos))
+        if (pn.comum.length) bloq(`há ${pn.comum.length} pedido(s) ainda NÃO importado(s) desses anúncios (${pn.comum.slice(0, 5).map(nomePd).join(', ')}) — aguarde a importação dos pedidos antes de agrupar (a baixa ficaria ambígua)`)
+        if (pn.incerto.length) bloq(`há ${pn.incerto.length} pedido(s) não importado(s) cujo tipo (Full ou comum) não foi possível confirmar (${pn.incerto.slice(0, 5).map((x) => nomePd(x) + (x.motivo_tipo ? ': ' + x.motivo_tipo : '')).join(' · ')}) — aguarde a importação dos pedidos antes de agrupar`)
+        if (pn.full.length) alerta(`${pn.full.length} pedido(s) Full/FBS ainda não importado(s) (${pn.full.slice(0, 5).map(nomePd).join(', ')}): venda Full/FBS não baixa o estoque normal, então não deixa a baixa ambígua — não impede o agrupamento`)
         if (errosConta.length && !removidos.length) bloq(`não foi possível confirmar os pedidos (${errosConta.join(' · ')}) — sem essa conferência não dá para agrupar com segurança`)
       }
     }
@@ -398,7 +424,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
       principal: { sku, nome: p ? p.name : null, estoque: p ? p.estoque_atual : null, foto: p ? p.photo || null : null },
       adicionar: novos.map(detalhe), remover: removidos.map((m) => ({ id: m.id, ...detalhe({ ...m, chave: chaveDe(m) }) })),
       final: finais.map((a) => ({ chave: a.chave, plataforma: a.plataforma, conta_nome: a.conta_nome, anuncio_id: a.anuncio_id, variacao_id: a.variacao_id || '', sku_original: a.sku_original, novo: !a.atual })),
-      quantidade_final: finais.length, bloqueios, alertas, pode_confirmar: bloqueios.length === 0 && (novos.length + removidos.length) > 0, assinatura,
+      quantidade_final: finais.length, bloqueios: bloqueios.map((b) => codificar(b, 'bloqueio')), alertas: alertas.map((x) => codificar(x, 'aviso')), pode_confirmar: bloqueios.length === 0 && (novos.length + removidos.length) > 0, assinatura,
       config: { modo: cfg.modo }
     }
   }
@@ -451,7 +477,8 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
     }
   }
 
-  return { produtos, anuncios, aoVivo, listarGrupos, detalheGrupo, previa, confirmar, produtosAnuncios }
+  return { produtos, anuncios, aoVivo, listarGrupos, detalheGrupo, previa, confirmar, produtosAnuncios,
+    interno: { catalogo, lerAoVivo, contasDaEmpresa, produtosMap, publico } }
 }
 
 module.exports = { criarAgrupamento }

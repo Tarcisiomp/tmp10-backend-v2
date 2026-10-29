@@ -148,6 +148,9 @@ function criarMercadoLivre({ axios, getToken, refreshToken, timeout = 8000 }) {
         const total = data && data.paging && Number.isFinite(Number(data.paging.total)) ? Number(data.paging.total) : 0
         for (const o of resultados) {
           pedidos.push({ id: String(o.id), status: o.status || status, criado: o.date_created || null,
+            // tipo de envio — MESMOS campos que o server.js usa (detectOrderType): tags 'meli_fulfillment', shipping.logistic_type, shipping.id
+            tags: Array.isArray(o.tags) ? o.tags.map(String) : [], logistica: o.shipping && o.shipping.logistic_type ? String(o.shipping.logistic_type).toLowerCase() : null,
+            envio_id: o.shipping && o.shipping.id ? String(o.shipping.id) : null,
             itens: (o.order_items || []).map((it) => ({ anuncio: it && it.item && it.item.id ? String(it.item.id) : null,
               sku: it && it.item && it.item.seller_sku ? String(it.item.seller_sku).trim() : null, qtd: Number(it && it.quantity) || 1 })) })
         }
@@ -163,6 +166,17 @@ function criarMercadoLivre({ axios, getToken, refreshToken, timeout = 8000 }) {
       const { data } = await axios.get(`${ML_API}/orders/${encodeURIComponent(id)}`, { headers: { Authorization: `Bearer ${token}` }, timeout })
       return { id: String(id), status: data && data.status ? String(data.status) : null }
     }, `ML GET /orders/${id} (${conta.nickname})`)
+  }
+
+  // Envio de um pedido (SÓ LEITURA) — mesmo endpoint e mesma regra do server.js (isFulfillment): GET /shipments/{id};
+  // Full = logistic_type 'fulfillment' ou tag 'meli_fulfillment'
+  async function lerEnvio(conta, id) {
+    return comToken(conta, async (token) => {
+      const { data } = await axios.get(`${ML_API}/shipments/${encodeURIComponent(id)}`, { headers: { Authorization: `Bearer ${token}` }, timeout })
+      const logistica = data && data.logistic_type ? String(data.logistic_type).toLowerCase() : null
+      const tags = data && Array.isArray(data.tags) ? data.tags.map(String) : []
+      return { id: String(id), logistica, tags, full: logistica === 'fulfillment' || tags.includes('meli_fulfillment') }
+    }, `ML GET /shipments/${id} (${conta.nickname})`)
   }
 
   // Saldo FULL de um anúncio (SÓ LEITURA). Doc oficial ML "Envios Fulfillment" (developers.mercadolibre — fulfillment):
@@ -184,7 +198,7 @@ function criarMercadoLivre({ axios, getToken, refreshToken, timeout = 8000 }) {
     }, `ML GET /inventories/${inventoryId}/stock/fulfillment (${conta.nickname})`)
   }
 
-  return { lerAnuncios, enviar, buscarPedidos, lerPedido, lerEstoqueFull }
+  return { lerAnuncios, enviar, buscarPedidos, lerPedido, lerEnvio, lerEstoqueFull }
 }
 
 function criarShopee({ axios, host, partnerId, assinar, getToken, refreshToken, timeout = 10000 }) {
@@ -234,6 +248,11 @@ function criarShopee({ axios, host, partnerId, assinar, getToken, refreshToken, 
     const v = x && x.stock_info_v2 && x.stock_info_v2.summary_info ? x.stock_info_v2.summary_info.total_reserved_stock : null
     return v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v)) ? Number(v) : null
   }
+  // Estoque no ARMAZÉM DA SHOPEE (FBS): soma de stock_info_v2.shopee_stock[].stock (doc). null quando a Shopee não informa.
+  const fbsDe = (x) => {
+    const l = x && x.stock_info_v2 && Array.isArray(x.stock_info_v2.shopee_stock) ? x.stock_info_v2.shopee_stock : null
+    return l ? l.reduce((t, s) => t + (Number(s && s.stock) || 0), 0) : null
+  }
   const estoqueDe = (x) => {
     const v = x && x.stock_info_v2 && x.stock_info_v2.summary_info ? x.stock_info_v2.summary_info.total_available_stock : null
     return Number.isFinite(Number(v)) && v !== null ? Number(v) : null
@@ -247,7 +266,7 @@ function criarShopee({ axios, host, partnerId, assinar, getToken, refreshToken, 
     const mapa = new Map()
     // PRECISA CONFIRMAR: "has_model" — usado SÓ para bloquear envio sem model_id a item que tem variações
     // "bruto" = o objeto como a Shopee devolveu (só para a consulta de diagnóstico; não entra em nenhuma decisão)
-    for (const item of ((data && data.response && data.response.item_list) || [])) mapa.set(String(item.item_id), { quantidade: estoqueDe(item), reservada: reservaDe(item), tem_variacao: item.has_model === true, bruto: item })
+    for (const item of ((data && data.response && data.response.item_list) || [])) mapa.set(String(item.item_id), { quantidade: estoqueDe(item), reservada: reservaDe(item), fbs: fbsDe(item), tem_variacao: item.has_model === true, bruto: item })
     return mapa
   }
 
@@ -261,7 +280,7 @@ function criarShopee({ axios, host, partnerId, assinar, getToken, refreshToken, 
       const ops = Array.isArray(m.tier_index) ? m.tier_index.map((ix, i) => (tiers[i] && Array.isArray(tiers[i].option_list) ? tiers[i].option_list[ix] : null)) : []
       const nome = ops.filter((o) => o && o.option).map((o) => o.option).join(' / ') || null
       const comImagem = ops.find((o) => o && o.image && o.image.image_url)
-      mapa.set(String(m.model_id), { quantidade: estoqueDe(m), reservada: reservaDe(m), bruto: m, nome, imagem: comImagem ? comImagem.image.image_url : null })
+      mapa.set(String(m.model_id), { quantidade: estoqueDe(m), reservada: reservaDe(m), fbs: fbsDe(m), bruto: m, nome, imagem: comImagem ? comImagem.image.image_url : null })
     }
     return mapa
   }

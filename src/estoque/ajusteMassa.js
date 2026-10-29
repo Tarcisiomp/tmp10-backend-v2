@@ -25,6 +25,7 @@ const LOTE_EXECUCAO = 20
 const VALIDADE_MINUTOS = 60        // depois que a simulação TERMINA
 const VALIDADE_MAXIMA_HORAS = 24   // teto absoluto (gravado no cabeçalho, que é imutável)
 const JANELA_DIAS = 30
+const { tipoPedido } = require('./regrasDiagnostico')
 const STATUS_PEDIDOS_ML = ['paid', 'payment_in_process', 'confirmed']   // confirmed: doc oficial do ML (desconta estoque)
 const STATUS_ML_CANCELADO = ['cancelled', 'invalid']                      // valores oficiais do ML
 const TRAVA_SEGUNDOS = 120
@@ -266,7 +267,8 @@ function criarAjusteMassa({ sb, ml, shopee, grupos, q, rpc, movimentar, lerConfi
       r.numero_lido = numeros[0]; r.anuncio_origem = `${daOrigem[0].plataforma}:${daOrigem[0].anuncio_id}${daOrigem[0].variacao_id ? '/' + daOrigem[0].variacao_id : ''}`
       r.contas_origem = [...new Set(daOrigem.map((a) => `${ROTULO_PLAT[a.plataforma]} ${a.conta}`))]
       if (!Number.isInteger(r.numero_lido) || r.numero_lido < 0) { bloquear(r.sku, `número inválido no anúncio (${r.numero_lido})`); continue }
-      if (r.numero_lido > limiteQuantidade) { bloquear(r.sku, `número do anúncio (${r.numero_lido}) acima do limite provisório de ${limiteQuantidade} — revisão manual (pode ser número de preenchimento, não estoque físico)`); continue }
+      // 999, 9999… são números de PREENCHIMENTO comuns nos anúncios ("estoque infinito"), não estoque físico: a partir do limite, revisão manual
+      if (r.numero_lido >= limiteQuantidade) { bloquear(r.sku, `número do anúncio (${r.numero_lido}) igual ou acima do limite provisório de ${limiteQuantidade} — revisão manual (provável número de preenchimento do anúncio, não estoque físico)`); continue }
       if (Number(r.tmp10) >= 0 && r.numero_lido === Number(r.tmp10)) { r.situacao = 'igual'; r.motivo = 'o TMP10 já tem este número'; continue }
       r.situacao = 'apto'; r.novo = r.numero_lido
     }
@@ -277,10 +279,22 @@ function criarAjusteMassa({ sb, ml, shopee, grupos, q, rpc, movimentar, lerConfi
       const refsEnv = new Set(aptos.flatMap((r) => r.anuncios.map((a) => a.conta_ref)))
       const contasEnv = contas.filter((c) => refsEnv.has(refDe(c)))
       await atualizarPedidos(ctx, contasEnv)
+      await classificarPendentes(ctx, contas)
       verificarPedidos(ctx, aptos, bloquear)
     }
     for (const r of res.values()) { delete r._originais; for (const a of r.anuncios) { delete a._l; delete a._c } }
     return res
+  }
+
+  // Tipo (Full × comum) de cada pedido ML não importado — regra única (regrasDiagnostico.tipoPedido: tag/logistic_type do pedido
+  // ou GET /shipments/{id}, como o server.js). Sem confirmar, fica como comum (continua bloqueando).
+  async function classificarPendentes(ctx, contas) {
+    let n = 0
+    for (const p of ctx.naoImportados.values()) {
+      if (p.plataforma !== 'mercadolivre' || p.tipo_full !== undefined) continue
+      if (n++ >= 100) { p.tipo_full = null; continue }
+      p.tipo_full = (await tipoPedido(p, { contas, ml })).full
+    }
   }
 
   function verificarPedidos(ctx, aptos, bloquear) {
@@ -299,6 +313,8 @@ function criarAjusteMassa({ sb, ml, shopee, grupos, q, rpc, movimentar, lerConfi
       // (A) não importados
       for (const p of ctx.naoImportados.values()) {
         if (p.plataforma === 'shopee' && p.fbs) continue
+        // venda Full do ML não baixa o estoque normal — MESMA regra da prévia do agrupamento (regrasDiagnostico.tipoPedido)
+        if (p.plataforma === 'mercadolivre' && p.tipo_full === true) continue
         const its = p.plataforma === 'shopee' ? p.itens.filter((it) => afetaSh(it.sku, it.item_id)) : p.itens.filter((it) => afetaML(it.sku, it.anuncio))
         if (its.length) {
           const un = its.reduce((t, it) => t + (it.qtd || 1), 0)
