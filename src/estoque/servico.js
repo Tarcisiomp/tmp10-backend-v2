@@ -10,6 +10,8 @@
 //   • Envio real só se: ESTOQUE_ENVIO_HABILITADO=1 no Railway E a empresa estiver em 'ativo', ou em 'piloto' com o
 //     SKU na lista do piloto. Fora disso tudo roda em SIMULAÇÃO (calcula, registra, não envia).
 //   • Full (ML) e FBS (Shopee) nunca recebem envio; anúncio de outra conta/empresa nunca recebe envio.
+//     Full do ML = vendas Full no histórico OU anúncio com inventory_id (lido ao vivo antes de cada envio — migração 27).
+//   • O saldo FULL (armazém do ML) é outro saldo: nunca vira estoque normal, nunca é somado, nunca é comparado com o TMP10.
 
 const crypto = require('crypto')
 const { ErroPlataforma, resumir } = require('./plataformas')
@@ -41,6 +43,7 @@ const mensagemReserva = (reserva, alvo, quando) => `RESERVA DA SHOPEE: a Shopee 
 const { criarAjusteMassa } = require('./ajusteMassa')
 const { criarGrupos } = require('./grupos')
 const { criarAgrupamento } = require('./agrupamento')
+const { criarFull } = require('./full')
 const inteiro = (v) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Math.trunc(Number(v)))
 
 function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitado = () => false, permitirSandbox = false,
@@ -319,6 +322,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
         const antes = (await ml.lerAnuncios(destino.conta, [item.anuncio_id])).get(item.anuncio_id)
         if (!antes || antes.erro) return concluir('erro', { alvo, erro: (antes && antes.erro) || 'anúncio não encontrado no Mercado Livre' })
         if (antes.variacoes > 0) return concluir('bloqueado', { alvo, erro: `anúncio com ${antes.variacoes} variação(ões) no ML — PRECISA CONFIRMAR o envio por variação` })
+        // anúncio FULL (o ML devolve inventory_id): o estoque desse anúncio é o do armazém do ML — o TMP10 nunca envia
+        if (antes.inventory_id) return concluir('bloqueado', { alvo, erro: `anúncio Full no Mercado Livre (inventory_id ${antes.inventory_id}) — o estoque fica com o ML; o TMP10 não envia o estoque normal para ele` })
         const r = await ml.enviar(destino.conta, item.anuncio_id, alvo)
         const depois = (await ml.lerAnuncios(destino.conta, [item.anuncio_id]).catch(() => new Map())).get(item.anuncio_id)
         const confirmada = depois && !depois.erro ? depois.quantidade : null
@@ -427,6 +432,11 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
       else if (p.estoque_atual === null || p.estoque_atual === undefined) linha.situacao = 'sem_estoque_oficial'
       else if (base.sincronizar === false) linha.situacao = 'desligado'
       else if (!leitura || leitura.erro || leitura.quantidade === null) { linha.situacao = 'erro_leitura'; linha.erro = leitura ? leitura.erro : 'sem leitura' }
+      else if (base.destino === 'mercadolivre' && leitura.inventory_id) {
+        // anúncio Full: o número do ML é o saldo do armazém do ML — NÃO é comparado com o estoque normal (nem vira divergência)
+        linha.situacao = 'full'; linha.inventory_id = leitura.inventory_id
+        linha.erro = `anúncio Full (inventory_id ${leitura.inventory_id}): o número do ML é o estoque Full — não é comparado com o estoque normal do TMP10`
+      }
       else if (leitura.variacoes > 0) { linha.situacao = 'variacao_ml'; linha.erro = `anúncio com ${leitura.variacoes} variação(ões) no ML — envio bloqueado (PRECISA CONFIRMAR)` }
       else if (f && ['pendente', 'enviando', 'erro_temporario'].includes(f.status)) linha.situacao = 'em_envio'
       else if (leitura.quantidade === Math.max(0, p.estoque_atual)) {
@@ -668,6 +678,11 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
       if (principal) throw Object.assign(new Error(`Esta divergência é de antes do agrupamento: o anúncio agora pertence a ${principal}. Clique em "Conferir de novo" — a nova conferência compara com o estoque de ${principal}.`), { status: 409 })
     }
     let movimento = null
+    if (acao === 'aceitar' && d.plataforma === 'mercadolivre') {
+      const fg = await full.gravadoDe(empresaId, d.conta_ref, d.anuncio_id)
+      const f = fg && fg.find((x) => x.inventory_id)
+      if (f) throw Object.assign(new Error(`O anúncio ${d.anuncio_id} é Full no Mercado Livre (inventory_id ${f.inventory_id}): o número dele é o estoque Full e NÃO pode virar o estoque normal do TMP10. Use "ignorar" ou "Conferir de novo".`), { status: 409 })
+    }
     if (acao === 'aceitar') {
       // a plataforma vira o número oficial — vira MOVIMENTO (rastreável) e o TMP10 envia para os outros anúncios
       movimento = await movimentar({ empresaId, sku: d.sku, tipo: 'definir', quantidade: Math.max(0, inteiro(d.estoque_ml)), origem: 'aceite_divergencia',
@@ -828,10 +843,13 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
   const ajusteMassa = criarAjusteMassa({ sb, ml, shopee, grupos, q, rpc, movimentar, lerConfig, decidirEnvio, log, dormir: () => dormir(esperaEntreEnviosMs),
     limiteQuantidade: limiteAjusteMassa })
 
-  // Agrupar anúncios por produto principal (decisão manual; só grava o agrupamento — nenhum saldo muda aqui)
-  const agrupamento = criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMassa, log, dormir: () => dormir(esperaEntreEnviosMs) })
+  // Estoque normal × Full por anúncio (migração 27): só LÊ o ML; grava só as tabelas do Full; nenhum saldo normal muda
+  const full = criarFull({ sb, ml, grupos, q, rpc, log, dormir: () => dormir(esperaEntreEnviosMs) })
 
-  return { grupos, agrupamento, registrarPendenciaVenda, ajusteMassa, diagnosticoShopee, tentarShopeeUmaVez, movimentar, registrarVenda, registrarCancelamento, ajustar, enfileirarSku, processarMovimentosPendentes, processarFila, processarItem,
+  // Agrupar anúncios por produto principal (decisão manual; só grava o agrupamento — nenhum saldo muda aqui)
+  const agrupamento = criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMassa, full, log, dormir: () => dormir(esperaEntreEnviosMs) })
+
+  return { grupos, agrupamento, full, registrarPendenciaVenda, ajusteMassa, diagnosticoShopee, tentarShopeeUmaVez, movimentar, registrarVenda, registrarCancelamento, ajustar, enfileirarSku, processarMovimentosPendentes, processarFila, processarItem,
     conferir, iniciarConferencia, statusConferencia, conferirTodas, previa, sincronizar, resolverDivergencia, salvarConfig, lerConfig, painel,
     movimentosDoSku, liberarPausa, agendarProcessamento }
 }

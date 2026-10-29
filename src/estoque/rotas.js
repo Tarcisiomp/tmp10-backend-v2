@@ -1,7 +1,7 @@
 // Rotas /api/estoque/* — Estoque Central. Sempre com sessão de ADMINISTRADOR; a empresa vem SEMPRE da sessão
 // (qualquer empresa_id enviado pelo navegador é ignorado). Funcionário e vendedor não alteram estoque por aqui.
 const express = require('express')
-const VERSAO_ESTOQUE = '2026-10-27-agrupar-produtos'
+const VERSAO_ESTOQUE = '2026-10-29-estoque-full'
 
 function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console.log }) {
   const router = express.Router()
@@ -22,7 +22,7 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
   // Versão do módulo de estoque publicada (SEM login; não expõe dados): serve para conferir, depois do deploy, se o
   // Railway está rodando o código novo — antes de publicar a interface. commit = RAILWAY_GIT_COMMIT_SHA (variável do Railway).
   router.get('/api/estoque/versao', (req, res) => res.json({ ok: true, modulo: 'estoque', versao: VERSAO_ESTOQUE, agrupamento: true,
-    agrupamento_produtos: true, commit: process.env.RAILWAY_GIT_COMMIT_SHA ? String(process.env.RAILWAY_GIT_COMMIT_SHA).slice(0, 7) : null }))
+    agrupamento_produtos: true, estoque_full_por_anuncio: true, commit: process.env.RAILWAY_GIT_COMMIT_SHA ? String(process.env.RAILWAY_GIT_COMMIT_SHA).slice(0, 7) : null }))
   const responder = (fn) => async (req, res) => {
     try {
       const r = await fn(req, res)
@@ -91,6 +91,18 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
     produtoSku: String(corpo(req).produto_sku || ''), adicionar: listaStr(corpo(req).adicionar, 501), remover: Array.isArray(corpo(req).remover) ? corpo(req).remover.slice(0, 501) : [],
     conferido: corpo(req).conferido === true, assinatura: String(corpo(req).assinatura || ''), operacaoId: String(corpo(req).operacao_id || ''),
     produtos: listaStr(corpo(req).produtos, 201), origem: String(corpo(req).origem || '') })))
+
+  // 📊 Estoque NORMAL × FULL por anúncio (ML). Lista: só banco · Consultar Full: só GET no ML, grava só as tabelas do Full
+  router.get('/api/estoque/full/anuncios', ...admin, responder(async (req) => estoque.full.saldos({ empresaId: req.empresaId, conta: String(req.query.conta || '').slice(0, 80),
+    busca: String(req.query.busca || '').slice(0, 120), situacaoFull: ['pendente', 'atualizado', 'erro', 'indisponivel', 'sem_full'].includes(req.query.situacao_full) ? req.query.situacao_full : '',
+    pagina: Number(req.query.pagina) || 1, porPagina: Number(req.query.por_pagina) || 100 })))
+  router.post('/api/estoque/full/consultar', ...admin, responder(async (req) => {
+    const b = corpo(req)
+    const t = await estoque.full.iniciarConsulta(req.empresaId, { contas: listaStr(b.contas, 100), chaves: listaStr(b.chaves, 5000), usuarioId: req.usuario.id })
+    return { consulta: { rodando: t.rodando, iniciado_em: t.iniciado_em } }
+  }))
+  router.get('/api/estoque/full/consultar/status', ...admin, responder(async (req) => ({ consulta: estoque.full.statusConsulta(req.empresaId) })))
+  router.get('/api/estoque/full/historico', ...admin, responder(async (req) => estoque.full.historico({ empresaId: req.empresaId, contaRef: String(req.query.conta || ''), anuncioId: String(req.query.anuncio || '') })))
 
   // Diagnóstico ML (SÓ LEITURA): quantidade atual de cada anúncio vinculado — GET /api/estoque/diagnostico-ml?skus=A,B
   router.get('/api/estoque/diagnostico-ml', ...admin, responder(async (req) => ({ diagnostico: await estoque.ajusteMassa.diagnosticoML({ empresaId: req.empresaId, skus: String(req.query.skus || '') }) })))

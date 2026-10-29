@@ -20,8 +20,9 @@
 //   • pedidos ainda NÃO importados dos anúncios que entram ou saem · falha ao consultar os pedidos · divergência NÃO
 //     resolvida dos SKUs que entram
 //   • desfazer/remover: remover só parte dos anúncios de um SKU original
+//   • anúncio FULL do ML (inventory_id) cujo saldo Full NÃO pôde ser consultado agora (sem confirmar o Full, não agrupa)
 // ALERTA (mostra, você decide): saldo do SKU original que fica CONGELADO (não é somado) · vendas sem baixa (pendências) ·
-//   Full/FBS · reserva de promoção · sincronização desligada · modo ATIVO (o estoque do principal irá aos anúncios na
+//   Full/FBS (o saldo Full fica NO ANÚNCIO: não é somado ao principal nem aos outros anúncios) · reserva de promoção · sincronização desligada · modo ATIVO (o estoque do principal irá aos anúncios na
 //   próxima movimentação). Em PILOTO, anúncio agrupado NUNCA recebe envio real (servico.decidirEnvio).
 const crypto = require('crypto')
 const ROT = { mercadolivre: 'ML', shopee: 'Shopee' }
@@ -30,7 +31,7 @@ const ehUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 const chaveDe = (a) => `${a.plataforma}|${a.conta_ref}|${a.anuncio_id}|${a.variacao_id || ''}`
 const JANELA_DIAS = 30
 
-function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMassa, log = console.log, agora = () => new Date(), dormir = () => Promise.resolve() }) {
+function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMassa, full = null, log = console.log, agora = () => new Date(), dormir = () => Promise.resolve() }) {
   async function lerTodos(montar, contexto) {
     const todos = []
     for (let de = 0; ; de += 1000) {
@@ -111,7 +112,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
       for (const a of lote) {
         const l = mapa ? mapa.get(a.anuncio_id) : null
         res.set(a.chave, !l ? { erro: erro || 'anúncio não devolvido pelo ML' } : l.erro ? { erro: l.erro }
-          : { titulo: l.titulo ?? null, imagem: l.imagem ?? null, quantidade: l.quantidade, variacoes: l.variacoes || 0, sku_declarado: l.sku_declarado || a.anuncio_id })
+          : { titulo: l.titulo ?? null, imagem: l.imagem ?? null, quantidade: l.quantidade, variacoes: l.variacoes || 0, sku_declarado: l.sku_declarado || a.anuncio_id, inventory_id: l.inventory_id || null })
       }
       await dormir()
     }
@@ -304,12 +305,29 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
       if (l.estoque_shopee > 0) alerta(`${nome(a)}: há estoque no armazém da Shopee (FBS) — esse anúncio não recebe envio do TMP10`, a.chave)
     }
 
-    // Full/FBS (histórico de vendas)
+    // Full/FBS (histórico de vendas — função estoque_anuncios_full, migração 22)
     if (novos.length) {
       try {
-        const full = new Set(((await rpc('estoque_anuncios_full', { p_empresa: empresaId, p_dias: 90 })) || []).map((x) => String(typeof x === 'object' && x !== null ? Object.values(x)[0] : x)))
-        for (const a of novos) if (full.has(a.anuncio_id)) alerta(`${nome(a)}: anúncio com vendas Full/FBS — não recebe envio; vendas Full não baixam o TMP10`, a.chave)
-      } catch (e) { alerta(`não foi possível conferir Full/FBS agora (${e.message})`) }
+        const vendasFull = new Set(((await rpc('estoque_anuncios_full', { p_empresa: empresaId, p_dias: 90 })) || []).map((x) => String(typeof x === 'object' && x !== null ? Object.values(x)[0] : x)))
+        for (const a of novos) if (vendasFull.has(a.anuncio_id)) alerta(`${nome(a)}: anúncio com vendas Full/FBS — não recebe envio; vendas Full não baixam o TMP10`, a.chave)
+      } catch (e) {
+        const semFuncao = /estoque_anuncios_full/.test(e.message) && /(Could not find|does not exist|PGRST202)/i.test(e.message)
+        alerta(semFuncao ? 'a conferência de vendas Full/FBS pelo histórico não rodou: a função estoque_anuncios_full não existe no banco (migração 22 ainda não aplicada). O saldo Full do ML é conferido abaixo pela API, à parte'
+          : `não foi possível conferir vendas Full/FBS pelo histórico agora (${e.message})`)
+      }
+    }
+    // Full do ML pela API (inventory_id + /inventories/{id}/stock/fulfillment) — SÓ LEITURA. O saldo Full fica NO ANÚNCIO.
+    const novosML = novos.filter((a) => a.plataforma === 'mercadolivre' && a.ao_vivo && !a.ao_vivo.erro && !(a.ao_vivo.variacoes > 0))
+    if (full && novosML.length) {
+      const lidosFull = await full.lerAoVivo(novosML)
+      for (const a of novosML) {
+        const f = lidosFull.get(a.chave); if (!f) continue
+        a.full = f
+        if (f.situacao === 'atualizado') alerta(`${nome(a)}: anúncio FULL — ${f.disponivel} unidade(s) disponível(is) no armazém do ML (total ${f.total}). Esse saldo fica NO ANÚNCIO: NÃO é somado ao ${sku} nem aos outros anúncios, o TMP10 não envia estoque para ele e vendas Full não baixam o ${sku}`, a.chave)
+        else if (f.situacao === 'erro' && f.inventory_id) bloq(`${nome(a)}: anúncio FULL (inventory_id ${f.inventory_id}), mas a consulta do saldo Full falhou (${f.erro}) — sem confirmar o Full, não agrupa. Tente de novo em instantes`, a.chave)
+        else if (f.situacao === 'erro') bloq(`${nome(a)}: não foi possível confirmar se o anúncio é Full (${f.erro}) — sem conferir, não agrupa`, a.chave)
+        else if (f.situacao === 'indisponivel') alerta(`${nome(a)}: anúncio com inventory_id ${f.inventory_id || '—'}, mas o ML não informa o saldo Full (${f.erro}). Saldo Full "Indisponível para consulta" — NÃO é tratado como zero; o TMP10 não envia estoque para anúncio com inventory_id`, a.chave)
+      }
     }
 
     // saldos que ficam CONGELADOS (não são somados), vendas sem baixa e divergências abertas dos SKUs originais
@@ -362,7 +380,8 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
 
     const assinatura = crypto.createHash('sha256').update(JSON.stringify([sku, novos.map((a) => a.chave).sort(), removidos.map((m) => m.id).sort(), membrosAtuais.map((m) => m.id).sort()])).digest('hex').slice(0, 32)
     const detalhe = (a) => ({ chave: a.chave, plataforma: a.plataforma, conta_ref: a.conta_ref, conta_nome: a.conta_nome, anuncio_id: a.anuncio_id, variacao_id: a.variacao_id || '',
-      sku_original: a.sku_original, saldo_original: prods.get(a.sku_original) ? prods.get(a.sku_original).estoque_atual : null, ao_vivo: a.ao_vivo || null })
+      sku_original: a.sku_original, saldo_original: prods.get(a.sku_original) ? prods.get(a.sku_original).estoque_atual : null, ao_vivo: a.ao_vivo || null,
+      full: a.full ? { situacao: a.full.situacao, inventory_id: a.full.inventory_id || null, disponivel: a.full.disponivel ?? null, total: a.full.total ?? null, consultado_em: a.full.consultado_em || null } : null })
     return {
       principal: { sku, nome: p ? p.name : null, estoque: p ? p.estoque_atual : null, foto: p ? p.photo || null : null },
       adicionar: novos.map(detalhe), remover: removidos.map((m) => ({ id: m.id, ...detalhe({ ...m, chave: chaveDe(m) }) })),

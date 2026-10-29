@@ -112,7 +112,10 @@ function criarMercadoLivre({ axios, getToken, refreshToken, timeout = 8000 }) {
           titulo: corpo.title ?? null,
           sku_declarado: skuDeclaradoML(corpo),
           // imagem do anúncio (campos do recurso /items: secure_thumbnail / thumbnail) — só para exibir na tela de agrupamento
-          imagem: corpo.secure_thumbnail || corpo.thumbnail || null
+          imagem: corpo.secure_thumbnail || corpo.thumbnail || null,
+          // inventory_id: identificador do estoque Full do anúncio (doc oficial ML "Envios Fulfillment": GET /items/{id} → inventory_id;
+          // anúncio com variações tem um inventory_id por variação). Só LEITURA: usado para separar o Full e para NUNCA enviar a ele.
+          inventory_id: corpo.inventory_id ? String(corpo.inventory_id) : null
         })
       }
       // anúncio que o ML não devolveu para esta conta (de outra conta, apagado, sem permissão)
@@ -162,7 +165,26 @@ function criarMercadoLivre({ axios, getToken, refreshToken, timeout = 8000 }) {
     }, `ML GET /orders/${id} (${conta.nickname})`)
   }
 
-  return { lerAnuncios, enviar, buscarPedidos, lerPedido }
+  // Saldo FULL de um anúncio (SÓ LEITURA). Doc oficial ML "Envios Fulfillment" (developers.mercadolibre — fulfillment):
+  //   GET /inventories/{inventory_id}/stock/fulfillment → { inventory_id, total, available_quantity, not_available_quantity,
+  //   not_available_detail: [{ status, quantity }], external_references: [{ type: 'item', id, variation_id }] }
+  //   Erros documentados: 400, 401, 403, 404 (seller_product_not_found), 429, 500.
+  // Número ausente/ inválido na resposta → ERRO (nunca vira zero). Não existe envio de estoque Full por API (a doc só permite consultar).
+  async function lerEstoqueFull(conta, inventoryId) {
+    if (!inventoryId) throw new ErroPlataforma('lerEstoqueFull: inventory_id vazio', { tipo: 'permanente' })
+    return comToken(conta, async (token) => {
+      const { data } = await axios.get(`${ML_API}/inventories/${encodeURIComponent(inventoryId)}/stock/fulfillment`, { headers: { Authorization: `Bearer ${token}` }, timeout })
+      const n = (v) => (v === null || v === undefined || v === '' || !Number.isInteger(Number(v)) || Number(v) < 0 ? null : Number(v))
+      const r = { inventory_id: data && data.inventory_id ? String(data.inventory_id) : String(inventoryId),
+        disponivel: n(data && data.available_quantity), nao_disponivel: n(data && data.not_available_quantity), total: n(data && data.total),
+        detalhe: data && Array.isArray(data.not_available_detail) ? data.not_available_detail : null,
+        referencias: data && Array.isArray(data.external_references) ? data.external_references : null }
+      if (r.disponivel === null || r.total === null) throw new ErroPlataforma(`ML /inventories/${inventoryId}/stock/fulfillment sem available_quantity/total válidos: ${resumir(data, 300)}`, { tipo: 'permanente', categoria: 'negocio', dados: data })
+      return r
+    }, `ML GET /inventories/${inventoryId}/stock/fulfillment (${conta.nickname})`)
+  }
+
+  return { lerAnuncios, enviar, buscarPedidos, lerPedido, lerEstoqueFull }
 }
 
 function criarShopee({ axios, host, partnerId, assinar, getToken, refreshToken, timeout = 10000 }) {

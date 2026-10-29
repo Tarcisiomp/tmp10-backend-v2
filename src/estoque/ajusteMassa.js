@@ -235,7 +235,11 @@ function criarAjusteMassa({ sb, ml, shopee, grupos, q, rpc, movimentar, lerConfi
         a.lido_em = lidoEm
         if (l.erro || l.quantidade === null || l.quantidade === undefined) { a.erro = l.erro || 'sem quantidade'; a.quantidade = null; continue }
         a.quantidade = l.quantidade
-        if (a.plataforma === 'mercadolivre') { a.titulo = l.titulo ?? null; a.variacoes = l.variacoes || 0; a.sku_declarado = l.sku_declarado || a.anuncio_id }
+        if (a.plataforma === 'mercadolivre') {
+          a.titulo = l.titulo ?? null; a.variacoes = l.variacoes || 0; a.sku_declarado = l.sku_declarado || a.anuncio_id
+          // anúncio FULL (inventory_id no /items): o número dele é o estoque do armazém do ML — nunca serve de origem do normal
+          if (l.inventory_id) { a.full = true; a.inventory_id = l.inventory_id }
+        }
         else {
           const b = l.bruto || {}; const si = b.stock_info_v2 || {}
           a.tem_variacao = !!l.tem_variacao; a.reserva = l.reservada ?? null
