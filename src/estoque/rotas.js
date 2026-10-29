@@ -1,7 +1,7 @@
 // Rotas /api/estoque/* — Estoque Central. Sempre com sessão de ADMINISTRADOR; a empresa vem SEMPRE da sessão
 // (qualquer empresa_id enviado pelo navegador é ignorado). Funcionário e vendedor não alteram estoque por aqui.
 const express = require('express')
-const VERSAO_ESTOQUE = '2026-10-29-estoque-full'
+const VERSAO_ESTOQUE = '2026-10-29b-estoque-full'
 
 function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console.log }) {
   const router = express.Router()

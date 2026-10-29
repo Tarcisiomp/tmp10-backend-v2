@@ -150,6 +150,31 @@ function criarFull({ sb, ml, grupos, q, rpc, log = console.log, agora = () => ne
     return { leituras: r.data || [] }
   }
 
+  // Validação da resposta do Full ANTES de aceitar o número (inclusive ZERO). Campos da doc oficial:
+  //   inventory_id da resposta = o pedido · total = available_quantity + not_available_quantity (definição da doc) ·
+  //   external_references[type=item].id = o anúncio. Qualquer inconsistência → ERRO (o número não é usado).
+  function validarFull(f, inventoryPedido, anuncioId) {
+    if (f.inventory_id && String(f.inventory_id) !== String(inventoryPedido)) return { erro: `o ML devolveu o inventory ${f.inventory_id}, mas foi pedido ${inventoryPedido} — resposta não usada` }
+    if (f.nao_disponivel !== null && f.nao_disponivel !== undefined && f.total !== f.disponivel + f.nao_disponivel)
+      return { erro: `resposta inconsistente do ML: total ${f.total} ≠ disponível ${f.disponivel} + não disponível ${f.nao_disponivel} — número não usado` }
+    if ((f.nao_disponivel === null || f.nao_disponivel === undefined) && f.total < f.disponivel) return { erro: `resposta inconsistente do ML: total ${f.total} menor que disponível ${f.disponivel} — número não usado` }
+    const refs = (f.referencias || []).filter((x) => x && x.type === 'item' && x.id)
+    if (refs.length && !refs.some((x) => String(x.id) === String(anuncioId))) return { erro: `o inventory ${inventoryPedido} aponta para outro anúncio (${refs.map((x) => x.id).join(', ')}) — não usado` }
+    return { validacao: { inventory_confere: true, total_confere: f.nao_disponivel !== null && f.nao_disponivel !== undefined, anuncio_confere: refs.length ? true : null } }
+  }
+
+  // Anúncios com VENDAS Full/FBS no histórico do TMP10 (ml_orders.is_fulfillment). Usa estoque_anuncios_full (migração 22, uma
+  // consulta só); se ela ainda não existir no banco, usa estoque_anuncio_tem_full (migração 21, anúncio por anúncio) — mesmo
+  // resultado, sem depender da 22. Devolve { ids: Set, modo: 'lote' | 'um_a_um' }. Outro erro sobe (não é engolido).
+  async function vendasFull(empresaId, anuncioIds) {
+    const r = await sb.rpc('estoque_anuncios_full', { p_empresa: empresaId, p_dias: 90 })
+    if (!r.error) return { ids: new Set((r.data || []).map((x) => String(typeof x === 'object' && x !== null ? Object.values(x)[0] : x))), modo: 'lote' }
+    if (!faltaObjeto(r.error, 'estoque_anuncios_full')) throw new Error(`rpc estoque_anuncios_full: ${r.error.message}`)
+    const ids = new Set()
+    for (const id of [...new Set((anuncioIds || []).map(String))]) if (await rpc('estoque_anuncio_tem_full', { p_empresa: empresaId, p_anuncio: id, p_dias: 90 })) ids.add(id)
+    return { ids, modo: 'um_a_um' }
+  }
+
   // ── Consulta AO VIVO (só GET no ML): inventory_id do anúncio e saldo Full ────────────────────────────────────────────
   // anuncios: [{ chave, conta_ref, conta_nome, anuncio_id, variacao_id, sku_vinculo, _conta, conta_conectada }]
   // devolve Map(chave → leitura { situacao, inventory_id, disponivel, nao_disponivel, total, detalhe, erro, consultado_em })
@@ -174,10 +199,10 @@ function criarFull({ sb, ml, grupos, q, rpc, log = console.log, agora = () => ne
         if (!l.inventory_id) { res.set(a.chave, { situacao: 'sem_full', inventory_id: null, consultado_em: quando() }); continue }
         try {
           const f = await ml.lerEstoqueFull(conta, l.inventory_id)
-          const refs = (f.referencias || []).filter((x) => x && x.type === 'item' && x.id)
-          if (refs.length && !refs.some((x) => String(x.id) === a.anuncio_id)) {
-            res.set(a.chave, { situacao: 'erro', inventory_id: l.inventory_id, erro: `o inventory ${l.inventory_id} aponta para outro anúncio (${refs.map((x) => x.id).join(', ')}) — não usado`, consultado_em: quando() })
-          } else res.set(a.chave, { situacao: 'atualizado', inventory_id: l.inventory_id, disponivel: f.disponivel, nao_disponivel: f.nao_disponivel, total: f.total, detalhe: f.detalhe, consultado_em: quando() })
+          const v = validarFull(f, l.inventory_id, a.anuncio_id)
+          if (v.erro) res.set(a.chave, { situacao: 'erro', inventory_id: l.inventory_id, erro: v.erro, consultado_em: quando() })
+          else res.set(a.chave, { situacao: 'atualizado', inventory_id: l.inventory_id, disponivel: f.disponivel, nao_disponivel: f.nao_disponivel, total: f.total, detalhe: f.detalhe,
+            validacao: v.validacao, consultado_em: quando() })
         } catch (e) {
           const http = e && e.http
           res.set(a.chave, http === 404
@@ -237,7 +262,7 @@ function criarFull({ sb, ml, grupos, q, rpc, log = console.log, agora = () => ne
     return l.length ? l : null
   }
 
-  return { saldos, historico, lerAoVivo, consultar, iniciarConsulta, statusConsulta, gravadoDe, rotulo: ROT }
+  return { saldos, historico, lerAoVivo, vendasFull, validarFull, consultar, iniciarConsulta, statusConsulta, gravadoDe, rotulo: ROT }
 }
 
 module.exports = { criarFull }

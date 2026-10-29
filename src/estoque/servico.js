@@ -594,8 +594,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     }
     const contas = await q(sb.from('ml_accounts').select('nickname, ml_user_id, platform, active').eq('empresa_id', empresaId), 'contas')
     let full = new Set()
-    try { full = new Set(((await rpc('estoque_anuncios_full', { p_empresa: empresaId, p_dias: 90 })) || []).map((x) => String(typeof x === 'object' && x !== null ? Object.values(x)[0] : x))) }
-    catch (e) { log(`[ESTOQUE] prévia sem a lista de Full (migração 22 aplicada?): ${e.message}`) }
+    try { full = (await fullMod.vendasFull(empresaId, destinos.map((d) => d.anuncio_id))).ids }   // sem a 22: usa a função da 21
+    catch (e) { log(`[ESTOQUE] prévia sem a lista de Full: ${e.message}`) }
     const conf = statusConferencia(empresaId)
     const situacaoConf = new Map(((conf.resultado && conf.resultado.linhas) || []).map((l) => [l.chave, l.situacao]))
     const contaAtiva = (d) => (contas || []).some((c) => c.active === true && (d.destino === 'shopee'
@@ -845,6 +845,7 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
 
   // Estoque normal × Full por anúncio (migração 27): só LÊ o ML; grava só as tabelas do Full; nenhum saldo normal muda
   const full = criarFull({ sb, ml, grupos, q, rpc, log, dormir: () => dormir(esperaEntreEnviosMs) })
+  const fullMod = full
 
   // Agrupar anúncios por produto principal (decisão manual; só grava o agrupamento — nenhum saldo muda aqui)
   const agrupamento = criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMassa, full, log, dormir: () => dormir(esperaEntreEnviosMs) })

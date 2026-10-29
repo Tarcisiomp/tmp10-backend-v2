@@ -307,13 +307,13 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
 
     // Full/FBS (histórico de vendas — função estoque_anuncios_full, migração 22)
     if (novos.length) {
+      // sem a migração 22 a consulta usa a função da migração 21 (anúncio por anúncio): a conferência RODA mesmo assim
       try {
-        const vendasFull = new Set(((await rpc('estoque_anuncios_full', { p_empresa: empresaId, p_dias: 90 })) || []).map((x) => String(typeof x === 'object' && x !== null ? Object.values(x)[0] : x)))
-        for (const a of novos) if (vendasFull.has(a.anuncio_id)) alerta(`${nome(a)}: anúncio com vendas Full/FBS — não recebe envio; vendas Full não baixam o TMP10`, a.chave)
+        const vf = full ? await full.vendasFull(empresaId, novos.map((a) => a.anuncio_id))
+          : { ids: new Set(((await rpc('estoque_anuncios_full', { p_empresa: empresaId, p_dias: 90 })) || []).map((x) => String(typeof x === 'object' && x !== null ? Object.values(x)[0] : x))) }
+        for (const a of novos) if (vf.ids.has(a.anuncio_id)) alerta(`${nome(a)}: anúncio com vendas Full/FBS — não recebe envio; vendas Full não baixam o TMP10`, a.chave)
       } catch (e) {
-        const semFuncao = /estoque_anuncios_full/.test(e.message) && /(Could not find|does not exist|PGRST202)/i.test(e.message)
-        alerta(semFuncao ? 'a conferência de vendas Full/FBS pelo histórico não rodou: a função estoque_anuncios_full não existe no banco (migração 22 ainda não aplicada). O saldo Full do ML é conferido abaixo pela API, à parte'
-          : `não foi possível conferir vendas Full/FBS pelo histórico agora (${e.message})`)
+        bloq(`não foi possível conferir as vendas Full/FBS dos anúncios agora (${e.message}) — sem essa conferência, não agrupa. Tente de novo`)
       }
     }
     // Full do ML pela API (inventory_id + /inventories/{id}/stock/fulfillment) — SÓ LEITURA. O saldo Full fica NO ANÚNCIO.
@@ -323,7 +323,11 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
       for (const a of novosML) {
         const f = lidosFull.get(a.chave); if (!f) continue
         a.full = f
-        if (f.situacao === 'atualizado') alerta(`${nome(a)}: anúncio FULL — ${f.disponivel} unidade(s) disponível(is) no armazém do ML (total ${f.total}). Esse saldo fica NO ANÚNCIO: NÃO é somado ao ${sku} nem aos outros anúncios, o TMP10 não envia estoque para ele e vendas Full não baixam o ${sku}`, a.chave)
+        if (f.situacao === 'atualizado') {
+          const conf = [f.validacao && f.validacao.inventory_confere ? 'inventory confere' : null, f.validacao && f.validacao.total_confere ? 'total = disponível + não disponível' : null,
+            f.validacao && f.validacao.anuncio_confere ? 'anúncio confere nas referências do ML' : 'o ML não informou a referência do anúncio'].filter(Boolean).join(', ')
+          alerta(`${nome(a)}: anúncio FULL (inventory ${f.inventory_id}) — saldo Full lido no ML: ${f.disponivel} disponível(is), ${f.nao_disponivel ?? '—'} não disponível(is), total ${f.total} (validado: ${conf}).${f.total === 0 ? ' Zero CONFIRMADO pela API: o armazém do ML não tem unidades deste anúncio agora.' : ''} Esse saldo fica NO ANÚNCIO: NÃO é somado ao ${sku} nem aos outros anúncios, NÃO altera o estoque normal, o TMP10 não envia estoque para ele e vendas Full não baixam o ${sku}`, a.chave)
+        }
         else if (f.situacao === 'erro' && f.inventory_id) bloq(`${nome(a)}: anúncio FULL (inventory_id ${f.inventory_id}), mas a consulta do saldo Full falhou (${f.erro}) — sem confirmar o Full, não agrupa. Tente de novo em instantes`, a.chave)
         else if (f.situacao === 'erro') bloq(`${nome(a)}: não foi possível confirmar se o anúncio é Full (${f.erro}) — sem conferir, não agrupa`, a.chave)
         else if (f.situacao === 'indisponivel') alerta(`${nome(a)}: anúncio com inventory_id ${f.inventory_id || '—'}, mas o ML não informa o saldo Full (${f.erro}). Saldo Full "Indisponível para consulta" — NÃO é tratado como zero; o TMP10 não envia estoque para anúncio com inventory_id`, a.chave)
@@ -342,13 +346,21 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
     if (envolvidos.length) {
       const sem = (await q(sb.from('estoque_movimentos').select('sku, referencia, observacao').eq('empresa_id', empresaId).eq('aplicado', false).in('origem', ['venda_mercadolivre', 'venda_shopee']).in('sku', envolvidos).gte('criado_em', desde).limit(200), 'vendas sem baixa')) || []
       for (const x of envolvidos) { const n = sem.filter((m) => m.sku === x).length; if (n) alerta(`o SKU ${x} tem ${n} venda(s) SEM baixa nos últimos ${JANELA_DIAS} dias (pendências) — confira o estoque do ${sku} depois`) }
-      const div = (await q(sb.from('estoque_divergencias').select('sku, anuncio_id').eq('empresa_id', empresaId).not('chave', 'is', null).not('resolvido', 'is', true).in('sku', envolvidos).limit(200), 'divergências')) || []
+      const div = (await q(sb.from('estoque_divergencias').select('id, sku, plataforma, conta_ref, anuncio_id, variacao_id, estoque_tmp10, estoque_ml, ocorrencias, detectado_em, atualizado_em').eq('empresa_id', empresaId).not('chave', 'is', null).not('resolvido', 'is', true).in('sku', envolvidos).limit(200), 'divergências')) || []
+      // anúncios que a API do ML CONFIRMOU agora como Full (inventory_id + saldo Full lido e validado): a "divergência" deles
+      // comparava o número do Full com o estoque normal (conferência antiga) — não é divergência do estoque normal
+      const fullConfirmado = new Set(novos.filter((a) => a.plataforma === 'mercadolivre' && a.full && a.full.situacao === 'atualizado' && a.full.inventory_id).map((a) => `${a.conta_ref}|${a.anuncio_id}`))
+      const desc = (d) => `#${d.id} ${ROT[d.plataforma] || d.plataforma || '?'} ${d.anuncio_id || '?'}${d.variacao_id ? '/' + d.variacao_id : ''}: TMP10 ${d.estoque_tmp10 ?? '—'} × plataforma ${d.estoque_ml ?? '—'}${d.ocorrencias > 1 ? ` (${d.ocorrencias}×)` : ''}, desde ${d.detectado_em ? new Date(d.detectado_em).toISOString().slice(0, 10) : '—'}`
       for (const x of envolvidos) {
-        const n = div.filter((d) => d.sku === x).length
-        if (!n) continue
+        const doSku = div.filter((d) => d.sku === x)
+        if (!doSku.length) continue
+        const deFull = doSku.filter((d) => d.plataforma === 'mercadolivre' && fullConfirmado.has(`${d.conta_ref}|${d.anuncio_id}`))
+        const reais = doSku.filter((d) => !deFull.includes(d))
+        if (deFull.length) alerta(`o SKU ${x} tem ${deFull.length} divergência(s) antiga(s) em anúncio FULL confirmado pela API (${deFull.map(desc).join(' · ')}). Ela comparava o saldo Full com o estoque normal — não é divergência do estoque normal e NÃO bloqueia. Nada foi alterado: no painel do Estoque, use "Ignorar" nela (não use "Aceitar")`)
+        if (!reais.length) continue
         // divergência NÃO resolvida nos anúncios que ENTRAM: bloqueia (o número da plataforma ainda não foi decidido)
-        if (originaisNovos.includes(x)) bloq(`o SKU ${x} tem ${n} divergência(s) NÃO resolvida(s) (TMP10 × plataforma) — resolva no painel do Estoque (aceitar, enviar o número do TMP10 ou ignorar) antes de agrupar`)
-        else alerta(`o SKU ${x} tem ${n} divergência(s) aberta(s) — depois, use "Conferir de novo"`)
+        if (originaisNovos.includes(x)) bloq(`o SKU ${x} tem ${reais.length} divergência(s) NÃO resolvida(s) (TMP10 × plataforma): ${reais.map(desc).join(' · ')} — resolva no painel do Estoque (aceitar, enviar o número do TMP10 ou ignorar) antes de agrupar`)
+        else alerta(`o SKU ${x} tem ${reais.length} divergência(s) aberta(s) (${reais.map(desc).join(' · ')}) — depois, use "Conferir de novo"`)
       }
     }
 
