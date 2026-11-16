@@ -1,7 +1,7 @@
 // Rotas /api/estoque/* — Estoque Central. Sempre com sessão de ADMINISTRADOR; a empresa vem SEMPRE da sessão
 // (qualquer empresa_id enviado pelo navegador é ignorado). Funcionário e vendedor não alteram estoque por aqui.
 const express = require('express')
-const VERSAO_ESTOQUE = '2026-10-30-final'
+const VERSAO_ESTOQUE = '2026-11-09-v4'
 // SHA-256 de cada arquivo do módulo de estoque CARREGADO por este processo: /api/estoque/versao devolve a lista para conferir,
 // arquivo por arquivo, que o Railway roda exatamente os arquivos do pacote (o MANIFESTO traz os mesmos hashes).
 const ARQUIVOS_ESTOQUE = (() => {
@@ -13,6 +13,14 @@ const ARQUIVOS_ESTOQUE = (() => {
     return r
   } catch (e) { return { erro: e.message } }
 })()
+
+// Bloco "saldo" do agrupamento vindo do navegador: só estes campos (empresa e usuário vêm SEMPRE da sessão)
+function saldoDoCorpo(b) {
+  if (!b || typeof b !== 'object') return null
+  const num = (v) => (v === null || v === undefined || v === '' ? null : Number(v))
+  return { modo: String(b.modo || ''), quantidade: num(b.quantidade), estoque_visto: num(b.estoque_visto), motivo: String(b.motivo || '').slice(0, 300),
+    contei: b.contei === true, acima_999: b.confirmo_acima_999 === true || b.acima_999 === true }
+}
 
 function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console.log }) {
   const router = express.Router()
@@ -33,7 +41,7 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
   // Versão do módulo de estoque publicada (SEM login; não expõe dados): serve para conferir, depois do deploy, se o
   // Railway está rodando o código novo — antes de publicar a interface. commit = RAILWAY_GIT_COMMIT_SHA (variável do Railway).
   router.get('/api/estoque/versao', (req, res) => res.json({ ok: true, modulo: 'estoque', versao: VERSAO_ESTOQUE, agrupamento: true,
-    agrupamento_produtos: true, estoque_full_por_anuncio: true, diagnostico: true, revisao: true, devolucao_manual: true, arquivos: ARQUIVOS_ESTOQUE, commit: process.env.RAILWAY_GIT_COMMIT_SHA ? String(process.env.RAILWAY_GIT_COMMIT_SHA).slice(0, 7) : null }))
+    agrupamento_produtos: true, estoque_full_por_anuncio: true, diagnostico: true, revisao: true, agrupamento_quantidade: true, revisao_sem_envio: true, importacao_plataforma: false, estoque_inicial_oficial: true, alteracao_direta_bloqueada: true, alteracao_direta_nunca_enviada: true, devolucao_manual: true, arquivos: ARQUIVOS_ESTOQUE, commit: process.env.RAILWAY_GIT_COMMIT_SHA ? String(process.env.RAILWAY_GIT_COMMIT_SHA).slice(0, 7) : null }))
   const responder = (fn) => async (req, res) => {
     try {
       const r = await fn(req, res)
@@ -41,7 +49,7 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
     } catch (e) {
       const status = e.status || 500
       if (status >= 500) log(`[ESTOQUE] erro em ${req.method} ${req.path} (empresa ${req.empresaId}): ${e.message}`)
-      res.status(status).json({ ok: false, error: status >= 500 ? 'Não foi possível concluir agora. Tente de novo em instantes.' : e.message, ...(e.atual !== undefined ? { atual: e.atual } : {}), ...(e.previa ? { previa: e.previa } : {}) })
+      res.status(status).json({ ok: false, error: status >= 500 ? 'Não foi possível concluir agora. Tente de novo em instantes.' : e.message, ...(e.codigo ? { codigo: e.codigo } : {}), ...(e.atual !== undefined ? { atual: e.atual } : {}), ...(e.previa ? { previa: e.previa } : {}) })
     }
   }
   const corpo = (req) => req.body || {}
@@ -55,6 +63,12 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
     const r = await estoque.ajustar({ empresaId: req.empresaId, sku: b.sku, novoEstoque: b.novo_estoque, estoqueEsperado: b.estoque_esperado,
       motivo: b.motivo, usuarioId: req.usuario.id, idOperacao: b.id_operacao })
     return { movimento: r }
+  }))
+
+  // Estoque INICIAL do produto recém-cadastrado (o cadastro cria o produto SEM estoque; o número entra aqui, auditado)
+  router.post('/api/estoque/estoque-inicial', ...admin, responder(async (req) => {
+    const b = corpo(req)
+    return { movimento: await estoque.estoqueInicial({ empresaId: req.empresaId, sku: b.sku, quantidade: b.quantidade, motivo: b.motivo, usuarioId: req.usuario.id, idOperacao: b.id_operacao }) }
   }))
 
   // Diagnóstico Shopee (só lê): TMP10 × Shopee (disponível, reserva de promoção, promoções), fila e últimas tentativas
@@ -101,7 +115,10 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
   router.post('/api/estoque/agrupamento/confirmar', ...admin, responder(async (req) => estoque.agrupamento.confirmar({ empresaId: req.empresaId, usuarioId: req.usuario.id,
     produtoSku: String(corpo(req).produto_sku || ''), adicionar: listaStr(corpo(req).adicionar, 501), remover: Array.isArray(corpo(req).remover) ? corpo(req).remover.slice(0, 501) : [],
     conferido: corpo(req).conferido === true, assinatura: String(corpo(req).assinatura || ''), operacaoId: String(corpo(req).operacao_id || ''),
-    produtos: listaStr(corpo(req).produtos, 201), origem: String(corpo(req).origem || '') })))
+    produtos: listaStr(corpo(req).produtos, 201), origem: String(corpo(req).origem || ''), saldo: saldoDoCorpo(corpo(req).saldo) })))
+  // ✏️ EDITAR QUANTIDADE de um grupo: contagem física auditada do produto principal (migração 28). NÃO envia nada.
+  router.post('/api/estoque/agrupamento/quantidade', ...admin, responder(async (req) => estoque.agrupamento.editarQuantidade({ empresaId: req.empresaId, usuarioId: req.usuario.id,
+    produtoSku: String(corpo(req).produto_sku || ''), saldo: saldoDoCorpo({ ...(corpo(req).saldo || {}), modo: 'contagem' }), operacaoId: String(corpo(req).operacao_id || '') })))
 
   // 📊 Estoque NORMAL × FULL por anúncio (ML). Lista: só banco · Consultar Full: só GET no ML, grava só as tabelas do Full
   router.get('/api/estoque/full/anuncios', ...admin, responder(async (req) => estoque.full.saldos({ empresaId: req.empresaId, conta: String(req.query.conta || '').slice(0, 80),
@@ -130,7 +147,7 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
   router.get('/api/estoque/revisao/pendentes', ...admin, responder(async (req) => estoque.revisao.pendentes({ empresaId: req.empresaId })))
   router.post('/api/estoque/revisao/ajustar', ...admin, responder(async (req) => { const b = corpo(req)
     return estoque.revisao.revisarSaldo({ empresaId: req.empresaId, sku: b.sku, contagem: b.contagem, estoqueEsperado: b.estoque_esperado, motivo: b.motivo,
-      conferido: b.conferido === true, usuarioId: req.usuario.id, idOperacao: b.id_operacao }) }))
+      conferido: b.conferido === true, usuarioId: req.usuario.id, idOperacao: b.id_operacao, acima999: b.confirmo_acima_999 === true }) }))
   router.post('/api/estoque/devolucao', ...admin, responder(async (req) => { const b = corpo(req)
     return estoque.revisao.registrarDevolucao({ empresaId: req.empresaId, plataforma: String(b.plataforma || ''), pedidoId: b.pedido, sku: b.sku, quantidade: b.quantidade,
       recebido: b.recebido === true, motivo: b.motivo, usuarioId: req.usuario.id }) }))
@@ -156,7 +173,7 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
 
   router.post('/api/estoque/sincronizar', ...admin, responder(async (req) => estoque.sincronizar({ empresaId: req.empresaId, skus: corpo(req).skus, usuarioId: req.usuario.id })))
 
-  // Divergência: aceitar o número da plataforma (vira movimento) | enviar o número do TMP10 | ignorar
+  // Divergência: enviar o número do TMP10 | ignorar. "aceitar o número da plataforma" foi DESATIVADO (410): o estoque central é a única fonte
   router.post('/api/estoque/divergencias/:id/resolver', ...admin, responder(async (req) => {
     const b = corpo(req)
     return estoque.resolverDivergencia({ empresaId: req.empresaId, id: req.params.id, acao: b.acao, usuarioId: req.usuario.id, estoqueEsperado: b.estoque_esperado })

@@ -254,7 +254,7 @@ function criarFull({ sb, ml, grupos, q, rpc, log = console.log, agora = () => ne
   }
   const statusConsulta = (empresaId) => trabalhos.get(empresaId) || { rodando: false, resumo: null }
 
-  // Full gravado de UM anúncio (para proteções: aceitar divergência). null = sem informação (tabela ausente ou nunca consultado).
+  // Full gravado de UM anúncio (consulta/diagnóstico). null = sem informação (tabela ausente ou nunca consultado).
   async function gravadoDe(empresaId, contaRef, anuncioId) {
     const r = await sb.from('estoque_full_saldos').select('conta_ref, situacao, inventory_id, consultado_em').eq('empresa_id', empresaId).eq('anuncio_id', String(anuncioId))
     if (r.error) return null

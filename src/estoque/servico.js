@@ -6,7 +6,8 @@
 //   • Toda mudança aplicada coloca na fila TODOS os anúncios vinculados ao SKU (ML e Shopee). A fila junta
 //     alterações seguidas: vai um envio por anúncio, sempre com o número ATUAL do TMP10 (absoluto, nunca "tira 1").
 //   • O número que o ML/Shopee mostra NUNCA vira movimento sozinho. Diferença vira divergência (uma por anúncio);
-//     só uma ação explícita ("aceitar") transforma em movimento. Por isso não existe loop TMP10 → ML → TMP10.
+//     NENHUMA ação transforma o número da plataforma em estoque: "aceitar o número da plataforma" foi DESATIVADO
+//     (regra definitiva: o estoque central do TMP10 é a única fonte da quantidade física). Por isso não existe loop TMP10 → ML → TMP10.
 //   • Envio real só se: ESTOQUE_ENVIO_HABILITADO=1 no Railway E a empresa estiver em 'ativo', ou em 'piloto' com o
 //     SKU na lista do piloto. Fora disso tudo roda em SIMULAÇÃO (calcula, registra, não envia).
 //   • Full (ML) e FBS (Shopee) nunca recebem envio; anúncio de outra conta/empresa nunca recebe envio.
@@ -62,15 +63,19 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
   const erroAgrupado = (sku, principal) => Object.assign(new Error(`O SKU ${sku} está agrupado no produto principal ${principal}: o estoque oficial é o do principal. Ajuste pelo produto ${principal}.`), { status: 409, principal })
 
   // ── Movimentação oficial ─────────────────────────────────────────────────────────────────────────────
-  async function movimentar({ empresaId, sku, tipo, quantidade, origem, motivo = null, referencia = null, usuarioId = null, processo = null, esperado = null }) {
+  // enfileirar=false: o movimento é registrado (auditado) mas NÃO vai para a fila de envio — usado pela contagem física
+  // (revisão por contagem): alterar quantidade nunca dispara sincronização; o envio é uma etapa separada (Sincronizar Agora).
+  async function movimentar({ empresaId, sku, tipo, quantidade, origem, motivo = null, referencia = null, usuarioId = null, processo = null, esperado = null, enfileirar = true }) {
     const r = await rpc('estoque_movimentar', {
       p_empresa: empresaId, p_sku: String(sku), p_tipo: tipo, p_quantidade: quantidade, p_origem: origem,
       p_motivo: motivo, p_referencia: referencia, p_usuario: usuarioId, p_processo: processo, p_esperado: esperado
     })
     if (r && r.aplicado && !r.duplicado) {
       if (r.negativo) log(`⚠️ [ESTOQUE] ${sku} ficou NEGATIVO (${r.novo}) — empresa ${empresaId}, origem ${origem}. O marketplace recebe 0.`)
-      await enfileirarSku(empresaId, String(sku), motivo || origem, r.movimento_id)
-      agendarProcessamento()
+      if (enfileirar) {
+        await enfileirarSku(empresaId, String(sku), motivo || origem, r.movimento_id)
+        agendarProcessamento()
+      }
     } else if (r && !r.aplicado && !r.duplicado && r.erro && r.erro !== 'estoque_mudou') {
       log(`⚠️ [ESTOQUE] movimento NÃO aplicado (${r.erro}) — ${sku}, empresa ${empresaId}, origem ${origem}, ref ${referencia}`)
     }
@@ -164,6 +169,32 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     return r
   }
 
+  // Estoque INICIAL de um produto recém-cadastrado (produto sem estoque oficial → número contado/digitado), pela função
+  // oficial: 1 movimento auditado (usuário, motivo, referência única). NÃO põe nada na fila. Produto que já tem estoque usa "ajustar"/"revisar".
+  async function estoqueInicial({ empresaId, sku, quantidade, motivo, usuarioId, idOperacao }) {
+    const qtd = inteiro(quantidade)
+    if (qtd === null || qtd < 0 || qtd > 1000000) throw Object.assign(new Error('Informe um estoque inicial entre 0 e 1.000.000.'), { status: 400 })
+    if (!sku || String(sku).length > 120) throw Object.assign(new Error('SKU inválido.'), { status: 400 })
+    const op = /^[A-Za-z0-9_-]{8,64}$/.test(String(idOperacao || '')) ? String(idOperacao) : crypto.randomUUID()
+    const prods = await q(sb.from('products').select('id, estoque_atual').eq('empresa_id', empresaId).eq('sku', String(sku)), 'produto')
+    if (!prods || !prods.length) throw Object.assign(new Error('Produto não encontrado nesta empresa.'), { status: 404 })
+    if (prods.length > 1) throw Object.assign(new Error('Há mais de um produto com este SKU. Corrija o cadastro antes.'), { status: 409 })
+    const ja = await q(sb.from('estoque_movimentos').select('id').eq('empresa_id', empresaId).eq('referencia', `cadastro:${op}`).limit(1), 'operação')
+    if (prods[0].estoque_atual !== null && prods[0].estoque_atual !== undefined && !(ja && ja.length)) {
+      throw Object.assign(new Error(`O produto ${sku} já tem estoque oficial (${prods[0].estoque_atual}). Para mudar, use o ajuste ou a revisão por contagem.`), { status: 409, atual: prods[0].estoque_atual })
+    }
+    const principal = (await grupos.carregar(empresaId)).principalDe(String(sku))
+    if (principal) throw erroAgrupado(sku, principal)
+    const r = await movimentar({
+      empresaId, sku: String(sku), tipo: 'definir', quantidade: qtd, origem: 'cadastro_estoque_inicial',
+      motivo: String(motivo || 'Estoque inicial informado no cadastro do produto').slice(0, 200), referencia: `cadastro:${op}`, usuarioId, processo: 'erp-cadastro', esperado: 0, enfileirar: false   // como a contagem: não envia; o envio é "Sincronizar Estoque Agora" (com prévia)
+    })
+    if (r && r.erro === 'estoque_mudou') throw Object.assign(new Error(`O estoque de ${sku} mudou para ${r.anterior} enquanto você cadastrava. Confira antes de informar o estoque inicial.`), { status: 409, atual: r.anterior })
+    if (r && r.erro === 'produto_inexistente') throw Object.assign(new Error('Produto não encontrado nesta empresa.'), { status: 404 })
+    if (r && r.erro === 'sku_duplicado') throw Object.assign(new Error('Há mais de um produto com este SKU. Corrija o cadastro antes.'), { status: 409 })
+    return r
+  }
+
   // ── Fila ───────────────────────────────────────────────────────────────────────────────────────────────
   // Anúncios que recebem o número do SKU: os vínculos dele que NÃO foram agrupados em outro produto + os anúncios
   // agrupados NELE (se for principal). O SKU original agrupado em outro principal não envia nada (saldo congelado).
@@ -199,19 +230,17 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     return destinos.length // 0 = produto sem anúncio vinculado (ou SKU agrupado em outro principal): estoque só no TMP10, sem erro
   }
 
-  // Movimentos registrados pelo gatilho (alteração direta / cadastro) → fila
+  // Movimentos registrados pelo rastro do banco (alteração fora da função oficial): só histórico, NUNCA vão para a fila
+  // V4: movimentos "pendentes de sincronização" só nascem do RASTRO do banco (alteração feita FORA da função oficial:
+  // 'alteracao_direta' / 'cadastro_produto' da migração 21, ou 'alteracao_administrativa' da 30). Eles NUNCA são enviados
+  // aos anúncios: só ficam no histórico e geram um aviso no log. Toda alteração legítima passa por movimentar(), que
+  // decide sozinha se enfileira (vendas, cancelamentos, ajuste manual) ou não (contagem, estoque inicial, agrupamento).
   async function processarMovimentosPendentes() {
-    const pend = await q(sb.from('estoque_movimentos').select('id, empresa_id, sku').eq('sincronizacao_pendente', true).limit(500), 'movimentos pendentes')
+    const pend = await q(sb.from('estoque_movimentos').select('id, empresa_id, sku, origem').eq('sincronizacao_pendente', true).limit(500), 'movimentos pendentes')
     if (!pend || !pend.length) return 0
-    const feitos = new Set()
-    for (const m of pend) {
-      const k = `${m.empresa_id}::${m.sku}`
-      if (feitos.has(k)) continue
-      feitos.add(k)
-      try { await enfileirarSku(m.empresa_id, m.sku, 'Alteração registrada pelo banco', m.id) } catch (e) { log(`❌ [ESTOQUE] enfileirar ${m.sku}: ${e.message}`) }
-    }
+    for (const m of pend) log(`⚠️ [ESTOQUE] alteração de estoque FORA da função oficial (${m.origem || '?'}) no SKU ${m.sku}: registrada no histórico e NÃO enviada aos anúncios`)
     await q(sb.from('estoque_movimentos').update({ sincronizacao_pendente: false }).in('id', pend.map((m) => m.id)), 'desmarcar pendentes')
-    return feitos.size
+    return 0
   }
 
   let timer = null
@@ -262,6 +291,9 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
       const daConta = (links || []).filter((l) => l.account_nickname === conta.nickname)
       // o anúncio tem de representar ESTE produto hoje (vínculo direto ou agrupamento) — item antigo da fila não envia
       const link = daConta.find((l) => g.skuEfetivo('mercadolivre', item.anuncio_id, '', l.sku) === item.sku)
+      // vínculo AMBÍGUO: o mesmo anúncio representa mais de um produto — mandar o estoque de um deles seria errado
+      const produtosDoAnuncio = [...new Set(daConta.map((l) => g.skuEfetivo('mercadolivre', item.anuncio_id, '', l.sku)))]
+      if (link && produtosDoAnuncio.length > 1) return { bloqueio: `vínculo ambíguo: o anúncio ${item.anuncio_id} está ligado a ${produtosDoAnuncio.length} produtos (${produtosDoAnuncio.sort().join(', ')}) — corrija o vínculo; nada é enviado` }
       if (!link) return { bloqueio: daConta.length ? `o anúncio agora pertence ao produto ${g.skuEfetivo('mercadolivre', item.anuncio_id, '', daConta[0].sku)} (agrupamento/vínculo mudou) — este item da fila não envia` : 'vínculo SKU ↔ anúncio não existe mais (ou é de outra conta)' }
       if (link.ml_user_id && String(link.ml_user_id) !== String(conta.ml_user_id)) return { bloqueio: 'vínculo aponta para outra conta do Mercado Livre' }
       if (link.sincronizar === false) return { bloqueio: 'sincronização desligada neste anúncio' }
@@ -275,6 +307,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     const links = await q(sb.from('product_shopee_links').select('sku, shop_id, item_id, model_id, sincronizar').eq('empresa_id', item.empresa_id).eq('shop_id', item.conta_ref).eq('item_id', item.anuncio_id), 'vínculo Shopee')
     const doDestino = (links || []).filter((l) => (l.model_id ? String(l.model_id) : '') === item.variacao_id)
     const link = doDestino.find((l) => g.skuEfetivo('shopee', item.anuncio_id, item.variacao_id, l.sku) === item.sku)
+    const produtosDoItem = [...new Set(doDestino.map((l) => g.skuEfetivo('shopee', item.anuncio_id, item.variacao_id, l.sku)))]
+    if (link && produtosDoItem.length > 1) return { bloqueio: `vínculo ambíguo: o item/variação ${item.anuncio_id}${item.variacao_id ? '/' + item.variacao_id : ''} da Shopee está ligado a ${produtosDoItem.length} produtos (${produtosDoItem.sort().join(', ')}) — corrija o vínculo; nada é enviado` }
     if (!link) return { bloqueio: doDestino.length ? `o item/variação agora pertence ao produto ${g.skuEfetivo('shopee', item.anuncio_id, item.variacao_id, doDestino[0].sku)} (agrupamento/vínculo mudou) — este item da fila não envia` : 'vínculo SKU ↔ item/variação da Shopee não existe mais' }
     if (link.sincronizar === false) return { bloqueio: 'sincronização desligada neste anúncio' }
     return { conta: contas[0], link }
@@ -678,6 +712,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
   }
 
   async function resolverDivergencia({ empresaId, id, acao, usuarioId, estoqueEsperado }) {
+    // DESATIVADO (antes de qualquer leitura/gravação): o número da plataforma nunca substitui o estoque central
+    if (acao === 'aceitar') throw Object.assign(new Error('"Aceitar o número da plataforma" foi desativado: o estoque central do TMP10 é a única fonte da quantidade física. Conte a peça e use "Revisar contagem", ou "Enviar número do TMP10" / "Ignorar".'), { status: 410, codigo: 'IMPORTACAO_PLATAFORMA_DESATIVADA' })
     const d = await q(sb.from('estoque_divergencias').select('*').eq('id', id).eq('empresa_id', empresaId).maybeSingle(), 'divergência')
     if (!d || !d.chave) throw Object.assign(new Error('Divergência não encontrada.'), { status: 404 })
     if (d.resolvido === true) throw Object.assign(new Error('Esta divergência já foi resolvida.'), { status: 409 })
@@ -686,23 +722,11 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
       if (principal) throw Object.assign(new Error(`Esta divergência é de antes do agrupamento: o anúncio agora pertence a ${principal}. Clique em "Conferir de novo" — a nova conferência compara com o estoque de ${principal}.`), { status: 409 })
     }
     let movimento = null
-    if (acao === 'aceitar' && d.plataforma === 'mercadolivre') {
-      const fg = await full.gravadoDe(empresaId, d.conta_ref, d.anuncio_id)
-      const f = fg && fg.find((x) => x.inventory_id)
-      if (f) throw Object.assign(new Error(`O anúncio ${d.anuncio_id} é Full no Mercado Livre (inventory_id ${f.inventory_id}): o número dele é o estoque Full e NÃO pode virar o estoque normal do TMP10. Use "ignorar" ou "Conferir de novo".`), { status: 409 })
-    }
-    if (acao === 'aceitar') {
-      // a plataforma vira o número oficial — vira MOVIMENTO (rastreável) e o TMP10 envia para os outros anúncios
-      movimento = await movimentar({ empresaId, sku: d.sku, tipo: 'definir', quantidade: Math.max(0, inteiro(d.estoque_ml)), origem: 'aceite_divergencia',
-        motivo: `Aceito o número de ${ROTULO[d.plataforma] || d.plataforma} (anúncio ${d.anuncio_id})`, referencia: `divergencia:${d.id}`, usuarioId, processo: 'erp',
-        esperado: estoqueEsperado === undefined || estoqueEsperado === null ? null : inteiro(estoqueEsperado) })
-      if (movimento && movimento.erro === 'estoque_mudou') throw Object.assign(new Error(`O estoque do TMP10 mudou para ${movimento.anterior}. Confira de novo antes de aceitar.`), { status: 409 })
-      if (movimento && !movimento.aplicado && !movimento.duplicado) throw Object.assign(new Error('Não foi possível aplicar: ' + (movimento.erro || 'erro')), { status: 409 })
-    } else if (acao === 'enviar_tmp10') {
+    if (acao === 'enviar_tmp10') {
       await enfileirarSku(empresaId, d.sku, `Divergência ${d.id}: enviar número do TMP10`)
       agendarProcessamento()
     } else if (acao !== 'ignorar') throw Object.assign(new Error('Ação inválida.'), { status: 400 })
-    await q(sb.from('estoque_divergencias').update({ resolvido: true, resolucao: acao === 'aceitar' ? 'aceito_valor_plataforma' : acao === 'enviar_tmp10' ? 'enviado_tmp10' : 'ignorada',
+    await q(sb.from('estoque_divergencias').update({ resolvido: true, resolucao: acao === 'enviar_tmp10' ? 'enviado_tmp10' : 'ignorada',
       resolvido_em: new Date().toISOString(), resolvido_por: usuarioId || null }).eq('id', d.id).eq('empresa_id', empresaId), 'resolver divergência')
     return { ok: true, movimento }
   }
@@ -860,10 +884,10 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
 
   // Diagnóstico único (só leitura) antes de agrupar — mesmas regras da prévia
   // Revisão manual auditada (contagem) e devolução recebida — nada automático
-  const revisao = criarRevisao({ sb, q, grupos, movimentar, log })
+  const revisao = criarRevisao({ sb, q, grupos, movimentar, lerConfig, log })
   const diagnostico = criarDiagnostico({ sb, ml, grupos, q, lerConfig, envioHabilitado, agrupamento, ajusteMassa, full, log })
 
-  return { grupos, agrupamento, full, diagnostico, revisao, registrarPendenciaVenda, ajusteMassa, diagnosticoShopee, tentarShopeeUmaVez, movimentar, registrarVenda, registrarCancelamento, ajustar, enfileirarSku, processarMovimentosPendentes, processarFila, processarItem,
+  return { grupos, agrupamento, full, diagnostico, revisao, registrarPendenciaVenda, ajusteMassa, diagnosticoShopee, tentarShopeeUmaVez, movimentar, registrarVenda, registrarCancelamento, ajustar, estoqueInicial, enfileirarSku, processarMovimentosPendentes, processarFila, processarItem,
     conferir, iniciarConferencia, statusConferencia, conferirTodas, previa, sincronizar, resolverDivergencia, salvarConfig, lerConfig, painel,
     movimentosDoSku, liberarPausa, agendarProcessamento }
 }

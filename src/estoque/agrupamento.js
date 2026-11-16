@@ -5,7 +5,12 @@
 // já importou), lê ao vivo (só leitura) título/imagem/variações, monta a PRÉVIA com bloqueios e alertas e grava pela
 // função atômica do banco (migração 26) depois do "CONFIRMAR AGRUPAMENTO".
 //
-// NADA DE ESTOQUE MUDA AQUI: não soma, não zera, não copia saldo, não põe nada na fila, não envia nada.
+// NADA É SOMADO, ZERADO OU COPIADO, NADA VAI PARA A FILA E NADA É ENVIADO. Ao agrupar (com anúncios entrando) a QUANTIDADE
+// FÍSICA DO PRINCIPAL é obrigatória (migração 28, numa transação só com o agrupamento):
+//   • "confirmar"  — o saldo central já está correto (0 a 998): nenhum movimento; fica no histórico do grupo que você confirmou;
+//   • "contagem"   — quantidade CONFERIDA: um movimento oficial 'revisao_contagem' (usuário, data, anterior, nova, diferença,
+//                    motivo). Nunca vem do Mercado Livre/Shopee nem da soma dos anúncios secundários.
+// "Editar quantidade" de um grupo usa o mesmo registro. Nenhum dos dois põe nada na fila de envio.
 //
 // BLOQUEIA (não deixa confirmar) quando:
 //   • principal: não cadastrado / duplicado / sem estoque oficial · já agrupado em outro principal · está no PILOTO
@@ -239,7 +244,11 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
     const p = prods.get(sku)
     if (!p) bloq(`o produto principal ${sku} não está cadastrado no TMP10`)
     else if (p.duplicado) bloq(`há mais de um produto com o SKU ${sku} no cadastro — corrija antes de agrupar`)
-    else if (p.estoque_atual === null || p.estoque_atual === undefined) bloq(`o produto principal ${sku} não tem estoque oficial definido`)
+    // o estoque do principal vira o número de TODOS os anúncios do grupo: sem estoque oficial, negativo ou 999+ (provável
+    // preenchimento) NÃO pode ser só confirmado — o agrupamento exige a quantidade contada fisicamente (campo obrigatório)
+    else if (add.length && (p.estoque_atual === null || p.estoque_atual === undefined)) alerta(`o produto principal ${sku} não tem estoque oficial definido — para agrupar, informe a quantidade contada fisicamente (fica registrada no histórico)`)
+    else if (add.length && Number(p.estoque_atual) >= 999) alerta(`o produto principal ${sku} tem ${p.estoque_atual} unidade(s) — 999 ou mais é provável número de preenchimento, não estoque físico. Para agrupar, informe a quantidade contada fisicamente`)
+    else if (add.length && Number(p.estoque_atual) < 0) alerta(`o produto principal ${sku} está com estoque NEGATIVO (${p.estoque_atual}) — para agrupar, informe a quantidade contada fisicamente`)
     const absorvido = g.principalDe(sku)
     if (absorvido) bloq(`${sku} já está agrupado no produto principal ${absorvido} — escolha ${absorvido} como principal (agrupamentos não se encadeiam)`)
     if (add.length && cfg.modo === 'piloto' && (cfg.skus_piloto || []).includes(sku)) bloq(`${sku} está na lista do PILOTO (envio real). Anúncios novos passariam a receber envio real sem a sua decisão — tire ${sku} do piloto, agrupe, confira e decida depois`)
@@ -361,7 +370,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
         preenchimento: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) em anúncio com número de preenchimento (999 ou mais) (${l.map((d) => desc(d) + ` → hoje ${d._vivo}`).join(' · ')}) — não é estoque físico`,
         tmp10_negativo: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) e o estoque normal do TMP10 está negativo (${prods.get(x) ? prods.get(x).estoque_atual : '—'}) (${l.map(desc).join(' · ')})`,
         sem_leitura: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) sem leitura atual do anúncio (${l.map((d) => desc(d) + (d._det ? ': ' + d._det : '')).join(' · ')}) — sem conferir, não decide`,
-        real: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) NÃO resolvida(s) (TMP10 × plataforma): ${l.map((d) => desc(d) + (d._vivo !== undefined ? ` → hoje ${d._vivo}` : '')).join(' · ')} — resolva no painel do Estoque (aceitar, enviar o número do TMP10 ou ignorar) antes de agrupar`
+        real: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) NÃO resolvida(s) (TMP10 × plataforma): ${l.map((d) => desc(d) + (d._vivo !== undefined ? ` → hoje ${d._vivo}` : '')).join(' · ')} — resolva antes de agrupar: confira a peça e use "Enviar número do TMP10", "Revisar contagem" ou "Ignorar" (o número da plataforma nunca vira o estoque oficial)`
       }
       for (const x of envolvidos) {
         const doSku = div.filter((d) => d.sku === x)
@@ -414,7 +423,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
     }
     if (novos.length && cfg.modo === 'piloto') alerta(`modo PILOTO: os anúncios agrupados ficam SEMPRE em simulação — mesmo que ${sku} entre na lista do piloto, só os anúncios com o próprio SKU ${sku} recebem envio real`)
     if (novos.length && cfg.modo === 'ativo') alerta(`modo ATIVO: na próxima movimentação de ${sku} (ou no "Sincronizar Estoque Agora"), o estoque de ${sku} será enviado também aos anúncios agrupados. O agrupamento em si não envia nada.`)
-    if (novos.length) alerta(`o agrupamento NÃO envia nada agora e NÃO altera saldos. Os anúncios agrupados passam a mostrar o estoque de ${sku} na próxima movimentação dele ou no "Sincronizar Estoque Agora"`)
+    if (novos.length) alerta(`o agrupamento NÃO envia nada agora e NÃO soma saldos. O saldo de ${sku} só muda se você informar uma quantidade contada (registrada no histórico). Os anúncios agrupados passam a mostrar o estoque de ${sku} quando você sincronizar ("Sincronizar Estoque Agora", com prévia) ou na próxima venda/cancelamento`)
 
     const assinatura = crypto.createHash('sha256').update(JSON.stringify([sku, novos.map((a) => a.chave).sort(), removidos.map((m) => m.id).sort(), membrosAtuais.map((m) => m.id).sort()])).digest('hex').slice(0, 32)
     const detalhe = (a) => ({ chave: a.chave, plataforma: a.plataforma, conta_ref: a.conta_ref, conta_nome: a.conta_nome, anuncio_id: a.anuncio_id, variacao_id: a.variacao_id || '',
@@ -425,12 +434,52 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
       adicionar: novos.map(detalhe), remover: removidos.map((m) => ({ id: m.id, ...detalhe({ ...m, chave: chaveDe(m) }) })),
       final: finais.map((a) => ({ chave: a.chave, plataforma: a.plataforma, conta_nome: a.conta_nome, anuncio_id: a.anuncio_id, variacao_id: a.variacao_id || '', sku_original: a.sku_original, novo: !a.atual })),
       quantidade_final: finais.length, bloqueios: bloqueios.map((b) => codificar(b, 'bloqueio')), alertas: alertas.map((x) => codificar(x, 'aviso')), pode_confirmar: bloqueios.length === 0 && (novos.length + removidos.length) > 0, assinatura,
-      config: { modo: cfg.modo }
+      config: { modo: cfg.modo },
+      // quantidade física do principal: obrigatória quando entram anúncios. "confirmar" só se o saldo atual for 0–998.
+      saldo_principal: saldoPrincipal(p, novos.length > 0, cfg)
+    }
+  }
+
+  function saldoPrincipal(p, obrigatorio, cfg) {
+    const atual = p && !p.duplicado && p.estoque_atual !== undefined ? p.estoque_atual : null
+    const confirmavel = atual !== null && Number(atual) >= 0 && Number(atual) <= 998
+    return { atual, obrigatorio: !!obrigatorio, confirmavel, exige_contagem: !confirmavel,
+      piloto: !!(p && cfg && cfg.modo === 'piloto' && (cfg.skus_piloto || []).includes(p.sku)), limite_piloto: 998 }
+  }
+
+  // Valida o bloco "saldo" ANTES de ir ao banco (o banco confere tudo de novo, travado). Devolve o p_saldo da migração 28.
+  function validarSaldo(saldo, atual, { piloto = false, soContagem = false, sku = '' } = {}) {
+    if (!saldo || !saldo.modo) throw erroHttp(`Informe a quantidade física do produto principal ${sku} (confirme o saldo atual ou informe a quantidade contada).`, 400)
+    const visto = saldo.estoque_visto === null || saldo.estoque_visto === undefined || Number.isNaN(saldo.estoque_visto) ? null : Math.trunc(Number(saldo.estoque_visto))
+    if (visto !== (atual === undefined ? null : atual)) throw erroHttp(`O estoque de ${sku} agora é ${atual ?? 'sem estoque oficial'} (a tela mostrava ${visto ?? 'sem estoque oficial'}). Confira e informe de novo.`, 409, { atual })
+    if (saldo.modo === 'confirmar' && !soContagem && (atual === null || atual < 0 || atual > 998)) throw erroHttp(`O saldo atual de ${sku} (${atual ?? 'sem estoque oficial'}) não pode ser só confirmado: informe a quantidade contada fisicamente.`, 400)
+    const n = Number(saldo.quantidade)
+    if (saldo.quantidade === null || saldo.quantidade === undefined || !Number.isInteger(n)) throw erroHttp('Informe a quantidade (número inteiro).', 400)
+    if (saldo.modo === 'confirmar' && !soContagem) {
+      if (n !== atual) throw erroHttp(`Para confirmar o saldo atual, a quantidade tem de ser ${atual}. Se o número é outro, informe como quantidade contada.`, 400)
+      return { modo: 'confirmar', quantidade: n, esperado: atual }
+    }
+    if (saldo.modo !== 'contagem') throw erroHttp('Escolha: confirmar o saldo atual ou informar a quantidade contada.', 400)
+    if (saldo.contei !== true) throw erroHttp('Marque "Contei fisicamente" para registrar a quantidade contada.', 400)
+    if (n < 0 || n > 1000000) throw erroHttp('Informe a quantidade contada (0 a 1.000.000).', 400)
+    const mot = String(saldo.motivo || '').trim(); if (mot.length < 5) throw erroHttp('Descreva o motivo da contagem (ex.: "contagem física 31/10").', 400)
+    if (n >= 999 && saldo.acima_999 !== true) throw erroHttp(`${n} unidades: 999 ou mais costuma ser número de preenchimento. Se você contou mesmo, marque "Confirmo que contei ${n} unidades".`, 400)
+    if (n >= 999 && piloto) throw erroHttp(`${sku} está na lista do PILOTO: a quantidade tem de ficar entre 0 e 998.`, 409)
+    return { modo: 'contagem', quantidade: n, esperado: atual, motivo: mot, contei: true, acima_999: n >= 999 }
+  }
+  // chamada à função da migração 28; sem ela, recusa (nunca agrupa sem registrar a quantidade)
+  async function aplicarComSaldo(args) {
+    try { return await rpc('estoque_agrupamento_aplicar_saldo', args) } catch (e) {
+      const m = String(e.message || '')
+      if (/estoque_agrupamento_aplicar_saldo/.test(m) && /(Could not find|does not exist|PGRST202|schema cache)/i.test(m)) throw erroHttp('A migração 28 (quantidade no agrupamento) ainda não foi aplicada no banco: agrupar com anúncios novos e "Editar quantidade" ficam indisponíveis. Nada foi gravado.', 409, { codigo: 'MIGRACAO_28' })
+      if (/agrupamento_saldo: saldo_mudou/.test(m)) throw erroHttp(m.replace(/^.*agrupamento_saldo: saldo_mudou — /, '') + ' Nada foi gravado.', 409)
+      if (/agrupamento_saldo:|agrupamento:/.test(m)) throw erroHttp(`${m.replace(/^rpc [^:]+: /, '').replace(/^agrupamento_saldo: /, '')}. Nada foi gravado.`, 409)
+      throw e
     }
   }
 
   // ── CONFIRMAR AGRUPAMENTO (grava atômico; nada de estoque muda) ──────────────────────────────────────────────────
-  async function confirmar({ empresaId, usuarioId, produtoSku, adicionar = [], remover = [], conferido, assinatura, operacaoId, produtos = [], origem = 'estoque' }) {
+  async function confirmar({ empresaId, usuarioId, produtoSku, adicionar = [], remover = [], conferido, assinatura, operacaoId, produtos = [], origem = 'estoque', saldo = null }) {
     if (conferido !== true) throw erroHttp('Marque "Conferi que todos estes anúncios são exatamente a mesma peça física" antes de confirmar.', 400)
     const pv = await previa({ empresaId, produtoSku, adicionar, remover })
     if (!assinatura || pv.assinatura !== assinatura) throw erroHttp('A seleção ou o agrupamento mudou desde a prévia. Gere a prévia de novo e confira.', 409, { previa: pv })
@@ -442,16 +491,47 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
       removidos: pv.remover, alertas_mostrados: pv.alertas.map((a) => a.motivo), quantidade_final: pv.quantidade_final, modo: pv.config.modo,
       // de onde veio a operação e quais PRODUTOS do catálogo o usuário selecionou (tela Produtos → "Agrupar selecionados")
       origem: origem === 'produtos' ? 'produtos' : 'estoque', produtos_selecionados: [...new Set((Array.isArray(produtos) ? produtos : []).map(String))].slice(0, 200) }
-    let r
-    try { r = await rpc('estoque_agrupamento_aplicar', { p_empresa: empresaId, p_operacao: op, p_produto: pv.principal.sku, p_usuario: usuarioId || null, p_acao: acao,
+    const args = { p_empresa: empresaId, p_operacao: op, p_produto: pv.principal.sku, p_usuario: usuarioId || null, p_acao: acao,
       p_adicionar: pv.adicionar.map((a) => ({ plataforma: a.plataforma, conta_ref: a.conta_ref, conta_nome: a.conta_nome, anuncio_id: a.anuncio_id, variacao_id: a.variacao_id, sku_original: a.sku_original })),
-      p_remover: pv.remover.map((m) => m.id), p_detalhe: detalhe }) } catch (e) {
-      // conflito detectado pelo banco (outro administrador agrupou ao mesmo tempo): nada foi gravado
-      if (/agrupamento:/.test(e.message)) throw erroHttp(`${e.message.replace(/^rpc [^:]+: /, '')}. Gere a prévia de novo.`, 409)
-      throw e
+      p_remover: pv.remover.map((m) => m.id), p_detalhe: detalhe }
+    let r
+    if (pv.adicionar.length) {
+      // anúncios ENTRANDO: a quantidade física do principal é obrigatória e é gravada na MESMA transação (migração 28)
+      const sp = pv.saldo_principal
+      const pSaldo = validarSaldo(saldo, sp.atual, { piloto: sp.piloto, sku: pv.principal.sku })
+      r = await aplicarComSaldo({ ...args, p_saldo: pSaldo })
+    } else {
+      // só remover/desfazer: nenhum saldo é pedido nem alterado (função da migração 26)
+      try { r = await rpc('estoque_agrupamento_aplicar', args) } catch (e) {
+        // conflito detectado pelo banco (outro administrador agrupou ao mesmo tempo): nada foi gravado
+        if (/agrupamento:/.test(e.message)) throw erroHttp(`${e.message.replace(/^rpc [^:]+: /, '')}. Gere a prévia de novo.`, 409)
+        throw e
+      }
     }
-    log(`🔗 [ESTOQUE] agrupamento ${acao} — ${pv.principal.sku}: +${pv.adicionar.length} / -${pv.remover.length} anúncio(s) (operação ${op}, usuário ${usuarioId || '-'})`)
-    return { ok: true, operacao_id: op, acao, duplicado: !!(r && r.duplicado), adicionados: pv.adicionar.length, removidos: pv.remover.length, grupo: await detalheGrupo({ empresaId, produtoSku: pv.principal.sku }) }
+    const sd = r && r.saldo ? r.saldo : null
+    log(`🔗 [ESTOQUE] agrupamento ${acao} — ${pv.principal.sku}: +${pv.adicionar.length} / -${pv.remover.length} anúncio(s) (operação ${op}, usuário ${usuarioId || '-'})` +
+      (sd ? ` · quantidade ${sd.modo === 'contagem' ? `CONTADA ${sd.anterior ?? 'sem estoque'} → ${sd.novo} (diferença ${sd.diferenca})` : `CONFIRMADA ${sd.novo}`} · nada enviado` : ''))
+    return { ok: true, operacao_id: op, acao, duplicado: !!(r && r.duplicado), adicionados: pv.adicionar.length, removidos: pv.remover.length, saldo: sd, enviado: false,
+      grupo: await detalheGrupo({ empresaId, produtoSku: pv.principal.sku }) }
+  }
+
+  // ── ✏️ EDITAR QUANTIDADE de um grupo: contagem física auditada do principal (mesmo registro do agrupamento). NÃO envia nada.
+  async function editarQuantidade({ empresaId, usuarioId, produtoSku, saldo, operacaoId }) {
+    const sku = String(produtoSku || '').trim(); if (!sku) throw erroHttp('Informe o produto principal.', 400)
+    const g = await grupos.carregar(empresaId)
+    if (!g.ehPrincipal(sku)) throw erroHttp(`${sku} não é produto principal de um agrupamento ativo.`, 409)
+    const p = (await produtosMap(empresaId, [sku])).get(sku)
+    if (!p) throw erroHttp(`O produto ${sku} não está cadastrado.`, 404)
+    if (p.duplicado) throw erroHttp(`Há mais de um produto com o SKU ${sku}. Corrija o cadastro antes.`, 409)
+    const cfg = await lerConfig(empresaId)
+    const sp = saldoPrincipal({ ...p, sku }, true, cfg)
+    const pSaldo = validarSaldo({ ...(saldo || {}), modo: 'contagem' }, sp.atual, { piloto: sp.piloto, soContagem: true, sku })
+    const op = ehUuid(operacaoId) ? operacaoId : crypto.randomUUID()
+    const r = await aplicarComSaldo({ p_empresa: empresaId, p_operacao: op, p_produto: sku, p_usuario: usuarioId || null, p_acao: 'editar',
+      p_adicionar: [], p_remover: [], p_detalhe: { tipo: 'editar_quantidade', principal: { sku, nome: p.name }, modo: cfg.modo }, p_saldo: pSaldo })
+    const sd = r && r.saldo ? r.saldo : null
+    log(`✏️ [ESTOQUE] quantidade do grupo ${sku}: ${sd ? `${sd.anterior ?? 'sem estoque'} → ${sd.novo} (diferença ${sd.diferenca})` : '-'} (operação ${op}, usuário ${usuarioId || '-'}) · nada enviado`)
+    return { ok: true, operacao_id: op, duplicado: !!(r && r.duplicado), saldo: sd, enviado: false, grupo: await detalheGrupo({ empresaId, produtoSku: sku }) }
   }
 
   // ── Tela PRODUTOS → "Agrupar selecionados": para cada PRODUTO selecionado, os anúncios vinculados a ele (ML e Shopee,
@@ -477,7 +557,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
     }
   }
 
-  return { produtos, anuncios, aoVivo, listarGrupos, detalheGrupo, previa, confirmar, produtosAnuncios,
+  return { produtos, anuncios, aoVivo, listarGrupos, detalheGrupo, previa, confirmar, editarQuantidade, produtosAnuncios,
     interno: { catalogo, lerAoVivo, contasDaEmpresa, produtosMap, publico } }
 }
 

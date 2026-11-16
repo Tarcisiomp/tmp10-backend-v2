@@ -1,4 +1,4 @@
-// Estoque Central TMP10 — serviço único (migração 21).
+// Estoque Central TMP10 — CÓPIA ANTIGA do serviço (o server.js carrega src/estoque/servico.js; este arquivo NÃO é usado).
 //
 // REGRAS
 //   • O TMP10 é a fonte oficial. O estoque só muda por estoque_movimentar (banco): trava a linha do produto,
@@ -129,19 +129,12 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
     return n // 0 = produto sem anúncio vinculado: estoque só no TMP10, sem erro
   }
 
-  // Movimentos registrados pelo gatilho (alteração direta / cadastro) → fila
-  async function processarMovimentosPendentes() {
-    const pend = await q(sb.from('estoque_movimentos').select('id, empresa_id, sku').eq('sincronizacao_pendente', true).limit(500), 'movimentos pendentes')
+  // Movimentos registrados pelo rastro do banco (alteração fora da função oficial): só histórico, NUNCA vão para a fila
+  async function processarMovimentosPendentes() {   // V4: alteração fora da função oficial NUNCA é enviada (cópia antiga, não carregada)
+    const pend = await q(sb.from('estoque_movimentos').select('id').eq('sincronizacao_pendente', true).limit(500), 'movimentos pendentes')
     if (!pend || !pend.length) return 0
-    const feitos = new Set()
-    for (const m of pend) {
-      const k = `${m.empresa_id}::${m.sku}`
-      if (feitos.has(k)) continue
-      feitos.add(k)
-      try { await enfileirarSku(m.empresa_id, m.sku, 'Alteração registrada pelo banco', m.id) } catch (e) { log(`❌ [ESTOQUE] enfileirar ${m.sku}: ${e.message}`) }
-    }
     await q(sb.from('estoque_movimentos').update({ sincronizacao_pendente: false }).in('id', pend.map((m) => m.id)), 'desmarcar pendentes')
-    return feitos.size
+    return 0
   }
 
   let timer = null
@@ -426,6 +419,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
   }
 
   async function resolverDivergencia({ empresaId, id, acao, usuarioId, estoqueEsperado }) {
+    // DESATIVADO: o número da plataforma nunca substitui o estoque central (cópia ANTIGA, não carregada pelo server.js)
+    if (acao === 'aceitar') throw Object.assign(new Error('"Aceitar o número da plataforma" foi desativado: o estoque central do TMP10 é a única fonte da quantidade física.'), { status: 410, codigo: 'IMPORTACAO_PLATAFORMA_DESATIVADA' })
     const d = await q(sb.from('estoque_divergencias').select('*').eq('id', id).eq('empresa_id', empresaId).maybeSingle(), 'divergência')
     if (!d || !d.chave) throw Object.assign(new Error('Divergência não encontrada.'), { status: 404 })
     if (d.resolvido === true) throw Object.assign(new Error('Esta divergência já foi resolvida.'), { status: 409 })

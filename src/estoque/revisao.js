@@ -2,6 +2,9 @@
 // e DEVOLUÇÃO RECEBIDA (entrada manual). Nada aqui é automático: toda escrita exige confirmação explícita do operador
 // ("conferido") e passa pela função oficial estoque_movimentar (movimento com usuário, motivo, referência idempotente e
 // "estoque esperado" — se o número mudou enquanto a pessoa contava, a revisão é recusada).
+// A REVISÃO POR CONTAGEM NÃO ENVIA NADA: o movimento é registrado sem ir para a fila (enfileirar:false). Alterar quantidade
+// nunca dispara sincronização; mandar o número aos anúncios é uma etapa separada ("Sincronizar Agora", com prévia).
+// 999 ou mais exige a confirmação extra "acima999"; o SKU que está na lista do PILOTO só aceita 0–998.
 //
 // DEVOLUÇÃO: o TMP10 NÃO trata devolução como cancelamento e NÃO dá entrada sozinho. A doc do Mercado Livre ("Gerenciar
 // devoluções") mostra que a devolução é um fluxo de reclamação (claims/returns) com estados próprios (opened, shipped,
@@ -14,7 +17,7 @@ const inteiro = (v) => (v === null || v === undefined || v === '' || !Number.isF
 const ROT = { mercadolivre: 'Mercado Livre', shopee: 'Shopee' }
 const LIMITE_PREENCHIMENTO = 999
 
-function criarRevisao({ sb, q, grupos, movimentar, log = console.log }) {
+function criarRevisao({ sb, q, grupos, movimentar, lerConfig = null, log = console.log }) {
   // Produtos que precisam de revisão: negativo · 999 ou mais · sem estoque oficial (inclui importados pendentes de contagem)
   async function pendentes({ empresaId, limite = 300 }) {
     const lerTodos = async (montar) => { const t = []; for (let de = 0; ; de += 1000) { const l = await q(montar().range(de, de + 999), 'produtos'); t.push(...(l || [])); if (!l || l.length < 1000) return t } }
@@ -31,13 +34,15 @@ function criarRevisao({ sb, q, grupos, movimentar, log = console.log }) {
   }
 
   // Revisão por CONTAGEM FÍSICA: "fica com N", só se o estoque ainda for o que a pessoa viu (esperado), com motivo e "conferido"
-  async function revisarSaldo({ empresaId, sku, contagem, estoqueEsperado, motivo, conferido, usuarioId, idOperacao }) {
+  async function revisarSaldo({ empresaId, sku, contagem, estoqueEsperado, motivo, conferido, usuarioId, idOperacao, acima999 = false }) {
     if (conferido !== true) throw erroHttp('Marque "Contei fisicamente esta peça" antes de confirmar a revisão.', 400)
     const n = inteiro(contagem)
     if (n === null || n < 0 || n > 1000000) throw erroHttp('Informe a quantidade contada (0 a 1.000.000).', 400)
     const mot = String(motivo || '').trim()
     if (mot.length < 5) throw erroHttp('Descreva o motivo da revisão (ex.: "contagem física 30/10").', 400)
     const s = String(sku || '').trim(); if (!s || s.length > 120) throw erroHttp('SKU inválido.', 400)
+    if (n >= LIMITE_PREENCHIMENTO && acima999 !== true) throw erroHttp(`${n} unidades: 999 ou mais costuma ser número de preenchimento. Se você contou mesmo, marque "Confirmo que contei ${n} unidades".`, 400)
+    if (n >= LIMITE_PREENCHIMENTO && lerConfig && ((await lerConfig(empresaId)).skus_piloto || []).includes(s)) throw erroHttp(`${s} está na lista do PILOTO: a quantidade tem de ficar entre 0 e 998.`, 409)
     const principal = (await grupos.carregar(empresaId)).principalDe(s)
     if (principal) throw erroHttp(`O SKU ${s} está agrupado em ${principal}: o estoque oficial é o do principal. Revise o ${principal}.`, 409)
     const atual = await q(sb.from('products').select('estoque_atual').eq('empresa_id', empresaId).eq('sku', s), 'produto')
@@ -48,11 +53,12 @@ function criarRevisao({ sb, q, grupos, movimentar, log = console.log }) {
     if ((atual[0].estoque_atual ?? null) !== viu) throw Object.assign(erroHttp(`O estoque deste produto agora é ${atual[0].estoque_atual ?? 'sem estoque oficial'} (a tela mostrava ${viu ?? 'sem estoque oficial'}). Confira e revise de novo.`, 409), { atual: atual[0].estoque_atual })
     const op = /^[A-Za-z0-9_-]{8,64}$/.test(String(idOperacao || '')) ? String(idOperacao) : crypto.randomUUID()
     const r = await movimentar({ empresaId, sku: s, tipo: 'definir', quantidade: n, origem: 'revisao_contagem',
-      motivo: `Revisão por contagem física: ${mot}`.slice(0, 300), referencia: `revisao:${op}`, usuarioId, processo: 'erp', esperado: viu === null ? 0 : viu })
+      motivo: `Revisão por contagem física: ${mot} · saldo anterior ${viu ?? 'sem estoque oficial'} → contado ${n} (diferença ${n - (viu ?? 0) > 0 ? '+' : ''}${n - (viu ?? 0)})`.slice(0, 300),
+      referencia: `revisao:${op}`, usuarioId, processo: 'erp', esperado: viu === null ? 0 : viu, enfileirar: false })
     if (r && r.erro === 'estoque_mudou') throw Object.assign(erroHttp(`O estoque mudou para ${r.anterior} enquanto você contava. Confira e revise de novo.`, 409), { atual: r.anterior })
     if (r && !r.aplicado && !r.duplicado) throw erroHttp(`Revisão não aplicada: ${r.erro || 'erro'}`, 409)
-    log(`📝 [ESTOQUE] revisão por contagem — ${s}: ${viu ?? 'sem estoque'} → ${n} (usuário ${usuarioId || '-'}; ${mot.slice(0, 80)})`)
-    return { ok: true, sku: s, anterior: viu, novo: n, duplicado: !!(r && r.duplicado), movimento_id: r && r.movimento_id }
+    log(`📝 [ESTOQUE] revisão por contagem — ${s}: ${viu ?? 'sem estoque'} → ${n} (usuário ${usuarioId || '-'}; ${mot.slice(0, 80)}) · nada enviado às plataformas`)
+    return { ok: true, sku: s, anterior: viu, novo: n, diferenca: n - (viu ?? 0), duplicado: !!(r && r.duplicado), movimento_id: r && r.movimento_id, enviado: false }
   }
 
   // DEVOLUÇÃO RECEBIDA (manual, auditada): entrada no produto que a venda REALMENTE baixou

@@ -1,4 +1,4 @@
-// Rotas /api/estoque/* — Estoque Central. Sempre com sessão de ADMINISTRADOR; a empresa vem SEMPRE da sessão
+// CÓPIA ANTIGA (o server.js carrega src/estoque/rotas.js; este arquivo NÃO é usado). Rotas /api/estoque/* — Estoque Central. Sempre com sessão de ADMINISTRADOR; a empresa vem SEMPRE da sessão
 // (qualquer empresa_id enviado pelo navegador é ignorado). Funcionário e vendedor não alteram estoque por aqui.
 const express = require('express')
 

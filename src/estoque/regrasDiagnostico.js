@@ -8,7 +8,7 @@
 //   preenchimento  — o anúncio mostra 999 ou mais (número de preenchimento, não estoque físico) → BLOQUEIO
 //   tmp10_negativo — o estoque normal do TMP10 está negativo → BLOQUEIO (conte e ajuste o produto primeiro)
 //   sem_leitura    — não foi possível ler o anúncio agora → BLOQUEIO (sem conferir, não decide)
-//   real           — diferença real sem causa conhecida → BLOQUEIO (decida no painel: enviar TMP10 / aceitar / ignorar)
+//   real           — diferença real sem causa conhecida → BLOQUEIO (decida no painel: conferir a peça, enviar TMP10 ou ignorar)
 const LIMITE_PREENCHIMENTO = 999
 
 function classificarDivergencia(d, { vivo = null, tmp10Atual = null, fullConfirmado = false } = {}) {
@@ -36,11 +36,15 @@ const CLASSE_DIVERGENCIA = {
   sem_leitura: { codigo: 'DIVERGENCIA_SEM_LEITURA', titulo: 'Divergência sem leitura atual do anúncio',
     orientacao: 'Não foi possível ler o anúncio agora. Tente de novo; se persistir, confira a conexão da conta/loja.' },
   real: { codigo: 'DIVERGENCIA_REAL', titulo: 'Divergência real (TMP10 × plataforma)',
-    orientacao: 'Decida no painel do Estoque: "Enviar número do TMP10" (o anúncio passa a mostrar o TMP10), "Aceitar" (o número da plataforma vira o oficial, com movimento registrado) ou "Ignorar".' }
+    orientacao: 'Confira a peça. Se o TMP10 está certo: "Enviar número do TMP10" (o anúncio passa a mostrar o TMP10). Se o TMP10 está errado: conte e use "Revisar contagem". Ou "Ignorar". O número da plataforma nunca vira o estoque oficial.' }
 }
 
 // Códigos e orientação para as mensagens da prévia do agrupamento (a mensagem já traz a causa e os valores)
 const PADROES = [
+  [/provável número de preenchimento, não estoque físico\. Para agrupar, informe a quantidade contada/, 'PRINCIPAL_PREENCHIMENTO', 'Conte a peça do produto principal e informe a quantidade contada no campo obrigatório do agrupamento (fica no histórico). Nada é enviado.'],
+  [/produto principal .* está com estoque NEGATIVO/, 'PRINCIPAL_NEGATIVO', 'Conte a peça do produto principal e informe a quantidade contada no campo obrigatório do agrupamento (fica no histórico). Nada é enviado.'],
+  [/produto principal .* não tem estoque oficial definido — para agrupar/, 'PRINCIPAL_SEM_ESTOQUE', 'Conte a peça do produto principal e informe a quantidade contada no campo obrigatório do agrupamento (fica no histórico). Nada é enviado.'],
+  [/vínculo ambíguo: o (anúncio|item)/, 'VINCULO_AMBIGUO', 'Corrija o vínculo: um anúncio/variação deve apontar para um único SKU.'],
   [/divergência\(s\) antiga\(s\) em anúncio FULL/, 'DIVERGENCIA_FULL', CLASSE_DIVERGENCIA.full.orientacao],
   [/já mostra o número atual do TMP10/, 'DIVERGENCIA_OBSOLETA', CLASSE_DIVERGENCIA.obsoleta.orientacao],
   [/reserva de promoção maior/, 'DIVERGENCIA_RESERVA_SHOPEE', CLASSE_DIVERGENCIA.reserva.orientacao],

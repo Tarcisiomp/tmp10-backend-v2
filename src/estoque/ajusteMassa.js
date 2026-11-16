@@ -771,7 +771,11 @@ function criarAjusteMassa({ sb, ml, shopee, grupos, q, rpc, movimentar, lerConfi
     await atualizarPedidos(ctx, contas)
     return { naoImportados: [...ctx.naoImportados.values()], erroConta: Object.fromEntries(ctx.erroConta) }
   }
-  return { simular, iniciarSimulacao, retomarSimulacao, executar, iniciarExecucao, status, itensDaExecucao, itens, diagnosticoML, avaliar: avaliarCompleto, filtrar, pedidosPendentes }
+  // DESATIVADO DEFINITIVAMENTE: o Ajuste em Massa gravava no TMP10 a quantidade lida no Mercado Livre/Shopee. Pela regra
+  // definitiva, o estoque central do TMP10 é a ÚNICA fonte da quantidade física — nenhuma quantidade da plataforma o substitui.
+  // Continuam: histórico das execuções antigas (status / itensDaExecucao), diagnóstico do ML (só leitura) e pedidos pendentes.
+  const desativado = async () => { throw Object.assign(new Error('O Ajuste em Massa (quantidade do Mercado Livre/Shopee → TMP10) foi desativado: o estoque central do TMP10 é a única fonte da quantidade física. Para corrigir um saldo, conte a peça e use "Revisar contagem" (Diagnóstico) ou "Editar quantidade" (grupo).'), { status: 410, codigo: 'IMPORTACAO_PLATAFORMA_DESATIVADA' }) }
+  return { simular: desativado, iniciarSimulacao: desativado, retomarSimulacao: desativado, executar: desativado, iniciarExecucao: desativado, status, itensDaExecucao, itens: desativado, diagnosticoML, avaliar: avaliarCompleto, filtrar, pedidosPendentes }
 }
 
 module.exports = { criarAjusteMassa, LIMITE_QUANTIDADE_PADRAO, LOTE_SIMULACAO, LOTE_EXECUCAO, AVISO_FIXO }

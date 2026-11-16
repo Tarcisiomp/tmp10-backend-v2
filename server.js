@@ -623,7 +623,8 @@ async function syncShopeeOrders(account) {
             if (existing) {
               // Cancelamento Shopee → devolve o estoque (só o que a venda baixou). Liga com ESTOQUE_SHOPEE_CANCELAMENTO=1.
               // PRECISA CONFIRMAR: o valor de order_status de pedido cancelado (padrão 'CANCELLED'; ajuste em SHOPEE_STATUS_CANCELADO).
-              const statusCancelado = (process.env.SHOPEE_STATUS_CANCELADO || 'CANCELLED').split(',').map((x) => x.trim()).filter(Boolean)
+              // Devolução NÃO é cancelamento: status com RETURN (ex.: TO_RETURN) nunca devolve estoque sozinho, mesmo se configurado.
+              const statusCancelado = (process.env.SHOPEE_STATUS_CANCELADO || 'CANCELLED').split(',').map((x) => x.trim()).filter((x) => x && !/RETURN/i.test(x))
               if (process.env.ESTOQUE_SHOPEE_CANCELAMENTO === '1' && existing.platform === 'shopee' && existing.status !== 'cancelado'
                   && statusCancelado.includes(String(order.order_status || ''))) {
                 const { error: errCanc } = await sb.from('ml_orders').update({ status: 'cancelado', ml_status: order.order_status, updated_at: new Date().toISOString() })
@@ -2456,8 +2457,11 @@ app.get('/api/stats', exigirAdmin, async (req, res) => {
 })
 
 // Importação: produto que JÁ existe só atualiza nome/foto/ativo/origem (o estoque oficial do TMP10 não muda);
-// produto NOVO é criado com o estoque do anúncio (fica registrado como "cadastro_produto" nos movimentos).
-async function salvarProdutoImportado(dados, estoqueInicial) {
+// produto NOVO nasce SEM estoque oficial (estoque_atual = null) e fica marcado "importacao_pendente_contagem" até a
+// contagem física (Diagnóstico → Revisar contagem, ou a quantidade no agrupamento). REGRA DEFINITIVA: a quantidade
+// anunciada no Mercado Livre/Shopee NUNCA vira estoque físico do TMP10 — nem na importação. Sem estoque oficial, nenhum
+// envio sai para os anúncios desse produto.
+async function salvarProdutoImportado(dados, quantidadeAnunciada) {
   if (!dados.empresa_id || !dados.sku) return
   const { data: existentes, error } = await sb.from('products').select('id').eq('empresa_id', dados.empresa_id).eq('sku', dados.sku).limit(2)
   if (error) throw new Error(error.message)
@@ -2466,7 +2470,16 @@ async function salvarProdutoImportado(dados, estoqueInicial) {
       .eq('empresa_id', dados.empresa_id).eq('sku', dados.sku)
     return
   }
-  await sb.from('products').insert({ ...dados, estoque_atual: Number(estoqueInicial) || 0 })
+  const numero = Number(quantidadeAnunciada) || 0
+  const { error: errIns } = await sb.from('products').insert({ ...dados, estoque_atual: null })
+  if (errIns) throw new Error(errIns.message)
+  const { error: errMarca } = await sb.from('estoque_movimentos').insert({ empresa_id: dados.empresa_id, sku: dados.sku, tipo: 'registro', quantidade: 0,
+    origem: 'importacao_pendente_contagem', aplicado: false, observacao: numero >= 999 ? 'quantidade_preenchimento' : 'quantidade_anunciada_nao_e_estoque_fisico',
+    referencia: `importacao_pendente:${dados.sku}`,
+    motivo: `Importado de ${dados.source || 'anúncio'} (o anúncio mostrava ${numero}) — a quantidade anunciada não vira estoque físico: estoque oficial pendente de contagem`.slice(0, 300),
+    processo: 'importacao-produtos' })
+  if (errMarca && errMarca.code !== '23505') console.log(`⚠️ [ESTOQUE] não marcou ${dados.sku} como pendente de contagem: ${errMarca.message}`)
+  console.log(`📦 [ESTOQUE] produto novo ${dados.sku} importado SEM estoque oficial (o anúncio mostrava ${numero}) — pendente de contagem física`)
 }
 
 let importStatus = { running: false, imported: 0, linked: 0, produtos_com_estoque_somado: 0, contaAtual: null, terminadoEm: null, erro: null }

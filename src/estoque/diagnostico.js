@@ -31,11 +31,22 @@ function criarDiagnostico({ sb, ml, grupos, q, lerConfig, envioHabilitado = () =
       'Sem a 22 a conferência de vendas Full usa a função da 21, anúncio por anúncio (mesmo resultado, mais lenta) e a fila grava anúncio por anúncio.',
       'Aplique a 22 depois da pré-verificação (0b/1-26-PRE).', false)
     add('24', 'tabela estoque_ajuste_massa_execucoes', await sonda(() => sb.from('estoque_ajuste_massa_execucoes').select('id').limit(1)), 'estoque_ajuste_massa_execucoes',
-      'Sem a 24 o Ajuste em Massa não grava a auditoria e a prévia do agrupamento não consegue conferir os pedidos com a trava.', 'Aplique a 24.', false)
+      'Sem a 24 a prévia do agrupamento não consegue conferir os pedidos pendentes com a trava (o histórico das execuções antigas do Ajuste em Massa — desativado — também fica nela).', 'Aplique a 24.', false)
     add('26', 'tabela estoque_agrupamento', await sonda(() => sb.from('estoque_agrupamento').select('id').limit(1)), 'estoque_agrupamento',
       'Sem a 26 não há onde gravar o agrupamento: "Confirmar" falha.', 'Aplique a 26 (depois da 22–25).', true)
     add('27', 'tabela estoque_full_saldos', await sonda(() => sb.from('estoque_full_saldos').select('id').limit(1)), 'estoque_full_saldos',
       'Sem a 27 o saldo Full é lido ao vivo na prévia, mas não fica guardado nem tem histórico na tela "Normal × Full".', 'Aplique a 27 (depois da 26).', false)
+    // 28: a sonda chama a função SEM parâmetros — ela recusa antes de ler ou travar qualquer coisa ("parâmetros obrigatórios")
+    const e28 = await sonda(() => sb.rpc('estoque_agrupamento_aplicar_saldo', { p_empresa: null, p_operacao: null, p_produto: null, p_usuario: null, p_acao: null, p_adicionar: null, p_remover: null, p_detalhe: null, p_saldo: null }))
+    add('28', 'função estoque_agrupamento_aplicar_saldo', e28 && /parâmetros obrigatórios/.test(e28.message || '') ? null : (e28 || { message: 'a sonda deveria ser recusada pela função' }), 'estoque_agrupamento_aplicar_saldo',
+      'Sem a 28 não dá para agrupar anúncios novos nem "Editar quantidade" (a quantidade física do principal é obrigatória e só é gravada pela 28). Desfazer continua funcionando.', 'Aplique a 28 (depois da 26).', true)
+    // 29: a regra "a plataforma nunca substitui o estoque central" também no banco (a sonda só LÊ: pergunta se uma origem é permitida)
+    const r29 = await (async () => { try { return await sb.rpc('estoque_origem_permitida', { p_origem: 'aceite_divergencia' }) } catch (e) { return { error: { message: e.message } } } })()
+    const r30 = await (async () => { try { return await sb.rpc('estoque_saldo_protegido_ativo') } catch (e) { return { error: { message: e.message } } } })()
+    add('30', 'saldo protegido no banco (só a função oficial altera products.estoque_atual)', r30 && r30.error ? r30.error : (r30 && r30.data === true ? null : { message: 'a proteção não está ativa' }), 'estoque_saldo_protegido_ativo',
+      'Sem a 30, o banco ainda ACEITA alteração direta de estoque (só registra).', 'Aplique a 30 (depois da 29).', false)
+    add('29', 'regra do estoque central no banco (estoque_origem_permitida)', r29 && r29.error ? r29.error : (r29 && r29.data === false ? null : { message: 'a regra não está ativa (a origem aceite_divergencia foi permitida)' }), 'estoque_origem_permitida',
+      'Sem a 29 a regra "o número da plataforma nunca substitui o estoque central" fica só no backend (o banco não recusa).', 'Aplique a 29 (depois da 28).', false)
     itens.push({ mig: '23 e 25', item: 'índices de divergências (23) e regra de plataforma do ajuste em massa (25)', situacao: 'nao_verificavel',
       detalhe: 'a API do banco não mostra índices/regras', efeito: null, orientacao: 'Confira com 0b-PRE-VERIFICACAO-migracoes-somente-leitura.sql.', impede_agrupar: false })
     return itens
