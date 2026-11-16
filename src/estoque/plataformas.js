@@ -115,7 +115,10 @@ function criarMercadoLivre({ axios, getToken, refreshToken, timeout = 8000 }) {
           imagem: corpo.secure_thumbnail || corpo.thumbnail || null,
           // inventory_id: identificador do estoque Full do anúncio (doc oficial ML "Envios Fulfillment": GET /items/{id} → inventory_id;
           // anúncio com variações tem um inventory_id por variação). Só LEITURA: usado para separar o Full e para NUNCA enviar a ele.
-          inventory_id: corpo.inventory_id ? String(corpo.inventory_id) : null
+          inventory_id: corpo.inventory_id ? String(corpo.inventory_id) : null,
+          // logística ATUAL do anúncio (recurso /items: shipping.logistic_type — 'fulfillment' = Full). Só LEITURA: usada na
+          // prévia do agrupamento para reconhecer o anúncio que SAIU do Full mas manteve o inventory_id antigo (2026-11-16).
+          logistica: corpo.shipping && corpo.shipping.logistic_type ? String(corpo.shipping.logistic_type).toLowerCase() : null
         })
       }
       // anúncio que o ML não devolveu para esta conta (de outra conta, apagado, sem permissão)

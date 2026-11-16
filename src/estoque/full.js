@@ -205,8 +205,10 @@ function criarFull({ sb, ml, grupos, q, rpc, log = console.log, agora = () => ne
             validacao: v.validacao, consultado_em: quando() })
         } catch (e) {
           const http = e && e.http
+          // logistica: logística ATUAL do anúncio no ML (só informativa para a prévia do agrupamento). A situação gravada no
+          // banco continua 'indisponivel' (nunca zero, último valor válido preservado) — a consulta do Full não muda.
           res.set(a.chave, http === 404
-            ? { situacao: 'indisponivel', inventory_id: l.inventory_id, erro: `o ML não informou o Full deste anúncio (HTTP 404): ${e.message}`, consultado_em: quando() }
+            ? { situacao: 'indisponivel', inventory_id: l.inventory_id, logistica: l.logistica || null, erro: `o ML não informou o Full deste anúncio (HTTP 404): ${e.message}`, consultado_em: quando() }
             : { situacao: 'erro', inventory_id: l.inventory_id, erro: e.message, consultado_em: quando() })
         }
         await dormir()

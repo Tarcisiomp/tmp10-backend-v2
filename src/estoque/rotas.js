@@ -41,7 +41,7 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
   // Versão do módulo de estoque publicada (SEM login; não expõe dados): serve para conferir, depois do deploy, se o
   // Railway está rodando o código novo — antes de publicar a interface. commit = RAILWAY_GIT_COMMIT_SHA (variável do Railway).
   router.get('/api/estoque/versao', (req, res) => res.json({ ok: true, modulo: 'estoque', versao: VERSAO_ESTOQUE, agrupamento: true,
-    agrupamento_produtos: true, estoque_full_por_anuncio: true, diagnostico: true, revisao: true, agrupamento_quantidade: true, revisao_sem_envio: true, importacao_plataforma: false, estoque_inicial_oficial: true, alteracao_direta_bloqueada: true, alteracao_direta_nunca_enviada: true, devolucao_manual: true, arquivos: ARQUIVOS_ESTOQUE, commit: process.env.RAILWAY_GIT_COMMIT_SHA ? String(process.env.RAILWAY_GIT_COMMIT_SHA).slice(0, 7) : null }))
+    agrupamento_produtos: true, estoque_full_por_anuncio: true, diagnostico: true, revisao: true, agrupamento_quantidade: true, revisao_sem_envio: true, importacao_plataforma: false, estoque_inicial_oficial: true, alteracao_direta_bloqueada: true, alteracao_direta_nunca_enviada: true, devolucao_manual: true, correcao: '2026-11-16-agrupamento', agrupamento_saiu_do_full: true, arquivos: ARQUIVOS_ESTOQUE, commit: process.env.RAILWAY_GIT_COMMIT_SHA ? String(process.env.RAILWAY_GIT_COMMIT_SHA).slice(0, 7) : null }))
   const responder = (fn) => async (req, res) => {
     try {
       const r = await fn(req, res)

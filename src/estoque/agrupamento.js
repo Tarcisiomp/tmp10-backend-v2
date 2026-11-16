@@ -233,8 +233,10 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
     const cat = await catalogo(empresaId, g, contas)
     const cfg = await lerConfig(empresaId)
     const bloqueios = [], alertas = []
-    const bloq = (motivo, chave = null) => bloqueios.push({ chave, motivo })
-    const alerta = (motivo, chave = null) => alertas.push({ chave, motivo })
+    // sku (2026-11-16): SKU original a que o achado se refere, quando é de um SKU inteiro (ex.: divergências) — a tela usa
+    // para oferecer "tirar da seleção". Não muda nenhuma regra: o bloqueio continua bloqueando.
+    const bloq = (motivo, chave = null, skuDe = null) => bloqueios.push({ chave, motivo, sku: skuDe })
+    const alerta = (motivo, chave = null, skuDe = null) => alertas.push({ chave, motivo, sku: skuDe })
     const nome = (a) => `${ROT[a.plataforma]} ${a.conta_nome || a.conta_ref} ${a.anuncio_id}${a.variacao_id ? '/' + a.variacao_id : ''}`
 
     // principal
@@ -342,6 +344,11 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
         else if (f.situacao === 'erro') bloq(`${nome(a)}: não foi possível confirmar se o anúncio é Full (${f.erro}) — sem conferir, não agrupa`, a.chave)
         // inventory_id presente, mas o ML não informa o saldo (ex.: 404 — o anúncio pode ter saído do Full mantendo o identificador
         // antigo). Sem informação confiável da logística/saldo, NÃO agrupa: o anúncio fica fora até o ML confirmar.
+        // 2026-11-16: o PRÓPRIO ML informa que a logística atual NÃO é Full (shipping.logistic_type ≠ 'fulfillment') e não tem
+        // saldo Full para o inventory_id antigo (404) → anúncio que SAIU do Full. Pode agrupar (AVISO): o saldo não vira zero,
+        // nada é somado, e o envio do estoque normal para ele continua bloqueado no servico.js enquanto o ML mostrar inventory_id.
+        // Logística 'fulfillment' ou não informada continua BLOQUEANDO (abaixo).
+        else if (f.situacao === 'indisponivel' && f.inventory_id && f.logistica && f.logistica !== 'fulfillment') alerta(`${nome(a)}: anúncio que SAIU DO FULL — o ML informa a logística "${f.logistica}" (não é Full) e não tem saldo Full para o inventory_id antigo ${f.inventory_id} (HTTP 404). Esse saldo NÃO é tratado como zero e NÃO é somado ao ${sku}. Enquanto o ML mantiver o inventory_id, o TMP10 continua sem enviar estoque para este anúncio`, a.chave)
         else if (f.situacao === 'indisponivel' && f.inventory_id) bloq(`${nome(a)}: anúncio com inventory_id ${f.inventory_id}, mas o ML não confirma o saldo Full (${f.erro}). Pode ter saído do Full mantendo o identificador antigo — sem informação confiável da logística, não agrupa. Deixe este anúncio fora ou confirme a logística no Mercado Livre`, a.chave)
         else if (f.situacao === 'indisponivel') alerta(`${nome(a)}: Full indisponível para consulta (${f.erro}) — NÃO é tratado como zero`, a.chave)
       }
@@ -384,7 +391,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
           const c = classificarDivergencia(d, { vivo, tmp10Atual: prods.get(x) ? prods.get(x).estoque_atual : null, fullConfirmado: fullOk })
           ;(porClasse[c.classe] = porClasse[c.classe] || []).push({ ...d, _vivo: vivo ? vivo.quantidade : undefined, _reserva: vivo ? vivo.reserva : undefined, _det: c.detalhe })
         }
-        for (const [classe, l] of Object.entries(porClasse)) (['full', 'obsoleta'].includes(classe) ? alerta : bloq)(TEXTO[classe](x, l))
+        for (const [classe, l] of Object.entries(porClasse)) (['full', 'obsoleta'].includes(classe) ? alerta : bloq)(TEXTO[classe](x, l), null, x)
       }
     }
 
@@ -428,7 +435,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
     const assinatura = crypto.createHash('sha256').update(JSON.stringify([sku, novos.map((a) => a.chave).sort(), removidos.map((m) => m.id).sort(), membrosAtuais.map((m) => m.id).sort()])).digest('hex').slice(0, 32)
     const detalhe = (a) => ({ chave: a.chave, plataforma: a.plataforma, conta_ref: a.conta_ref, conta_nome: a.conta_nome, anuncio_id: a.anuncio_id, variacao_id: a.variacao_id || '',
       sku_original: a.sku_original, saldo_original: prods.get(a.sku_original) ? prods.get(a.sku_original).estoque_atual : null, ao_vivo: a.ao_vivo || null,
-      full: a.full ? { situacao: a.full.situacao, inventory_id: a.full.inventory_id || null, disponivel: a.full.disponivel ?? null, total: a.full.total ?? null, consultado_em: a.full.consultado_em || null } : null })
+      full: a.full ? { situacao: a.full.situacao, inventory_id: a.full.inventory_id || null, logistica: a.full.logistica || null, disponivel: a.full.disponivel ?? null, total: a.full.total ?? null, consultado_em: a.full.consultado_em || null } : null })
     return {
       principal: { sku, nome: p ? p.name : null, estoque: p ? p.estoque_atual : null, foto: p ? p.photo || null : null },
       adicionar: novos.map(detalhe), remover: removidos.map((m) => ({ id: m.id, ...detalhe({ ...m, chave: chaveDe(m) }) })),
