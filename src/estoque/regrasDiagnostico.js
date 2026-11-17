@@ -51,15 +51,16 @@ const PADROES = [
   [/número de preenchimento/, 'DIVERGENCIA_PREENCHIMENTO', CLASSE_DIVERGENCIA.preenchimento.orientacao],
   [/estoque normal do TMP10 está negativo/, 'DIVERGENCIA_TMP10_NEGATIVO', CLASSE_DIVERGENCIA.tmp10_negativo.orientacao],
   [/sem leitura atual do anúncio/, 'DIVERGENCIA_SEM_LEITURA', CLASSE_DIVERGENCIA.sem_leitura.orientacao],
+  [/anúncio que NÃO está nesta seleção/, 'DIVERGENCIA_ANUNCIO_FORA', 'Divergência antiga de um anúncio que não está mais vinculado a este SKU. Confira o anúncio no painel do Estoque ("Conferir de novo" ou "Ignorar"), ou marque a decisão abaixo para agrupar sem mexer nela (ela continua aberta).'],
   [/divergência\(s\) NÃO resolvida|divergência\(s\) aberta/, 'DIVERGENCIA_REAL', CLASSE_DIVERGENCIA.real.orientacao],
   [/pedido\(s\) Full\/FBS ainda não importado/, 'PEDIDO_FULL_PENDENTE', 'Nada a fazer: venda Full/FBS não baixa o estoque normal.'],
   [/tipo \(Full ou comum\) não foi possível confirmar/, 'PEDIDO_TIPO_INCERTO', 'Aguarde a sincronização de pedidos (o TMP10 importa os pedidos sozinho) e gere a prévia de novo.'],
   [/pedido\(s\) ainda NÃO importado/, 'PEDIDO_PENDENTE', 'Aguarde a sincronização de pedidos (o TMP10 importa os pedidos sozinho) e gere a prévia de novo. Agrupar antes faria a baixa cair no produto errado.'],
   [/não foi possível confirmar os pedidos/, 'PEDIDOS_CONSULTA_FALHOU', 'Falha ao consultar os pedidos na plataforma (rede/token). Tente de novo em instantes; se persistir, reconecte a conta/loja.'],
-  [/consulta do saldo Full falhou|confirmar se o anúncio é Full/, 'FULL_CONSULTA_FALHOU', 'A consulta do Full no ML falhou ou veio inconsistente. Tente de novo; o número NÃO é tratado como zero.'],
+  [/consulta do saldo Full falhou|confirmar se o anúncio é Full/, 'FULL_CONSULTA_FALHOU', 'A consulta do Full no ML falhou ou veio inconsistente (veja a causa provável na frase). Tente de novo; o número NÃO é tratado como zero. Se o erro persistir e o anúncio tiver inventory_id, você pode decidir agrupar ESTE anúncio sem o saldo Full (a decisão fica na auditoria; o envio para ele continua bloqueado).'],
   [/não foi possível conferir as vendas Full/, 'FULL_VENDAS_FALHOU', 'Falha ao consultar o histórico de vendas Full no banco. Tente de novo; confira a migração 21/22 no diagnóstico.'],
   [/SAIU DO FULL/, 'FULL_SAIU', 'Informativo: pode agrupar. O ML informa que o anúncio não é mais Full; o saldo Full antigo não vira zero e não é somado. O envio do estoque normal para este anúncio continua bloqueado enquanto o ML mostrar inventory_id.'],
-  [/não confirma o saldo Full/, 'FULL_LOGISTICA_INCERTA', 'Deixe este anúncio fora do agrupamento ou confirme no Mercado Livre se ele ainda é Full. O envio do estoque normal para ele continua bloqueado enquanto o ML mostrar inventory_id.'],
+  [/não confirma o saldo Full/, 'FULL_LOGISTICA_INCERTA', 'Deixe este anúncio fora do agrupamento ou confirme no Mercado Livre se ele ainda é Full — ou decida agrupar ESTE anúncio sem o saldo Full (a decisão fica na auditoria). O envio do estoque normal para ele continua bloqueado enquanto o ML mostrar inventory_id.'],
   [/anúncio FULL \(inventory|Full indisponível para consulta/, 'FULL_SALDO', 'Informativo: o saldo Full fica no anúncio e não é somado.'],
   [/anúncio com vendas Full\/FBS/, 'FULL_VENDAS', 'Informativo: anúncio Full não recebe envio do TMP10.'],
   [/lista do PILOTO/, 'PRINCIPAL_NO_PILOTO', 'Tire o principal do PILOTO, agrupe, confira e decida depois (regra de segurança: agrupado nunca herda envio real).'],
@@ -79,8 +80,11 @@ const PADROES = [
 ]
 function codificar(item, tipo) {
   const m = String(item.motivo || '')
-  const p = PADROES.find(([re]) => re.test(m))
-  return { tipo, chave: item.chave || null, sku: item.sku || null, motivo: m, codigo: p ? p[1] : 'OUTRO', orientacao: p ? p[2] : 'Leia a causa descrita e corrija antes de tentar de novo.' }
+  // código explícito (achados decidíveis por anúncio, 2026-11-17) tem prioridade sobre o reconhecimento pelo texto
+  const p = (item.codigo && PADROES.find((x) => x[1] === item.codigo)) || PADROES.find(([re]) => re.test(m))
+  const r = { tipo, chave: item.chave || null, sku: item.sku || null, motivo: m, codigo: item.codigo || (p ? p[1] : 'OUTRO'), orientacao: p ? p[2] : 'Leia a causa descrita e corrija antes de tentar de novo.' }
+  if (item.confirmavel) Object.assign(r, { ref: item.ref, confirmavel: true, confirmado: item.confirmado === true, efeito: item.efeito || null })
+  return r
 }
 
 // Tipo de um pedido ainda NÃO importado: { full: true | false | null, motivo }. Venda Full/FBS não baixa o estoque normal.

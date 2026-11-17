@@ -222,7 +222,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
   }
 
   // ── PRÉVIA (não grava nada) ──────────────────────────────────────────────────────────────────────────────────────
-  async function previa({ empresaId, produtoSku, adicionar = [], remover = [] }) {
+  async function previa({ empresaId, produtoSku, adicionar = [], remover = [], confirmados = [] }) {
     const sku = String(produtoSku || '').trim()
     if (!sku) throw erroHttp('Escolha o produto principal.', 400)
     const add = [...new Set((Array.isArray(adicionar) ? adicionar : []).map(String))]
@@ -237,6 +237,29 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
     // para oferecer "tirar da seleção". Não muda nenhuma regra: o bloqueio continua bloqueando.
     const bloq = (motivo, chave = null, skuDe = null) => bloqueios.push({ chave, motivo, sku: skuDe })
     const alerta = (motivo, chave = null, skuDe = null) => alertas.push({ chave, motivo, sku: skuDe })
+    // DECISÃO POR ANÚNCIO (2026-11-17). Só para achados que NÃO mexem no estoque central nem liberam envio: Full com
+    // inventory_id cujo saldo não foi lido e divergências antigas (anúncio com número que não é estoque físico, ou de anúncio
+    // fora da seleção). Sem a decisão explícita do usuário (ref em "confirmados"), CONTINUAM BLOQUEANDO. Com a decisão,
+    // viram aviso "DECIDIDO POR VOCÊ", entram na assinatura da prévia e ficam gravados na auditoria do agrupamento.
+    // Nada é aceito, ignorado, resolvido, gravado ou enviado: a divergência continua ABERTA e o Full nunca vira zero.
+    const decididos = new Set((Array.isArray(confirmados) ? confirmados : []).map(String).slice(0, 500))
+    const decisoes = []
+    const decidivel = (ref, codigo, motivo, chave, skuDe, efeito) => {
+      const item = { chave, motivo, sku: skuDe, codigo, ref, confirmavel: true, efeito }
+      if (decididos.has(ref)) { decisoes.push({ ref, codigo, chave, sku: skuDe, motivo, efeito }); alertas.push({ ...item, confirmado: true, motivo: `DECIDIDO POR VOCÊ — ${motivo}` }) }
+      else bloqueios.push(item)
+    }
+    // causa provável da falha na consulta do saldo Full (pelo texto do erro, que traz o código HTTP do ML) — só explica
+    const causaFull = (erro) => { const e = String(erro || '')
+      if (/aponta para outro anúncio/.test(e)) return 'o inventory_id é COMPARTILHADO com outro anúncio (comum quando há anúncio de catálogo e anúncio tradicional do mesmo produto no Full): o ML devolve o saldo ligado ao outro anúncio, por isso o TMP10 não usa o número aqui'
+      if (/devolveu o inventory/.test(e)) return 'o ML devolveu outro inventory_id'
+      if (/inconsistente|sem available_quantity/.test(e)) return 'resposta do ML incompleta ou inconsistente'
+      if (/HTTP 401|sem token/.test(e)) return 'token da conta inválido ou vencido (reconecte a conta no TMP10)'
+      if (/HTTP 403/.test(e)) return 'o ML recusou a consulta do Full para esta conta (HTTP 403 — permissão do aplicativo/conta)'
+      if (/HTTP 429/.test(e)) return 'limite de chamadas do ML (HTTP 429) — tente de novo em alguns minutos'
+      if (/HTTP 5\d\d|sem resposta|ECONN|ETIMEDOUT|timeout/i.test(e)) return 'ML instável ou sem resposta — tente de novo'
+      return null }
+    const EFEITO_FULL = 'Agrupar este anúncio sem o saldo Full lido: o saldo Full fica "não lido" (nunca vira zero e nunca é somado), o estoque do principal vem só da contagem informada e o TMP10 continua SEM enviar estoque para este anúncio enquanto o ML mostrar inventory_id.'
     const nome = (a) => `${ROT[a.plataforma]} ${a.conta_nome || a.conta_ref} ${a.anuncio_id}${a.variacao_id ? '/' + a.variacao_id : ''}`
 
     // principal
@@ -340,7 +363,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
             f.validacao && f.validacao.anuncio_confere ? 'anúncio confere nas referências do ML' : 'o ML não informou a referência do anúncio'].filter(Boolean).join(', ')
           alerta(`${nome(a)}: anúncio FULL (inventory ${f.inventory_id}) — saldo Full lido no ML: ${f.disponivel} disponível(is), ${f.nao_disponivel ?? '—'} não disponível(is), total ${f.total} (validado: ${conf}).${f.total === 0 ? ' Zero CONFIRMADO pela API: o armazém do ML não tem unidades deste anúncio agora.' : ''} Esse saldo fica NO ANÚNCIO: NÃO é somado ao ${sku} nem aos outros anúncios, NÃO altera o estoque normal, o TMP10 não envia estoque para ele e vendas Full não baixam o ${sku}`, a.chave)
         }
-        else if (f.situacao === 'erro' && f.inventory_id) bloq(`${nome(a)}: anúncio FULL (inventory_id ${f.inventory_id}), mas a consulta do saldo Full falhou (${f.erro}) — sem confirmar o Full, não agrupa. Tente de novo em instantes`, a.chave)
+        else if (f.situacao === 'erro' && f.inventory_id) decidivel(`FULL:${a.chave}`, 'FULL_CONSULTA_FALHOU', `${nome(a)}: anúncio FULL (inventory_id ${f.inventory_id}), mas a consulta do saldo Full falhou (${f.erro})${causaFull(f.erro) ? ' — causa provável: ' + causaFull(f.erro) : ''} — sem confirmar o Full, não agrupa. Tente de novo em instantes`, a.chave, a.sku_original, EFEITO_FULL)
         else if (f.situacao === 'erro') bloq(`${nome(a)}: não foi possível confirmar se o anúncio é Full (${f.erro}) — sem conferir, não agrupa`, a.chave)
         // inventory_id presente, mas o ML não informa o saldo (ex.: 404 — o anúncio pode ter saído do Full mantendo o identificador
         // antigo). Sem informação confiável da logística/saldo, NÃO agrupa: o anúncio fica fora até o ML confirmar.
@@ -349,7 +372,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
         // nada é somado, e o envio do estoque normal para ele continua bloqueado no servico.js enquanto o ML mostrar inventory_id.
         // Logística 'fulfillment' ou não informada continua BLOQUEANDO (abaixo).
         else if (f.situacao === 'indisponivel' && f.inventory_id && f.logistica && f.logistica !== 'fulfillment') alerta(`${nome(a)}: anúncio que SAIU DO FULL — o ML informa a logística "${f.logistica}" (não é Full) e não tem saldo Full para o inventory_id antigo ${f.inventory_id} (HTTP 404). Esse saldo NÃO é tratado como zero e NÃO é somado ao ${sku}. Enquanto o ML mantiver o inventory_id, o TMP10 continua sem enviar estoque para este anúncio`, a.chave)
-        else if (f.situacao === 'indisponivel' && f.inventory_id) bloq(`${nome(a)}: anúncio com inventory_id ${f.inventory_id}, mas o ML não confirma o saldo Full (${f.erro}). Pode ter saído do Full mantendo o identificador antigo — sem informação confiável da logística, não agrupa. Deixe este anúncio fora ou confirme a logística no Mercado Livre`, a.chave)
+        else if (f.situacao === 'indisponivel' && f.inventory_id) decidivel(`FULL:${a.chave}`, 'FULL_LOGISTICA_INCERTA', `${nome(a)}: anúncio com inventory_id ${f.inventory_id}, mas o ML não confirma o saldo Full (${f.erro}). Pode ter saído do Full mantendo o identificador antigo — sem informação confiável da logística, não agrupa. Deixe este anúncio fora ou confirme a logística no Mercado Livre`, a.chave, a.sku_original, EFEITO_FULL)
         else if (f.situacao === 'indisponivel') alerta(`${nome(a)}: Full indisponível para consulta (${f.erro}) — NÃO é tratado como zero`, a.chave)
       }
     }
@@ -377,6 +400,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
         preenchimento: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) em anúncio com número de preenchimento (999 ou mais) (${l.map((d) => desc(d) + ` → hoje ${d._vivo}`).join(' · ')}) — não é estoque físico`,
         tmp10_negativo: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) e o estoque normal do TMP10 está negativo (${prods.get(x) ? prods.get(x).estoque_atual : '—'}) (${l.map(desc).join(' · ')})`,
         sem_leitura: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) sem leitura atual do anúncio (${l.map((d) => desc(d) + (d._det ? ': ' + d._det : '')).join(' · ')}) — sem conferir, não decide`,
+        fora: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) antiga(s) de anúncio que NÃO está nesta seleção (${l.map(desc).join(' · ')}) — o anúncio não está mais vinculado a ${x} nesta empresa (ou é de outra conta/variação), então não é lido nem agrupado`,
         real: (x, l) => `o SKU ${x} tem ${l.length} divergência(s) NÃO resolvida(s) (TMP10 × plataforma): ${l.map((d) => desc(d) + (d._vivo !== undefined ? ` → hoje ${d._vivo}` : '')).join(' · ')} — resolva antes de agrupar: confira a peça e use "Enviar número do TMP10", "Revisar contagem" ou "Ignorar" (o número da plataforma nunca vira o estoque oficial)`
       }
       for (const x of envolvidos) {
@@ -386,12 +410,23 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
         const porClasse = {}
         for (const d of doSku) {
           const a = porChaveNovo.get(`${d.conta_ref}|${d.anuncio_id}|${d.variacao_id || ''}`)
+          // 2026-11-17: divergência de anúncio que NÃO está entre os que entram (o SKU inteiro entra — regra do SKU não
+          // dividido —, então o anúncio não está mais vinculado a este SKU): antes caía em "sem leitura" e bloqueava para sempre
+          if (!a) { (porClasse.fora = porClasse.fora || []).push({ ...d }); continue }
           const fullOk = !!(a && d.plataforma === 'mercadolivre' && a.full && a.full.situacao === 'atualizado' && a.full.inventory_id)
           const vivo = a && a.ao_vivo ? a.ao_vivo : null
           const c = classificarDivergencia(d, { vivo, tmp10Atual: prods.get(x) ? prods.get(x).estoque_atual : null, fullConfirmado: fullOk })
-          ;(porClasse[c.classe] = porClasse[c.classe] || []).push({ ...d, _vivo: vivo ? vivo.quantidade : undefined, _reserva: vivo ? vivo.reserva : undefined, _det: c.detalhe })
+          ;(porClasse[c.classe] = porClasse[c.classe] || []).push({ ...d, _chave: a.chave, _vivo: vivo ? vivo.quantidade : undefined, _reserva: vivo ? vivo.reserva : undefined, _det: c.detalhe })
         }
-        for (const [classe, l] of Object.entries(porClasse)) (['full', 'obsoleta'].includes(classe) ? alerta : bloq)(TEXTO[classe](x, l), null, x)
+        const CODIGO_DIV = { real: 'DIVERGENCIA_REAL', preenchimento: 'DIVERGENCIA_PREENCHIMENTO', fora: 'DIVERGENCIA_ANUNCIO_FORA' }
+        const efeitoDiv = (classe, d) => classe === 'fora'
+          ? `A divergência #${d.id} é de um anúncio fora desta seleção: continua ABERTA no painel (não é aceita nem ignorada) e não entra neste agrupamento. Nada é enviado.`
+          : `Conferi: o número que o anúncio mostra (${d._vivo ?? d.estoque_ml}) NÃO é estoque físico e não vira estoque. Agrupar mesmo assim: a divergência #${d.id} continua ABERTA no painel (não é aceita nem ignorada), o estoque de ${sku} vem só da contagem informada e nada é enviado agora (no PILOTO, o anúncio agrupado continua em simulação).`
+        for (const [classe, l] of Object.entries(porClasse)) {
+          if (['full', 'obsoleta'].includes(classe)) alerta(TEXTO[classe](x, l), null, x)
+          else if (CODIGO_DIV[classe]) for (const d of l) decidivel(`DIV:${d.id}`, CODIGO_DIV[classe], TEXTO[classe](x, [d]), d._chave || null, x, efeitoDiv(classe, d))
+          else bloq(TEXTO[classe](x, l), null, x)
+        }
       }
     }
 
@@ -432,7 +467,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
     if (novos.length && cfg.modo === 'ativo') alerta(`modo ATIVO: na próxima movimentação de ${sku} (ou no "Sincronizar Estoque Agora"), o estoque de ${sku} será enviado também aos anúncios agrupados. O agrupamento em si não envia nada.`)
     if (novos.length) alerta(`o agrupamento NÃO envia nada agora e NÃO soma saldos. O saldo de ${sku} só muda se você informar uma quantidade contada (registrada no histórico). Os anúncios agrupados passam a mostrar o estoque de ${sku} quando você sincronizar ("Sincronizar Estoque Agora", com prévia) ou na próxima venda/cancelamento`)
 
-    const assinatura = crypto.createHash('sha256').update(JSON.stringify([sku, novos.map((a) => a.chave).sort(), removidos.map((m) => m.id).sort(), membrosAtuais.map((m) => m.id).sort()])).digest('hex').slice(0, 32)
+    const assinatura = crypto.createHash('sha256').update(JSON.stringify([sku, novos.map((a) => a.chave).sort(), removidos.map((m) => m.id).sort(), membrosAtuais.map((m) => m.id).sort(), decisoes.map((x) => x.ref).sort()])).digest('hex').slice(0, 32)
     const detalhe = (a) => ({ chave: a.chave, plataforma: a.plataforma, conta_ref: a.conta_ref, conta_nome: a.conta_nome, anuncio_id: a.anuncio_id, variacao_id: a.variacao_id || '',
       sku_original: a.sku_original, saldo_original: prods.get(a.sku_original) ? prods.get(a.sku_original).estoque_atual : null, ao_vivo: a.ao_vivo || null,
       full: a.full ? { situacao: a.full.situacao, inventory_id: a.full.inventory_id || null, logistica: a.full.logistica || null, disponivel: a.full.disponivel ?? null, total: a.full.total ?? null, consultado_em: a.full.consultado_em || null } : null })
@@ -442,6 +477,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
       final: finais.map((a) => ({ chave: a.chave, plataforma: a.plataforma, conta_nome: a.conta_nome, anuncio_id: a.anuncio_id, variacao_id: a.variacao_id || '', sku_original: a.sku_original, novo: !a.atual })),
       quantidade_final: finais.length, bloqueios: bloqueios.map((b) => codificar(b, 'bloqueio')), alertas: alertas.map((x) => codificar(x, 'aviso')), pode_confirmar: bloqueios.length === 0 && (novos.length + removidos.length) > 0, assinatura,
       config: { modo: cfg.modo },
+      decisoes,   // decisões por anúncio aplicadas nesta prévia (2026-11-17) — vão para a auditoria no CONFIRMAR
       // quantidade física do principal: obrigatória quando entram anúncios. "confirmar" só se o saldo atual for 0–998.
       saldo_principal: saldoPrincipal(p, novos.length > 0, cfg)
     }
@@ -486,9 +522,9 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
   }
 
   // ── CONFIRMAR AGRUPAMENTO (grava atômico; nada de estoque muda) ──────────────────────────────────────────────────
-  async function confirmar({ empresaId, usuarioId, produtoSku, adicionar = [], remover = [], conferido, assinatura, operacaoId, produtos = [], origem = 'estoque', saldo = null }) {
+  async function confirmar({ empresaId, usuarioId, produtoSku, adicionar = [], remover = [], conferido, assinatura, operacaoId, produtos = [], origem = 'estoque', saldo = null, confirmados = [] }) {
     if (conferido !== true) throw erroHttp('Marque "Conferi que todos estes anúncios são exatamente a mesma peça física" antes de confirmar.', 400)
-    const pv = await previa({ empresaId, produtoSku, adicionar, remover })
+    const pv = await previa({ empresaId, produtoSku, adicionar, remover, confirmados })
     if (!assinatura || pv.assinatura !== assinatura) throw erroHttp('A seleção ou o agrupamento mudou desde a prévia. Gere a prévia de novo e confira.', 409, { previa: pv })
     if (pv.bloqueios.length) throw erroHttp(`Não é possível confirmar: ${pv.bloqueios.map((b) => b.motivo).join(' | ')}`, 409, { previa: pv })
     if (!pv.adicionar.length && !pv.remover.length) throw erroHttp('Nada a alterar.', 400)
@@ -497,7 +533,9 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
     const detalhe = { principal: pv.principal, adicionados: pv.adicionar.map(({ ao_vivo, ...x }) => ({ ...x, titulo: ao_vivo ? ao_vivo.titulo : null, quantidade_lida: ao_vivo ? ao_vivo.quantidade : null })),
       removidos: pv.remover, alertas_mostrados: pv.alertas.map((a) => a.motivo), quantidade_final: pv.quantidade_final, modo: pv.config.modo,
       // de onde veio a operação e quais PRODUTOS do catálogo o usuário selecionou (tela Produtos → "Agrupar selecionados")
-      origem: origem === 'produtos' ? 'produtos' : 'estoque', produtos_selecionados: [...new Set((Array.isArray(produtos) ? produtos : []).map(String))].slice(0, 200) }
+      origem: origem === 'produtos' ? 'produtos' : 'estoque', produtos_selecionados: [...new Set((Array.isArray(produtos) ? produtos : []).map(String))].slice(0, 200),
+      // decisões tomadas anúncio a anúncio na prévia (quem/quando = usuário e data do evento)
+      decisoes_por_anuncio: (pv.decisoes || []).map((x) => ({ ref: x.ref, codigo: x.codigo, chave: x.chave, sku: x.sku, motivo: x.motivo, efeito: x.efeito })) }
     const args = { p_empresa: empresaId, p_operacao: op, p_produto: pv.principal.sku, p_usuario: usuarioId || null, p_acao: acao,
       p_adicionar: pv.adicionar.map((a) => ({ plataforma: a.plataforma, conta_ref: a.conta_ref, conta_nome: a.conta_nome, anuncio_id: a.anuncio_id, variacao_id: a.variacao_id, sku_original: a.sku_original })),
       p_remover: pv.remover.map((m) => m.id), p_detalhe: detalhe }
