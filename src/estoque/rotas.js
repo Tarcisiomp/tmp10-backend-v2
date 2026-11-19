@@ -41,7 +41,7 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
   // Versão do módulo de estoque publicada (SEM login; não expõe dados): serve para conferir, depois do deploy, se o
   // Railway está rodando o código novo — antes de publicar a interface. commit = RAILWAY_GIT_COMMIT_SHA (variável do Railway).
   router.get('/api/estoque/versao', (req, res) => res.json({ ok: true, modulo: 'estoque', versao: VERSAO_ESTOQUE, agrupamento: true,
-    agrupamento_produtos: true, estoque_full_por_anuncio: true, diagnostico: true, revisao: true, agrupamento_quantidade: true, revisao_sem_envio: true, importacao_plataforma: false, estoque_inicial_oficial: true, alteracao_direta_bloqueada: true, alteracao_direta_nunca_enviada: true, devolucao_manual: true, correcao: '2026-11-17-agrupamento', agrupamento_saiu_do_full: true, agrupamento_decisao_por_anuncio: true, arquivos: ARQUIVOS_ESTOQUE, commit: process.env.RAILWAY_GIT_COMMIT_SHA ? String(process.env.RAILWAY_GIT_COMMIT_SHA).slice(0, 7) : null }))
+    agrupamento_produtos: true, estoque_full_por_anuncio: true, diagnostico: true, revisao: true, agrupamento_quantidade: true, revisao_sem_envio: true, importacao_plataforma: false, estoque_inicial_oficial: true, alteracao_direta_bloqueada: true, alteracao_direta_nunca_enviada: true, devolucao_manual: true, correcao: '2026-11-18-agrupamento-simples', agrupamento_saiu_do_full: true, agrupamento_salvar: true, arquivos: ARQUIVOS_ESTOQUE, commit: process.env.RAILWAY_GIT_COMMIT_SHA ? String(process.env.RAILWAY_GIT_COMMIT_SHA).slice(0, 7) : null }))
   const responder = (fn) => async (req, res) => {
     try {
       const r = await fn(req, res)
@@ -109,14 +109,18 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
   router.get('/api/estoque/agrupamento/grupos', ...admin, responder(async (req) => estoque.agrupamento.listarGrupos({ empresaId: req.empresaId })))
   router.get('/api/estoque/agrupamento/grupo', ...admin, responder(async (req) => estoque.agrupamento.detalheGrupo({ empresaId: req.empresaId, produtoSku: String(req.query.sku || '') })))
   router.post('/api/estoque/agrupamento/previa', ...admin, responder(async (req) => ({ previa: await estoque.agrupamento.previa({ empresaId: req.empresaId,
-    produtoSku: String(corpo(req).produto_sku || ''), adicionar: listaStr(corpo(req).adicionar, 501), remover: Array.isArray(corpo(req).remover) ? corpo(req).remover.slice(0, 501) : [],
-    confirmados: listaStr(corpo(req).confirmados, 501) }) })))
+    produtoSku: String(corpo(req).produto_sku || ''), adicionar: listaStr(corpo(req).adicionar, 501), remover: Array.isArray(corpo(req).remover) ? corpo(req).remover.slice(0, 501) : [] }) })))
   // Tela Produtos → "Agrupar selecionados": anúncios vinculados aos PRODUTOS selecionados (só leitura)
   router.post('/api/estoque/agrupamento/produtos-anuncios', ...admin, responder(async (req) => estoque.agrupamento.produtosAnuncios({ empresaId: req.empresaId, skus: listaStr(corpo(req).skus, 201) })))
   router.post('/api/estoque/agrupamento/confirmar', ...admin, responder(async (req) => estoque.agrupamento.confirmar({ empresaId: req.empresaId, usuarioId: req.usuario.id,
     produtoSku: String(corpo(req).produto_sku || ''), adicionar: listaStr(corpo(req).adicionar, 501), remover: Array.isArray(corpo(req).remover) ? corpo(req).remover.slice(0, 501) : [],
     conferido: corpo(req).conferido === true, assinatura: String(corpo(req).assinatura || ''), operacaoId: String(corpo(req).operacao_id || ''),
-    produtos: listaStr(corpo(req).produtos, 201), origem: String(corpo(req).origem || ''), saldo: saldoDoCorpo(corpo(req).saldo), confirmados: listaStr(corpo(req).confirmados, 501) })))
+    produtos: listaStr(corpo(req).produtos, 201), origem: String(corpo(req).origem || ''), saldo: saldoDoCorpo(corpo(req).saldo) })))
+  // 💾 SALVAR AGRUPAMENTO (2026-11-18): selecionar → quantidade → salvar. Verifica e grava na mesma chamada; impedimento = 409 com
+  // a lista (nada gravado). Mesma função do banco (migração 28), mesma auditoria, nada enviado às plataformas.
+  router.post('/api/estoque/agrupamento/salvar', ...admin, responder(async (req) => estoque.agrupamento.salvar({ empresaId: req.empresaId, usuarioId: req.usuario.id,
+    produtoSku: String(corpo(req).produto_sku || ''), adicionar: listaStr(corpo(req).adicionar, 501), remover: Array.isArray(corpo(req).remover) ? corpo(req).remover.slice(0, 501) : [],
+    operacaoId: String(corpo(req).operacao_id || ''), produtos: listaStr(corpo(req).produtos, 201), origem: String(corpo(req).origem || ''), saldo: saldoDoCorpo(corpo(req).saldo) })))
   // ✏️ EDITAR QUANTIDADE de um grupo: contagem física auditada do produto principal (migração 28). NÃO envia nada.
   router.post('/api/estoque/agrupamento/quantidade', ...admin, responder(async (req) => estoque.agrupamento.editarQuantidade({ empresaId: req.empresaId, usuarioId: req.usuario.id,
     produtoSku: String(corpo(req).produto_sku || ''), saldo: saldoDoCorpo({ ...(corpo(req).saldo || {}), modo: 'contagem' }), operacaoId: String(corpo(req).operacao_id || '') })))
