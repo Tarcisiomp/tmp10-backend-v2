@@ -41,7 +41,7 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
   // Versão do módulo de estoque publicada (SEM login; não expõe dados): serve para conferir, depois do deploy, se o
   // Railway está rodando o código novo — antes de publicar a interface. commit = RAILWAY_GIT_COMMIT_SHA (variável do Railway).
   router.get('/api/estoque/versao', (req, res) => res.json({ ok: true, modulo: 'estoque', versao: VERSAO_ESTOQUE, agrupamento: true,
-    agrupamento_produtos: true, estoque_full_por_anuncio: true, diagnostico: true, revisao: true, agrupamento_quantidade: true, revisao_sem_envio: true, importacao_plataforma: false, estoque_inicial_oficial: true, alteracao_direta_bloqueada: true, alteracao_direta_nunca_enviada: true, devolucao_manual: true, correcao: '2026-11-18-agrupamento-simples', agrupamento_saiu_do_full: true, agrupamento_salvar: true, arquivos: ARQUIVOS_ESTOQUE, commit: process.env.RAILWAY_GIT_COMMIT_SHA ? String(process.env.RAILWAY_GIT_COMMIT_SHA).slice(0, 7) : null }))
+    agrupamento_produtos: true, estoque_full_por_anuncio: true, diagnostico: true, revisao: true, agrupamento_quantidade: true, revisao_sem_envio: true, importacao_plataforma: false, estoque_inicial_oficial: true, alteracao_direta_bloqueada: true, alteracao_direta_nunca_enviada: true, devolucao_manual: true, correcao: '2026-11-25-sincronizacao-agrupamento', agrupamento_saiu_do_full: true, agrupamento_salvar: true, full_por_logistica_e_saldo: true, diagnostico_envio: true, arquivos: ARQUIVOS_ESTOQUE, commit: process.env.RAILWAY_GIT_COMMIT_SHA ? String(process.env.RAILWAY_GIT_COMMIT_SHA).slice(0, 7) : null }))
   const responder = (fn) => async (req, res) => {
     try {
       const r = await fn(req, res)
@@ -116,6 +116,8 @@ function criarRotasEstoque({ sb, estoque, autenticar, exigirPapel, log = console
     produtoSku: String(corpo(req).produto_sku || ''), adicionar: listaStr(corpo(req).adicionar, 501), remover: Array.isArray(corpo(req).remover) ? corpo(req).remover.slice(0, 501) : [],
     conferido: corpo(req).conferido === true, assinatura: String(corpo(req).assinatura || ''), operacaoId: String(corpo(req).operacao_id || ''),
     produtos: listaStr(corpo(req).produtos, 201), origem: String(corpo(req).origem || ''), saldo: saldoDoCorpo(corpo(req).saldo) })))
+  // 📡 Diagnóstico de envio, anúncio por anúncio (2026-11-25): SÓ LEITURA — estoque central, congelados e o que a fila faria
+  router.get('/api/estoque/agrupamento/diagnostico-envio', ...admin, responder(async (req) => ({ diagnostico: await estoque.diagnosticoEnvio({ empresaId: req.empresaId, sku: String(req.query.sku || '').slice(0, 120) }) })))
   // 💾 SALVAR AGRUPAMENTO (2026-11-18): selecionar → quantidade → salvar. Verifica e grava na mesma chamada; impedimento = 409 com
   // a lista (nada gravado). Mesma função do banco (migração 28), mesma auditoria, nada enviado às plataformas.
   router.post('/api/estoque/agrupamento/salvar', ...admin, responder(async (req) => estoque.agrupamento.salvar({ empresaId: req.empresaId, usuarioId: req.usuario.id,

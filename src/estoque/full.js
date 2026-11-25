@@ -200,8 +200,8 @@ function criarFull({ sb, ml, grupos, q, rpc, log = console.log, agora = () => ne
         try {
           const f = await ml.lerEstoqueFull(conta, l.inventory_id)
           const v = validarFull(f, l.inventory_id, a.anuncio_id)
-          if (v.erro) res.set(a.chave, { situacao: 'erro', inventory_id: l.inventory_id, erro: v.erro, consultado_em: quando() })
-          else res.set(a.chave, { situacao: 'atualizado', inventory_id: l.inventory_id, disponivel: f.disponivel, nao_disponivel: f.nao_disponivel, total: f.total, detalhe: f.detalhe,
+          if (v.erro) res.set(a.chave, { situacao: 'erro', inventory_id: l.inventory_id, logistica: l.logistica || null, erro: v.erro, consultado_em: quando() })
+          else res.set(a.chave, { situacao: 'atualizado', inventory_id: l.inventory_id, logistica: l.logistica || null, disponivel: f.disponivel, nao_disponivel: f.nao_disponivel, total: f.total, detalhe: f.detalhe,
             validacao: v.validacao, consultado_em: quando() })
         } catch (e) {
           const http = e && e.http
@@ -264,7 +264,34 @@ function criarFull({ sb, ml, grupos, q, rpc, log = console.log, agora = () => ne
     return l.length ? l : null
   }
 
-  return { saldos, historico, lerAoVivo, vendasFull, validarFull, consultar, iniciarConsulta, statusConsulta, gravadoDe, rotulo: ROT }
+  // ── CLASSIFICAÇÃO PARA ENVIO (2026-11-25) — regra ÚNICA usada pela fila, pela conferência e pelo diagnóstico ─────────
+  // O ML devolve inventory_id para todo anúncio com Full HABILITADO, inclusive o que vende só do DEPÓSITO do vendedor
+  // ("Depósito 9.904 · Full: sem estoque"). Antes, inventory_id = Full ⇒ bloqueio eterno. Agora:
+  //   FULL (nunca recebe PUT)  = logística 'fulfillment' OU saldo no Full > 0 lido na API
+  //   NORMAL (recebe o principal) = sem inventory_id; OU inventory_id com logística NÃO-Full informada pelo ML E Full
+  //                                 confirmado VAZIO (total 0 lido na API, ou 404 = sem registro no Full)
+  //   INDEFINIDO (não envia)    = inventory_id sem logística informada, consulta do Full com erro/inconsistente/de outro anúncio
+  // leitura = resultado de ml.lerAnuncios para o anúncio. Só faz GET. Devolve { tipo, motivo, inventory_id, logistica, full_total }.
+  async function classificarEnvioML(conta, leitura, anuncioId) {
+    const inv = leitura && leitura.inventory_id ? String(leitura.inventory_id) : null
+    const logistica = leitura && leitura.logistica ? String(leitura.logistica) : null
+    const base = { inventory_id: inv, logistica, full_total: null }
+    if (logistica === 'fulfillment') return { ...base, tipo: 'full', motivo: `logística Full no ML${inv ? ` (inventory_id ${inv})` : ''}` }
+    if (!inv) return { ...base, tipo: 'normal', motivo: 'anúncio sem Full (sem inventory_id)' }
+    if (!logistica) return { ...base, tipo: 'indefinido', motivo: `inventory_id ${inv} e o ML não informou a logística — sem confirmar, tratado como Full` }
+    try {
+      const f = await ml.lerEstoqueFull(conta, inv)
+      const v = validarFull(f, inv, anuncioId)
+      if (v.erro) return { ...base, tipo: 'indefinido', motivo: `inventory_id ${inv}: ${v.erro} — sem confirmar, tratado como Full` }
+      if ((f.total || 0) > 0 || (f.disponivel || 0) > 0) return { ...base, full_total: f.total, tipo: 'full', motivo: `inventory_id ${inv} com ${f.total} unidade(s) no Full` }
+      return { ...base, full_total: 0, tipo: 'normal', motivo: `Full habilitado SEM estoque no Full (inventory_id ${inv}, total 0 confirmado; logística ${logistica}) — vende do depósito` }
+    } catch (e) {
+      if (e && e.http === 404) return { ...base, full_total: 0, tipo: 'normal', motivo: `inventory_id ${inv} sem registro no Full (HTTP 404; logística ${logistica}) — vende do depósito` }
+      return { ...base, tipo: 'indefinido', motivo: `inventory_id ${inv}: consulta do Full falhou (${e.message}) — sem confirmar, tratado como Full` }
+    }
+  }
+
+  return { saldos, historico, lerAoVivo, vendasFull, validarFull, consultar, iniciarConsulta, statusConsulta, gravadoDe, classificarEnvioML, rotulo: ROT }
 }
 
 module.exports = { criarFull }

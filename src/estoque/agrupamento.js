@@ -370,7 +370,8 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
       for (const a of novosML) {
         const f = lidosFull.get(a.chave); if (!f) continue
         a.full = f
-        if (f.situacao === 'atualizado') {
+        if (f.situacao === 'atualizado' && f.total === 0 && f.logistica && f.logistica !== 'fulfillment') alerta(`${nome(a)}: Full habilitado SEM estoque no Full (inventory ${f.inventory_id}, total 0 confirmado; logística ${f.logistica}) — vende do depósito: recebe o estoque de ${sku} como os anúncios normais`, a.chave)
+        else if (f.situacao === 'atualizado') {
           const conf = [f.validacao && f.validacao.inventory_confere ? 'inventory confere' : null, f.validacao && f.validacao.total_confere ? 'total = disponível + não disponível' : null,
             f.validacao && f.validacao.anuncio_confere ? 'anúncio confere nas referências do ML' : 'o ML não informou a referência do anúncio'].filter(Boolean).join(', ')
           alerta(`${nome(a)}: anúncio FULL (inventory ${f.inventory_id}) — saldo Full lido no ML: ${f.disponivel} disponível(is), ${f.nao_disponivel ?? '—'} não disponível(is), total ${f.total} (validado: ${conf}).${f.total === 0 ? ' Zero CONFIRMADO pela API: o armazém do ML não tem unidades deste anúncio agora.' : ''} Esse saldo fica NO ANÚNCIO: NÃO é somado ao ${sku} nem aos outros anúncios, NÃO altera o estoque normal, o TMP10 não envia estoque para ele e vendas Full não baixam o ${sku}`, a.chave)
@@ -383,7 +384,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
         // saldo Full para o inventory_id antigo (404) → anúncio que SAIU do Full. Pode agrupar (AVISO): o saldo não vira zero,
         // nada é somado, e o envio do estoque normal para ele continua bloqueado no servico.js enquanto o ML mostrar inventory_id.
         // Logística 'fulfillment' ou não informada continua BLOQUEANDO (abaixo).
-        else if (f.situacao === 'indisponivel' && f.inventory_id && f.logistica && f.logistica !== 'fulfillment') alerta(`${nome(a)}: anúncio que SAIU DO FULL — o ML informa a logística "${f.logistica}" (não é Full) e não tem saldo Full para o inventory_id antigo ${f.inventory_id} (HTTP 404). Esse saldo NÃO é tratado como zero e NÃO é somado ao ${sku}. Enquanto o ML mantiver o inventory_id, o TMP10 continua sem enviar estoque para este anúncio`, a.chave)
+        else if (f.situacao === 'indisponivel' && f.inventory_id && f.logistica && f.logistica !== 'fulfillment') alerta(`${nome(a)}: anúncio que SAIU DO FULL — o ML informa a logística "${f.logistica}" (não é Full) e não tem saldo Full para o inventory_id antigo ${f.inventory_id} (HTTP 404). Esse saldo NÃO é tratado como zero e NÃO é somado ao ${sku}. Sem estoque no Full, o anúncio vende do depósito e recebe o estoque de ${sku} como os anúncios normais`, a.chave)
         else if (f.situacao === 'indisponivel' && f.inventory_id) automatico(`FULL:${a.chave}`, 'FULL_NAO_LIDO', `${nome(a)}: anúncio com inventory_id ${f.inventory_id} (tratado como FULL) — o ML não informou o saldo Full (${f.erro}). Fica SEPARADO: não vira zero, não é somado ao ${sku} e o TMP10 não envia estoque para este anúncio enquanto o ML mostrar inventory_id`, a.chave, a.sku_original)
         else if (f.situacao === 'indisponivel') alerta(`${nome(a)}: Full indisponível para consulta (${f.erro}) — NÃO é tratado como zero`, a.chave)
       }
@@ -491,7 +492,7 @@ function criarAgrupamento({ sb, ml, shopee, grupos, q, rpc, lerConfig, ajusteMas
       config: { modo: cfg.modo },
       // 2026-11-18: o que o sistema tratou sozinho (vai para a auditoria no SALVAR)
       tratados_automaticamente: automaticos, divergencias_mantidas: divMantidas, incluidos_automaticamente: incluidosAuto.map((b) => b.chave),
-      full_fbs: novos.filter((a) => (a.full && a.full.situacao && a.full.situacao !== 'sem_full') || (a.ao_vivo && a.ao_vivo.estoque_shopee > 0) || idsVendasFull.has(a.anuncio_id)).map((a) => a.chave),
+      full_fbs: novos.filter((a) => (a.full && a.full.situacao && a.full.situacao !== 'sem_full' && !(a.full.situacao === 'atualizado' && a.full.total === 0 && a.full.logistica && a.full.logistica !== 'fulfillment')) || (a.ao_vivo && a.ao_vivo.estoque_shopee > 0) || idsVendasFull.has(a.anuncio_id)).map((a) => a.chave),
       // quantidade física do principal: obrigatória quando entram anúncios. "confirmar" só se o saldo atual for 0–998.
       saldo_principal: saldoPrincipal(p, novos.length > 0, cfg)
     }
