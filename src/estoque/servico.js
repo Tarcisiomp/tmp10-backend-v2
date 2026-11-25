@@ -361,7 +361,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
         // 2026-11-25: Full = logística Full OU saldo no Full (regra única em full.classificarEnvioML). Anúncio com Full
         // habilitado mas VAZIO, que vende do depósito, é NORMAL e recebe o principal. Na dúvida (indefinido), NÃO envia.
         const cls = await full.classificarEnvioML(destino.conta, antes, item.anuncio_id)
-        if (cls.tipo !== 'normal') return concluir('bloqueado', { alvo, erro: `anúncio Full no Mercado Livre (${cls.inventory_id ? `inventory_id ${cls.inventory_id}` : 'logística Full'}) — ${cls.motivo} — o estoque fica com o ML; o TMP10 não envia o estoque normal para ele` })
+        if (cls.tipo === 'full') return concluir('bloqueado', { alvo, erro: `anúncio Full no Mercado Livre (${cls.inventory_id ? `inventory_id ${cls.inventory_id}` : 'logística Full'}) — ${cls.motivo} — o estoque fica com o ML; o TMP10 não envia o estoque normal para ele` })
+        if (cls.tipo !== 'normal') return concluir('bloqueado', { alvo, erro: `ERRO DE CONSULTA (não é Full): ${cls.motivo}. Nada enviado; tenta de novo no próximo envio` })
         const r = await ml.enviar(destino.conta, item.anuncio_id, alvo)
         const depois = (await ml.lerAnuncios(destino.conta, [item.anuncio_id]).catch(() => new Map())).get(item.anuncio_id)
         const confirmada = depois && !depois.erro ? depois.quantidade : null
@@ -474,8 +475,9 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
       else if (!leitura || leitura.erro || leitura.quantidade === null) { linha.situacao = 'erro_leitura'; linha.erro = leitura ? leitura.erro : 'sem leitura' }
       else if (base.destino === 'mercadolivre' && leitura.inventory_id && (linha.classe_full = await full.classificarEnvioML(conta, leitura, base.anuncio_id)).tipo !== 'normal') {
         // anúncio Full (ou não confirmado): o número do ML não é comparado com o estoque normal (nem vira divergência)
-        linha.situacao = 'full'; linha.inventory_id = leitura.inventory_id
-        linha.erro = `anúncio Full (${linha.classe_full.motivo}): o número do ML não é comparado com o estoque normal do TMP10`
+        linha.inventory_id = leitura.inventory_id
+        if (linha.classe_full.tipo === 'full') { linha.situacao = 'full'; linha.erro = `anúncio Full (${linha.classe_full.motivo}): o número do ML não é comparado com o estoque normal do TMP10` }
+        else { linha.situacao = 'erro_leitura'; linha.erro = `erro de consulta do Full (não é Full): ${linha.classe_full.motivo}` }
       }
       else if (base.destino === 'shopee' && leitura.fbs > 0) {
         // Shopee com estoque no armazém dela (FBS): o número não é comparável com o estoque normal
@@ -911,8 +913,8 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
           const l = (await ml.lerAnuncios(conta, [d.anuncio_id])).get(d.anuncio_id)
           if (!l || l.erro) throw new Error((l && l.erro) || 'anúncio não devolvido pelo ML')
           linha.plataforma_agora = l.quantidade
-          if (l.variacoes > 0) Object.assign(linha, { tipo: 'indefinido', motivo: `anúncio com ${l.variacoes} variação(ões) — envio por variação fora desta versão` })
-          else { const c = await full.classificarEnvioML(conta, l, d.anuncio_id); Object.assign(linha, { tipo: c.tipo, motivo: c.motivo, inventory_id: c.inventory_id, logistica: c.logistica, full_total: c.full_total }) }
+          if (l.variacoes > 0) Object.assign(linha, { tipo: 'variacao', motivo: `anúncio com ${l.variacoes} variação(ões) — envio por variação fora desta versão` })
+          else { const c = await full.classificarEnvioML(conta, l, d.anuncio_id); Object.assign(linha, { tipo: c.tipo, motivo: c.motivo, inventory_id: c.inventory_id, logistica: c.logistica, full_total: c.full_total, user_product_id: c.user_product_id, consulta: c.consulta }) }
         } else {
           const conta = (contas || []).find((c) => ehShopee(c) && c.active === true && String(c.ml_user_id) === d.conta_ref)
           if (!conta) throw new Error('loja Shopee não conectada/ativa')
@@ -924,16 +926,33 @@ function criarServicoEstoque({ sb, ml, shopee, log = console.log, envioHabilitad
         }
         if (linha.tipo === 'normal' && await rpc('estoque_anuncio_tem_full', { p_empresa: empresaId, p_anuncio: d.anuncio_id, p_dias: 90 }))
           Object.assign(linha, { tipo: 'full', motivo: 'vendas Full/FBS nos últimos 90 dias' })
-      } catch (e) { Object.assign(linha, { tipo: 'indefinido', motivo: `leitura falhou: ${e.message}`, plataforma_agora: linha.plataforma_agora ?? null }) }
+      } catch (e) { Object.assign(linha, { tipo: 'erro_consulta', consulta: 'anuncio', motivo: `leitura do anúncio falhou: ${e.message}`, plataforma_agora: linha.plataforma_agora ?? null }) }
       const decisao = decidirEnvio(cfg, sku, { agrupado: linha.papel === 'secundario' })
       linha.proximo_envio = alvo === null ? { acao: 'bloqueado', texto: 'produto sem estoque oficial' }
+        : linha.tipo === 'erro_consulta' ? { acao: 'erro_consulta', texto: `não recebe agora (erro de consulta, NÃO é Full): ${linha.motivo}` }
         : linha.tipo !== 'normal' ? { acao: 'bloqueado', texto: `não recebe: ${linha.motivo}` }
         : !decisao.real ? { acao: 'simulado', texto: `enviaria ${alvo} — simulação: ${decisao.motivo}` }
         : linha.plataforma_agora === alvo ? { acao: 'igual', texto: `já mostra ${alvo}` }
         : { acao: 'envia', texto: `recebe ${alvo} (hoje ${linha.plataforma_agora ?? '—'})` }
       anuncios.push(linha)
     }
-    return { consultado_em: new Date().toISOString(), principal: { sku, nome: p.name, estoque_central: p.estoque_atual }, config: { modo: cfg.modo, skus_piloto: cfg.skus_piloto, envio_habilitado_no_servidor: !!envioHabilitado() },
+    // principal primeiro; resumo no topo; origem do saldo central (último movimento e último agrupamento com quantidade)
+    anuncios.sort((a, b) => (a.papel === b.papel ? 0 : a.papel === 'principal' ? -1 : 1))
+    const conta = (t) => anuncios.filter((a) => t(a)).length
+    const resumo = { total: anuncios.length, anuncios_do_principal: conta((a) => a.papel === 'principal'), agrupados: conta((a) => a.papel === 'secundario'),
+      normais_recebem: conta((a) => a.tipo === 'normal'), full_fbs: conta((a) => ['full', 'fbs'].includes(a.tipo)), erro_consulta: conta((a) => a.tipo === 'erro_consulta'),
+      outros_bloqueios: conta((a) => !['normal', 'full', 'fbs', 'erro_consulta'].includes(a.tipo)),
+      em_simulacao: conta((a) => a.proximo_envio.acao === 'simulado'), envio_real_agora: conta((a) => a.proximo_envio.acao === 'envia'), ja_iguais: conta((a) => a.proximo_envio.acao === 'igual') }
+    const mov = ((await q(sb.from('estoque_movimentos').select('origem, estoque_anterior, estoque_novo, usuario_id, criado_em').eq('empresa_id', empresaId).eq('sku', sku).eq('aplicado', true).order('criado_em', { ascending: false }).limit(1), 'último movimento')) || [])[0] || null
+    const evs = (await q(sb.from('estoque_agrupamento_eventos').select('acao, detalhe, criado_em').eq('empresa_id', empresaId).eq('produto_sku', sku).order('criado_em', { ascending: false }).limit(20), 'eventos')) || []
+    const evSaldo = evs.find((e) => e.detalhe && e.detalhe.saldo) || null
+    const atual = p.estoque_atual === null || p.estoque_atual === undefined ? null : Number(p.estoque_atual)
+    const origemSaldo = { valor_oficial: p.estoque_atual, fonte: 'products.estoque_atual (estoque central do TMP10, lido agora)',
+      ultimo_movimento: mov ? { origem: mov.origem, anterior: mov.estoque_anterior, novo: mov.estoque_novo, em: mov.criado_em } : null,
+      ultimo_agrupamento_com_quantidade: evSaldo ? { acao: evSaldo.acao, modo: evSaldo.detalhe.saldo.modo, anterior: evSaldo.detalhe.saldo.anterior ?? null, novo: evSaldo.detalhe.saldo.novo, em: evSaldo.criado_em } : null,
+      alerta: atual === null ? 'sem estoque oficial: registre a contagem física' : atual >= 999 ? `${atual} — 999 ou mais costuma ser número de preenchimento, não estoque físico: confira e registre a contagem física (✏️ Editar quantidade)` : atual < 0 ? 'negativo: registre a contagem física' : null }
+    return { consultado_em: new Date().toISOString(), principal: { sku, nome: p.name, estoque_central: p.estoque_atual, origem_saldo: origemSaldo,
+        sem_anuncio_proprio: resumo.anuncios_do_principal === 0 }, resumo, config: { modo: cfg.modo, skus_piloto: cfg.skus_piloto, envio_habilitado_no_servidor: !!envioHabilitado() },
       secundarios: congelados.map((x) => ({ sku: x.sku, saldo_congelado: x.estoque_atual, observacao: 'congelado: NÃO é estoque oficial, não é somado e não é enviado a nenhum anúncio' })),
       anuncios, observacao: 'Somente leitura: as plataformas só foram LIDAS; nada foi gravado, somado ou enviado.' }
   }

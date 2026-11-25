@@ -264,30 +264,45 @@ function criarFull({ sb, ml, grupos, q, rpc, log = console.log, agora = () => ne
     return l.length ? l : null
   }
 
-  // ── CLASSIFICAÇÃO PARA ENVIO (2026-11-25) — regra ÚNICA usada pela fila, pela conferência e pelo diagnóstico ─────────
-  // O ML devolve inventory_id para todo anúncio com Full HABILITADO, inclusive o que vende só do DEPÓSITO do vendedor
-  // ("Depósito 9.904 · Full: sem estoque"). Antes, inventory_id = Full ⇒ bloqueio eterno. Agora:
-  //   FULL (nunca recebe PUT)  = logística 'fulfillment' OU saldo no Full > 0 lido na API
-  //   NORMAL (recebe o principal) = sem inventory_id; OU inventory_id com logística NÃO-Full informada pelo ML E Full
-  //                                 confirmado VAZIO (total 0 lido na API, ou 404 = sem registro no Full)
-  //   INDEFINIDO (não envia)    = inventory_id sem logística informada, consulta do Full com erro/inconsistente/de outro anúncio
-  // leitura = resultado de ml.lerAnuncios para o anúncio. Só faz GET. Devolve { tipo, motivo, inventory_id, logistica, full_total }.
+  // ── CLASSIFICAÇÃO PARA ENVIO (2026-11-25; revisada 2026-11-26) — regra ÚNICA da fila, da conferência e do diagnóstico ───
+  //   'full'         = logística 'fulfillment' OU unidades no Full lidas na API (nunca recebe PUT)
+  //   'normal'       = sem inventory_id; OU inventory_id com logística NÃO-Full informada E Full confirmado vazio
+  //   'erro_consulta'= não foi possível ler o Full (HTTP 403/5xx/rede, resposta inválida, inventory de outro anúncio,
+  //                    logística não informada). NÃO é Full: é falta de leitura. Também NÃO recebe envio até a leitura funcionar.
+  // 403 ResourceDeprecated na consulta antiga (/inventories/{id}/stock/fulfillment): tenta o estoque POR ORIGEM do
+  // "user product" (GET /user-products/{id}/stock; 'meli_facility' = Full). Só GET. Devolve { tipo, motivo, ... , consulta }.
   async function classificarEnvioML(conta, leitura, anuncioId) {
     const inv = leitura && leitura.inventory_id ? String(leitura.inventory_id) : null
     const logistica = leitura && leitura.logistica ? String(leitura.logistica) : null
-    const base = { inventory_id: inv, logistica, full_total: null }
+    const up = leitura && leitura.user_product_id ? String(leitura.user_product_id) : null
+    const base = { inventory_id: inv, logistica, user_product_id: up, full_total: null, consulta: null }
     if (logistica === 'fulfillment') return { ...base, tipo: 'full', motivo: `logística Full no ML${inv ? ` (inventory_id ${inv})` : ''}` }
     if (!inv) return { ...base, tipo: 'normal', motivo: 'anúncio sem Full (sem inventory_id)' }
-    if (!logistica) return { ...base, tipo: 'indefinido', motivo: `inventory_id ${inv} e o ML não informou a logística — sem confirmar, tratado como Full` }
+    if (!logistica) return { ...base, tipo: 'erro_consulta', consulta: 'logistica', motivo: `inventory_id ${inv}: o ML não informou a logística do anúncio — sem confirmar, não envia` }
+    const vazio = (como) => ({ ...base, full_total: 0, tipo: 'normal', motivo: `Full habilitado SEM estoque no Full (inventory_id ${inv}, ${como}; logística ${logistica}) — vende do depósito` })
     try {
       const f = await ml.lerEstoqueFull(conta, inv)
       const v = validarFull(f, inv, anuncioId)
-      if (v.erro) return { ...base, tipo: 'indefinido', motivo: `inventory_id ${inv}: ${v.erro} — sem confirmar, tratado como Full` }
+      if (v.erro) return { ...base, tipo: 'erro_consulta', consulta: 'full', motivo: `inventory_id ${inv}: ${v.erro} — sem confirmar, não envia` }
       if ((f.total || 0) > 0 || (f.disponivel || 0) > 0) return { ...base, full_total: f.total, tipo: 'full', motivo: `inventory_id ${inv} com ${f.total} unidade(s) no Full` }
-      return { ...base, full_total: 0, tipo: 'normal', motivo: `Full habilitado SEM estoque no Full (inventory_id ${inv}, total 0 confirmado; logística ${logistica}) — vende do depósito` }
+      return vazio('total 0 confirmado')
     } catch (e) {
-      if (e && e.http === 404) return { ...base, full_total: 0, tipo: 'normal', motivo: `inventory_id ${inv} sem registro no Full (HTTP 404; logística ${logistica}) — vende do depósito` }
-      return { ...base, tipo: 'indefinido', motivo: `inventory_id ${inv}: consulta do Full falhou (${e.message}) — sem confirmar, tratado como Full` }
+      if (e && e.http === 404) return vazio('sem registro no Full — HTTP 404')
+      const txt = String((e && e.message) || '')
+      if (e && e.http === 403 && (/deprecat/i.test(txt) || /deprecat/i.test(JSON.stringify((e && e.dados) || {})))) {
+        // a consulta antiga foi DESCONTINUADA para este anúncio: lê o estoque por origem do user product
+        if (!up) return { ...base, tipo: 'erro_consulta', consulta: 'deprecated', motivo: `inventory_id ${inv}: o ML descontinuou a consulta antiga do Full (HTTP 403 ResourceDeprecated) e o anúncio não informa user_product_id — sem confirmar, não envia` }
+        try {
+          const st = await ml.lerEstoqueUserProduct(conta, up)
+          const noFull = st.locais.filter((l) => l.tipo === 'meli_facility').reduce((s, l) => s + l.quantidade, 0)
+          const resumo = st.locais.map((l) => `${l.tipo} ${l.quantidade}`).join(', ') || 'nenhuma origem'
+          if (noFull > 0) return { ...base, full_total: noFull, tipo: 'full', consulta: 'user_product', motivo: `user_product ${up}: ${noFull} unidade(s) no Full (${resumo})` }
+          return { ...vazio(`estoque por origem do user_product ${up}: ${resumo}`), consulta: 'user_product' }
+        } catch (e2) {
+          return { ...base, tipo: 'erro_consulta', consulta: 'user_product', motivo: `inventory_id ${inv}: consulta antiga descontinuada (HTTP 403 ResourceDeprecated) e a leitura do estoque por origem falhou (${e2.message}) — sem confirmar, não envia` }
+        }
+      }
+      return { ...base, tipo: 'erro_consulta', consulta: 'full', motivo: `inventory_id ${inv}: consulta do Full falhou (${txt}) — sem confirmar, não envia` }
     }
   }
 

@@ -118,7 +118,9 @@ function criarMercadoLivre({ axios, getToken, refreshToken, timeout = 8000 }) {
           inventory_id: corpo.inventory_id ? String(corpo.inventory_id) : null,
           // logística ATUAL do anúncio (recurso /items: shipping.logistic_type — 'fulfillment' = Full). Só LEITURA: usada na
           // prévia do agrupamento para reconhecer o anúncio que SAIU do Full mas manteve o inventory_id antigo (2026-11-16).
-          logistica: corpo.shipping && corpo.shipping.logistic_type ? String(corpo.shipping.logistic_type).toLowerCase() : null
+          logistica: corpo.shipping && corpo.shipping.logistic_type ? String(corpo.shipping.logistic_type).toLowerCase() : null,
+          // user_product_id (modelo "user products" do ML): identifica o estoque POR ORIGEM do anúncio (2026-11-26, só leitura)
+          user_product_id: corpo.user_product_id ? String(corpo.user_product_id) : null
         })
       }
       // anúncio que o ML não devolveu para esta conta (de outra conta, apagado, sem permissão)
@@ -201,7 +203,22 @@ function criarMercadoLivre({ axios, getToken, refreshToken, timeout = 8000 }) {
     }, `ML GET /inventories/${inventoryId}/stock/fulfillment (${conta.nickname})`)
   }
 
-  return { lerAnuncios, enviar, buscarPedidos, lerPedido, lerEnvio, lerEstoqueFull }
+  // Estoque POR ORIGEM de um "user product" (SÓ LEITURA) — usado quando o ML responde 403 ResourceDeprecated na consulta
+  // antiga do Full. GET /user-products/{id}/stock → { locations: [{ type, quantity }] } (type 'meli_facility' = armazém do ML
+  // = Full; 'selling_address' / 'seller_warehouse' = depósito do vendedor). PRECISA CONFIRMAR com a documentação oficial do ML:
+  // se a resposta não vier EXATAMENTE nesse formato, é erro de consulta (nunca vira Full nem zero por suposição).
+  async function lerEstoqueUserProduct(conta, userProductId) {
+    if (!userProductId) throw new ErroPlataforma('lerEstoqueUserProduct: user_product_id vazio', { tipo: 'permanente' })
+    return comToken(conta, async (token) => {
+      const { data } = await axios.get(`${ML_API}/user-products/${encodeURIComponent(userProductId)}/stock`, { headers: { Authorization: `Bearer ${token}` }, timeout })
+      const locs = data && Array.isArray(data.locations) ? data.locations : null
+      if (!locs || !locs.every((l) => l && typeof l.type === 'string' && Number.isInteger(Number(l.quantity)) && Number(l.quantity) >= 0))
+        throw new ErroPlataforma(`ML /user-products/${userProductId}/stock em formato inesperado: ${resumir(data, 300)}`, { tipo: 'permanente', categoria: 'negocio', dados: data })
+      return { user_product_id: String(userProductId), locais: locs.map((l) => ({ tipo: String(l.type), quantidade: Number(l.quantity) })) }
+    }, `ML GET /user-products/${userProductId}/stock (${conta.nickname})`)
+  }
+
+  return { lerAnuncios, enviar, buscarPedidos, lerPedido, lerEnvio, lerEstoqueFull, lerEstoqueUserProduct }
 }
 
 function criarShopee({ axios, host, partnerId, assinar, getToken, refreshToken, timeout = 10000 }) {
